@@ -45,8 +45,20 @@ const API_HOST =
   process.env.API_HOST ||
   "0.0.0.0";
 
-const DATA_DIR =
-  process.env.DATA_DIR || path.resolve(__dirname, "../../../data");
+const DATA_DIR = path.resolve(
+  process.env.DATA_DIR ||
+    path.join(__dirname, "data")
+);
+
+console.log(
+  `[startup] data-directory ${JSON.stringify({
+    configuredValue:
+      process.env.DATA_DIR || "",
+    resolvedValue: DATA_DIR,
+    cwd: process.cwd(),
+    dirname: __dirname,
+  })}`
+);
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
