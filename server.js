@@ -1551,7 +1551,27 @@ app.use(
 /* ==========================================================
    Team communication routes
    ========================================================== */
+app.get("/", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    name: "ReachFly API",
+    health: "/api/health",
+    timestamp: new Date().toISOString(),
+  });
+});
 
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    name: "ReachFly API",
+    version: "5.6.1",
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    host: API_HOST,
+    port: PORT,
+    googlePlaces: placesProvider.getDiagnostics(),
+  });
+});
 app.get(
   "/api/team-communication/channels",
   requireAuth,
@@ -6947,16 +6967,29 @@ app.use(
   }
 );
 
-const httpServer =
-  app.listen(
-    PORT,
-    API_HOST,
-    () => {
-      console.log(
-        `ReachFly API listening on ${API_HOST}:${PORT}`
-      );
-    }
-  );
+const httpServer = app.listen(
+  PORT,
+  API_HOST,
+  () => {
+    console.log(
+      `[startup] ReachFly API listening ${JSON.stringify({
+        host: API_HOST,
+        port: PORT,
+        healthUrl: `http://127.0.0.1:${PORT}/api/health`,
+      })}`
+    );
+  }
+);
+
+httpServer.on("error", (error) => {
+  console.error("[startup] HTTP server failed", {
+    code: error?.code,
+    message: error?.message,
+    stack: error?.stack,
+  });
+
+  process.exitCode = 1;
+});
 
 
 
