@@ -24,9 +24,9 @@ import {
 import {
   createCallerQueueService,
 } from "./caller-queue-service.js";
-import { createTeamControlService } from "../src/team-control-service.js";
+import { createTeamControlService } from "./team-control-service.js";
 import { seedRoleTestAccounts } from "./role-test-seed.js";
-import { createVonageCallService } from "../src/vonage-call-service.js";
+import { createVonageCallService } from "./vonage-call-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
 import fs from "node:fs";
