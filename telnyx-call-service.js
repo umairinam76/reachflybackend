@@ -263,7 +263,7 @@ export function createTelnyxCallService({
     if (!autoProvision) {
       throw httpError(
         409,
-        "No Telnyx dialer is assigned to this caller. Configure TELNYX_CALLER_CREDENTIALS_JSON or enable TELNYX_AUTO_PROVISION_CALLERS."
+        "No ReachFly Dialer is assigned to this caller. Configure TELNYX_CALLER_CREDENTIALS_JSON or enable TELNYX_AUTO_PROVISION_CALLERS."
       );
     }
 

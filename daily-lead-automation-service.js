@@ -155,15 +155,6 @@ export function createDailyLeadAutomationService({
           process.env.DAILY_LEAD_TIMEZONE ??
           "UTC"
         ) || "UTC",
-
-      staleRunMinutes:
-        positiveInteger(
-          stored.staleRunMinutes ??
-          process.env.DAILY_LEAD_STALE_RUN_MINUTES,
-          30,
-          5,
-          1440
-        ),
     };
   }
 
@@ -461,33 +452,27 @@ export function createDailyLeadAutomationService({
         config.timezone
       );
 
-    const existingRuns =
+    const existingRun =
       (
         initialState.dailyLeadRuns ||
         []
-      ).filter(
+      ).find(
         (run) =>
           run.workspaceId ===
             workspaceId &&
           run.dateKey ===
-            dateKey
-      );
-
-    const completedRun =
-      existingRuns.find(
-        (run) =>
+            dateKey &&
           [
+            "running",
             "completed",
             "completed_partial",
           ].includes(
-            normalizeStatus(
-              run.status
-            )
+            run.status
           )
       );
 
     if (
-      completedRun &&
+      existingRun &&
       !force
     ) {
       return {
@@ -496,69 +481,11 @@ export function createDailyLeadAutomationService({
         workspaceId,
         run:
           publicRun(
-            completedRun
+            existingRun
           ),
         reason:
-          "Today's automatic allocation has already completed.",
+          "Today's automatic allocation has already run.",
       };
-    }
-
-    const runningRun =
-      existingRuns.find(
-        (run) =>
-          normalizeStatus(
-            run.status
-          ) === "running"
-      );
-
-    if (runningRun) {
-      const startedAtMs =
-        Date.parse(
-          runningRun.startedAt ||
-          runningRun.createdAt ||
-          0
-        );
-
-      const ageMs =
-        Number.isFinite(
-          startedAtMs
-        )
-          ? Date.now() -
-            startedAtMs
-          : Number.POSITIVE_INFINITY;
-
-      const staleAfterMs =
-        config.staleRunMinutes *
-        60_000;
-
-      if (
-        !force &&
-        ageMs < staleAfterMs
-      ) {
-        return {
-          ok: true,
-          skipped: true,
-          workspaceId,
-          run:
-            publicRun(
-              runningRun
-            ),
-          reason:
-            "Today's automatic allocation is still running.",
-        };
-      }
-
-      markRunAbandoned(
-        runningRun.id,
-        force
-          ? "Superseded by a forced daily allocation run."
-          : `Recovered stale running allocation after ${Math.max(
-              1,
-              Math.round(
-                ageMs / 60_000
-              )
-            )} minutes.`
-      );
     }
 
     const callers =
@@ -573,6 +500,34 @@ export function createDailyLeadAutomationService({
         "No active callers were found in this workspace."
       );
     }
+
+    /*
+     * Each caller may now have an individual limit configured from the
+     * manager resource board. The workspace-level leadsPerCaller value
+     * remains the fallback for callers without a custom setting.
+     */
+    const callerTargets =
+      new Map(
+        callers.map(
+          (caller) => [
+            caller.id,
+            getCallerLeadLimit(
+              initialState,
+              workspaceId,
+              caller,
+              config.leadsPerCaller
+            ),
+          ]
+        )
+      );
+
+    const totalTargetCount =
+      [...callerTargets.values()]
+        .reduce(
+          (sum, value) =>
+            sum + value,
+          0
+        );
 
     const now =
       new Date().toISOString();
@@ -590,9 +545,12 @@ export function createDailyLeadAutomationService({
         callers.length,
       leadsPerCaller:
         config.leadsPerCaller,
+      resourceTargets:
+        Object.fromEntries(
+          callerTargets
+        ),
       targetCount:
-        callers.length *
-        config.leadsPerCaller,
+        totalTargetCount,
       recycledCount:
         0,
       reusedCount:
@@ -662,7 +620,12 @@ export function createDailyLeadAutomationService({
               caller.id,
               Math.max(
                 0,
-                config.leadsPerCaller -
+                (
+                  callerTargets.get(
+                    caller.id
+                  ) ||
+                  config.leadsPerCaller
+                ) -
                 (
                   activeCounts.get(
                     caller.id
@@ -1768,50 +1731,6 @@ export function createDailyLeadAutomationService({
     );
   }
 
-  function markRunAbandoned(
-    runId,
-    reason
-  ) {
-    store.update((draft) => {
-      const run =
-        (
-          draft.dailyLeadRuns ||
-          []
-        ).find(
-          (item) =>
-            item.id === runId
-        );
-
-      if (!run) {
-        return;
-      }
-
-      const now =
-        new Date().toISOString();
-
-      run.status =
-        "failed";
-
-      run.errors = [
-        ...(Array.isArray(
-          run.errors
-        )
-          ? run.errors
-          : []),
-        reason,
-      ];
-
-      run.completedAt =
-        now;
-
-      run.updatedAt =
-        now;
-
-      run.recoveredAt =
-        now;
-    });
-  }
-
   function finishRun(
     runId,
     patch
@@ -1915,6 +1834,26 @@ export function createDailyLeadAutomationService({
     runWorkspace,
     releaseDueLeads,
   };
+}
+
+
+function getCallerLeadLimit(
+  state,
+  workspaceId,
+  caller,
+  fallback
+) {
+  return positiveInteger(
+    state.resourceLeadLimits
+      ?.[workspaceId]
+      ?.[caller.id] ??
+      caller.dailyLeadLimit ??
+      caller.leadAssignmentLimit ??
+      fallback,
+    fallback,
+    1,
+    5000
+  );
 }
 
 function listActiveCallers(

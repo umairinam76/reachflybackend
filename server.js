@@ -24,7 +24,8 @@ import {
 import {
   createCallerQueueService,
 } from "./caller-queue-service.js";
-import { createTeamControlService } from "./team-control-service.js";
+import { createTeamControlService } from "../src/team-control-service.js";
+import { createResourceBoardService } from "./resource-board-service.js";
 import { seedRoleTestAccounts } from "./role-test-seed.js";
 import { createTelnyxCallService } from "./telnyx-call-service.js";
 import multer from "multer";
@@ -880,15 +881,23 @@ const leadAuditService =
     workspaceService,
     reportTemplateProvider: (user) =>
       salesOperationsService.getReportTemplate(user),
-    emit({ workspaceId, event, payload }) {
-      emitToWorkspace(workspaceId, event, payload);
-    },
   });
 
 const callerQueueService =
   createCallerQueueService({
     store,
     workspaceService,
+  });
+
+const resourceBoardService =
+  createResourceBoardService({
+    store,
+    workspaceService,
+    teamCommunicationService,
+    teamControlService,
+    telnyxCallService,
+    email,
+    hashPassword,
   });
 
 const dailyLeadAutomationService =
@@ -6107,23 +6116,6 @@ app.get(
 );
 
 app.get(
-  "/api/caller-queue/:id",
-  requireAuth,
-  (req, res, next) => {
-    try {
-      res.json(
-        callerQueueService.getAssignment(
-          req.user,
-          req.params.id
-        )
-      );
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-app.get(
   "/api/caller-queue/:id/history",
   requireAuth,
   (req, res, next) => {
@@ -6315,9 +6307,9 @@ app.use(
 app.get(
   "/api/telnyx/diagnostics",
   requireAuth,
-  asyncRoute(async (req, res) => {
-    res.json(await telnyxCallService.diagnostics(req.user));
-  })
+  (req, res) => {
+    res.json(telnyxCallService.diagnostics(req.user));
+  }
 );
 
 app.get(
@@ -6591,6 +6583,196 @@ app.post("/api/senders", requireAuth, (req, res, next) => {
 app.get("/api/owner/overview", requireAuth, (req, res, next) => {
   try { res.json(teamControlService.ownerOverview(req.user)); } catch (error) { next(error); }
 });
+
+/* ==========================================================
+   Manager resource whiteboard
+   ========================================================== */
+
+app.get(
+  "/api/resource-board",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      resourceBoardService.getBoard(
+        req.user,
+        req.query || {}
+      )
+    );
+  })
+);
+
+app.patch(
+  "/api/resource-board/leads/:assignmentId/assignee",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      resourceBoardService.assignLead(
+        req.user,
+        req.params.assignmentId,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId ||
+        result.assignment?.workspaceId,
+      "resource-board:lead-updated",
+      result
+    );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId ||
+        result.assignment?.workspaceId,
+      "lead:updated",
+      {
+        assignment: result.assignment,
+        lead: result.assignment?.lead,
+      }
+    );
+
+    res.json(result);
+  })
+);
+
+app.post(
+  "/api/resource-board/leads/assign",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      resourceBoardService.assignLeads(
+        req.user,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId,
+      "resource-board:updated",
+      {
+        type: "bulk_lead_assignment",
+        updated: result.updated,
+      }
+    );
+
+    res.json(result);
+  })
+);
+
+app.patch(
+  "/api/resource-board/tasks/:taskId/assignee",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      await resourceBoardService.assignTask(
+        req.user,
+        req.params.taskId,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId ||
+        result.task?.workspaceId,
+      "team:task-updated",
+      { task: result.task }
+    );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId ||
+        result.task?.workspaceId,
+      "resource-board:updated",
+      {
+        type: "task_assignment",
+        task: result.task,
+      }
+    );
+
+    res.json(result);
+  })
+);
+
+app.patch(
+  "/api/resource-board/resources/:resourceId/limit",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      resourceBoardService.setResourceLimit(
+        req.user,
+        req.params.resourceId,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId,
+      "resource-board:resource-updated",
+      result
+    );
+
+    res.json(result);
+  })
+);
+
+app.patch(
+  "/api/resource-board/resources/:resourceId/channels",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      await resourceBoardService.assignChannels(
+        req.user,
+        req.params.resourceId,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId,
+      "resource-board:resource-updated",
+      result
+    );
+
+    res.json(result);
+  })
+);
+
+app.post(
+  "/api/resource-board/resources",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      await resourceBoardService.createResource(
+        req.user,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId,
+      "resource-board:resource-updated",
+      {
+        type: "resource_created",
+        resource: result.resource,
+      }
+    );
+
+    res.status(201).json(result);
+  })
+);
+
+app.patch(
+  "/api/resource-board/resources/:resourceId",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const result =
+      resourceBoardService.updateResource(
+        req.user,
+        req.params.resourceId,
+        req.body || {}
+      );
+
+    emitToWorkspace(
+      req.workspaceContext?.workspaceId,
+      "resource-board:resource-updated",
+      result
+    );
+
+    res.json(result);
+  })
+);
 
 app.get("/api/dev/test-accounts", (req, res) => {
   if (process.env.NODE_ENV === "production" || String(process.env.ENABLE_TEST_ACCOUNTS || "false") !== "true") {
