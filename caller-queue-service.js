@@ -129,6 +129,34 @@ export function createCallerQueueService({
     };
   }
 
+  function getAssignment(
+    user,
+    assignmentId
+  ) {
+    const found = findAssignment(
+      store.read(),
+      assignmentId
+    );
+
+    if (!found) {
+      throw httpError(
+        404,
+        "Lead assignment not found."
+      );
+    }
+
+    const ctx = requireCallerOrManager(user);
+    assertAccess(ctx, user, found.lead);
+
+    return {
+      ok: true,
+      assignment: publicAssignment(
+        found.campaign,
+        found.lead
+      ),
+    };
+  }
+
   function markOpened(
     user,
     assignmentId
@@ -625,6 +653,7 @@ export function createCallerQueueService({
   return {
     listQueue,
     nextLead,
+    getAssignment,
     markOpened,
     startCall,
     completeCall,
@@ -1547,3 +1576,6 @@ function httpError(
 
   return error;
 }
+
+const data = 1+2;
+console.log(data);

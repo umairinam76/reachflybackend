@@ -75,7 +75,7 @@ const AUDIT_LOGGING = ["1", "true", "yes", "on"].includes(
 );
 let serviceRef = null;
 
-export function createLeadAuditService({ store, workspaceService, reportTemplateProvider } = {}) {
+export function createLeadAuditService({ store, workspaceService, reportTemplateProvider, emit = () => {} } = {}) {
   if (!store) {
     throw new Error("createLeadAuditService requires a store.");
   }
@@ -215,8 +215,10 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       }
 
       draft.leadAudits.unshift(record);
+      syncReportToLead(draft, record);
     });
 
+    emitAudit(record);
     enqueue(record.id);
     return record;
   }
@@ -382,10 +384,60 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
   }
 
   function updateRecord(id, changes) {
+    let updated = null;
+
     store.update((draft) => {
       const target = (draft.leadAudits || []).find((item) => item.id === id);
-      if (target) Object.assign(target, changes);
+      if (!target) return;
+
+      Object.assign(target, changes);
+      syncReportToLead(draft, target);
+      updated = { ...target };
     });
+
+    if (updated) emitAudit(updated);
+    return updated;
+  }
+
+  function emitAudit(record) {
+    if (!record?.workspaceId) return;
+
+    emit({
+      workspaceId: record.workspaceId,
+      event: "lead:audit-updated",
+      payload: {
+        audit: publicReport(record),
+        leadId: record.lead?.id || "",
+        website: record.website || "",
+      },
+    });
+  }
+}
+
+function syncReportToLead(draft, record) {
+  if (!record || record.kind !== "mini") return;
+
+  const leadId = clean(record.lead?.id);
+  const website = normalizeUrl(record.website || record.lead?.website);
+  const updatedAt = record.updatedAt || new Date().toISOString();
+
+  for (const campaign of draft.campaigns || []) {
+    if (campaign.workspaceId !== record.workspaceId) continue;
+
+    const lead = (campaign.leads || []).find((candidate) => {
+      if (leadId && clean(candidate.id) === leadId) return true;
+      return website && normalizeUrl(candidate.website) === website;
+    });
+
+    if (!lead) continue;
+
+    lead.miniAuditId = record.id;
+    lead.miniAuditStatus = record.status;
+    lead.miniAuditError = record.error || "";
+    lead.miniAuditUpdatedAt = updatedAt;
+    lead.miniAudit = publicReport(record);
+    lead.updatedAt = updatedAt;
+    break;
   }
 }
 

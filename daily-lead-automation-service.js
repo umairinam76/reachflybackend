@@ -1,63 +1,30 @@
 import crypto from "node:crypto";
 
-/* ==========================================================================
-   Daily lead automation
-   ========================================================================== */
-
-const TERMINAL_LEAD_STATUSES = new Set([
-  "qualified",
-  "converted",
-  "meeting_booked",
-  "not_interested",
-  "do_not_call",
-  "invalid_number",
-  "wrong_number",
-  "closed",
-  "completed",
-]);
-
-const RETRYABLE_LEAD_STATUSES = new Set([
-  "new",
-  "assigned",
-  "ready",
-  "pending",
-  "in_progress",
-  "attempted",
-  "no_answer",
-  "busy",
-  "voicemail",
-  "callback",
-  "follow_up",
-  "missed",
-]);
-
-const RUN_COMPLETE_STATUSES = new Set([
-  "complete",
-  "completed",
-  "completed_partial",
-]);
-
-const RUN_ACTIVE_STATUSES = new Set([
-  "running",
-  "processing",
-]);
-
+/**
+ * Automatic daily lead generation and caller queue allocation.
+ *
+ * Daily sequence:
+ * 1. Release due missed/follow-up leads.
+ * 2. Reuse eligible previously stored leads.
+ * 3. Reuse unassigned leads.
+ * 4. Generate only the remaining shortfall through Google Places.
+ * 5. Assign exactly DAILY_LEADS_PER_CALLER eligible leads to each active caller
+ *    when enough usable leads are available.
+ * 6. Queue mini audits for newly assigned website leads.
+ *
+ * The service is idempotent per workspace/date. A second invocation on the
+ * same date returns the existing run unless force=true.
+ */
 export function createDailyLeadAutomationService({
   store,
   workspaceService,
   leadFinder,
   leadAuditService = null,
   emit = null,
-} = {}) {
+}) {
   if (!store?.read || !store?.update) {
     throw new Error(
       "createDailyLeadAutomationService requires a store exposing read() and update()."
-    );
-  }
-
-  if (!workspaceService) {
-    throw new Error(
-      "createDailyLeadAutomationService requires workspaceService."
     );
   }
 
@@ -67,293 +34,263 @@ export function createDailyLeadAutomationService({
     );
   }
 
-  let schedulerTimer = null;
-  let startupTimer = null;
-  let stopped = false;
-  let schedulerRunning = false;
+  const runningWorkspaces = new Map();
 
-  function getEnvironmentConfig() {
-    return normalizeConfig({
-      enabled: envFlag(
-        "DAILY_LEAD_AUTOMATION_ENABLED",
-        false
-      ),
-
-      leadsPerCaller: envInteger(
-        "DAILY_LEADS_PER_CALLER",
-        100,
-        1,
-        1000
-      ),
-
-      timezone:
-        process.env.DAILY_LEAD_TIMEZONE ||
-        "Asia/Karachi",
-
-      assignmentHour: envInteger(
-        "DAILY_LEAD_ASSIGNMENT_HOUR",
-        0,
-        0,
-        23
-      ),
-
-      assignmentMinute: envInteger(
-        "DAILY_LEAD_ASSIGNMENT_MINUTE",
-        0,
-        0,
-        59
-      ),
-
-      startupDelayMs: envInteger(
-        "DAILY_LEAD_STARTUP_DELAY_MS",
-        15_000,
-        0,
-        10 * 60_000
-      ),
-
-      recycleAfterHours: envInteger(
-        "DAILY_LEAD_RECYCLE_AFTER_HOURS",
-        24,
-        1,
-        24 * 365
-      ),
-
-      maxCallAttempts: envInteger(
-        "DAILY_LEAD_MAX_CALL_ATTEMPTS",
-        5,
-        1,
-        100
-      ),
-
-      maxGenerationPerRun: envInteger(
-        "DAILY_LEAD_MAX_GENERATION_PER_RUN",
-        2000,
-        1,
-        20_000
-      ),
-
-      generationBatchSize: envInteger(
-        "DAILY_LEAD_GENERATION_BATCH_SIZE",
-        200,
-        1,
-        1000
-      ),
-
-      niches: splitCsv(
-        process.env.DAILY_LEAD_NICHES
-      ),
-
-      locations: splitCsv(
-        process.env.DAILY_LEAD_LOCATIONS
-      ),
-
-      regionCode:
-        process.env.DAILY_LEAD_REGION_CODE ||
-        "US",
-
-      radiusKm: envInteger(
-        "DAILY_LEAD_RADIUS_KM",
-        50,
-        1,
-        500
-      ),
-
-      qualityLevel:
-        process.env.DAILY_LEAD_QUALITY_LEVEL ||
-        "balanced",
-
-      autoMiniAudit: envFlag(
-        "DAILY_LEAD_AUTO_MINI_AUDIT",
-        true
-      ),
-
-      staleRunMinutes: envInteger(
-        "DAILY_LEAD_STALE_RUN_MINUTES",
-        30,
-        5,
-        24 * 60
-      ),
-    });
-  }
-
-  function getWorkspaceConfig(
-    workspaceId,
-    state = store.read()
-  ) {
-    const environmentConfig =
-      getEnvironmentConfig();
+  function getConfig(workspaceId, stateOverride = null) {
+    const state = stateOverride || store.read();
 
     const stored =
-      state.workspaceSettings?.[
-        workspaceId
-      ]?.dailyLeads || {};
-
-    return normalizeConfig({
-      ...environmentConfig,
-      ...stored,
-
-      enabled:
-        stored.enabled ??
-        environmentConfig.enabled,
-
-      leadsPerCaller:
-        stored.leadsPerCaller ??
-        environmentConfig.leadsPerCaller,
-
-      timezone:
-        stored.timezone ||
-        environmentConfig.timezone,
-
-      assignmentHour:
-        stored.assignmentHour ??
-        environmentConfig.assignmentHour,
-
-      assignmentMinute:
-        stored.assignmentMinute ??
-        environmentConfig.assignmentMinute,
-
-      niches:
-        Array.isArray(stored.niches) &&
-        stored.niches.length
-          ? stored.niches
-          : environmentConfig.niches,
-
-      locations:
-        Array.isArray(stored.locations) &&
-        stored.locations.length
-          ? stored.locations
-          : environmentConfig.locations,
-    });
-  }
-
-  function status(user) {
-    const state = store.read();
-    ensureCollections(state);
-
-    const context =
-      getWorkspaceContext(
-        workspaceService,
-        user,
-        state
-      );
-
-    const workspaceId =
-      context.workspaceId;
-
-    const config =
-      getWorkspaceConfig(
-        workspaceId,
-        state
-      );
-
-    const runs =
-      state.dailyLeadRuns
-        .filter(
-          (run) =>
-            run.workspaceId ===
-            workspaceId
-        )
-        .sort(
-          (left, right) =>
-            Date.parse(
-              right.createdAt || 0
-            ) -
-            Date.parse(
-              left.createdAt || 0
-            )
-        );
-
-    const todayDateKey =
-      getDateKey(
-        new Date(),
-        config.timezone
-      );
-
-    const todayRun =
-      runs.find(
-        (run) =>
-          run.dateKey ===
-          todayDateKey
-      ) || null;
+      state.workspaceSettings?.[workspaceId]
+        ?.dailyLeadAutomation || {};
 
     return {
-      ok: true,
-      config,
-      todayDateKey,
-      todayRun,
-      latestRun:
-        runs[0] || null,
-      nextRunAt:
-        calculateNextRunAt(config)
-          .toISOString(),
+      enabled:
+        stored.enabled ??
+        envFlag(
+          "DAILY_LEAD_AUTOMATION_ENABLED",
+          false
+        ),
+
+      leadsPerCaller:
+        positiveInteger(
+          stored.leadsPerCaller ??
+          process.env.DAILY_LEADS_PER_CALLER,
+          100,
+          1,
+          5000
+        ),
+
+      maxGenerationPerRun:
+        positiveInteger(
+          stored.maxGenerationPerRun ??
+          process.env.DAILY_LEAD_MAX_GENERATION_PER_RUN,
+          10000,
+          1,
+          50000
+        ),
+
+      generationBatchSize:
+        positiveInteger(
+          stored.generationBatchSize ??
+          process.env.DAILY_LEAD_GENERATION_BATCH_SIZE,
+          200,
+          20,
+          1000
+        ),
+
+      minimumQualityScore:
+        positiveInteger(
+          stored.minimumQualityScore ??
+          process.env.DAILY_LEAD_MIN_QUALITY_SCORE,
+          0,
+          0,
+          100
+        ),
+
+      recycleAfterHours:
+        positiveInteger(
+          stored.recycleAfterHours ??
+          process.env.DAILY_LEAD_RECYCLE_AFTER_HOURS,
+          24,
+          1,
+          720
+        ),
+
+      maxCallAttempts:
+        positiveInteger(
+          stored.maxCallAttempts ??
+          process.env.DAILY_LEAD_MAX_CALL_ATTEMPTS,
+          5,
+          1,
+          20
+        ),
+
+      niches:
+        normalizeStringList(
+          stored.niches ??
+          process.env.DAILY_LEAD_NICHES ??
+          ""
+        ),
+
+      locations:
+        normalizeStringList(
+          stored.locations ??
+          process.env.DAILY_LEAD_LOCATIONS ??
+          ""
+        ),
+
+      regionCode:
+        clean(
+          stored.regionCode ??
+          process.env.DAILY_LEAD_REGION_CODE ??
+          "US"
+        ).toUpperCase(),
+
+      radiusKm:
+        positiveInteger(
+          stored.radiusKm ??
+          process.env.DAILY_LEAD_RADIUS_KM,
+          50,
+          1,
+          500
+        ),
+
+      qualityLevel:
+        clean(
+          stored.qualityLevel ??
+          process.env.DAILY_LEAD_QUALITY_LEVEL ??
+          "balanced"
+        ) || "balanced",
+
+      autoMiniAudit:
+        stored.autoMiniAudit ??
+        envFlag(
+          "DAILY_LEAD_AUTO_MINI_AUDIT",
+          true
+        ),
+
+      timezone:
+        clean(
+          stored.timezone ??
+          process.env.DAILY_LEAD_TIMEZONE ??
+          "UTC"
+        ) || "UTC",
+
+      staleRunMinutes:
+        positiveInteger(
+          stored.staleRunMinutes ??
+          process.env.DAILY_LEAD_STALE_RUN_MINUTES,
+          30,
+          5,
+          1440
+        ),
     };
   }
 
-  function updateConfig(
-    user,
-    input = {}
-  ) {
-    const state = store.read();
+  function saveConfig(user, input = {}) {
+    const ctx = requireManager(user);
+    const current = getConfig(ctx.workspaceId);
 
-    const context =
-      getWorkspaceContext(
-        workspaceService,
-        user,
-        state
-      );
+    const next = {
+      ...current,
 
-    requireManager(context);
+      enabled:
+        input.enabled !== undefined
+          ? Boolean(input.enabled)
+          : current.enabled,
 
-    const workspaceId =
-      context.workspaceId;
+      leadsPerCaller:
+        positiveInteger(
+          input.leadsPerCaller,
+          current.leadsPerCaller,
+          1,
+          5000
+        ),
 
-    const current =
-      getWorkspaceConfig(
-        workspaceId,
-        state
-      );
+      maxGenerationPerRun:
+        positiveInteger(
+          input.maxGenerationPerRun,
+          current.maxGenerationPerRun,
+          1,
+          50000
+        ),
 
-    const next =
-      normalizeConfig({
-        ...current,
-        ...input,
-      });
+      generationBatchSize:
+        positiveInteger(
+          input.generationBatchSize,
+          current.generationBatchSize,
+          20,
+          1000
+        ),
+
+      minimumQualityScore:
+        positiveInteger(
+          input.minimumQualityScore,
+          current.minimumQualityScore,
+          0,
+          100
+        ),
+
+      recycleAfterHours:
+        positiveInteger(
+          input.recycleAfterHours,
+          current.recycleAfterHours,
+          1,
+          720
+        ),
+
+      maxCallAttempts:
+        positiveInteger(
+          input.maxCallAttempts,
+          current.maxCallAttempts,
+          1,
+          20
+        ),
+
+      niches:
+        normalizeStringList(
+          input.niches ?? current.niches
+        ),
+
+      locations:
+        normalizeStringList(
+          input.locations ?? current.locations
+        ),
+
+      regionCode:
+        clean(
+          input.regionCode ??
+          current.regionCode
+        ).toUpperCase(),
+
+      radiusKm:
+        positiveInteger(
+          input.radiusKm,
+          current.radiusKm,
+          1,
+          500
+        ),
+
+      qualityLevel:
+        clean(
+          input.qualityLevel ??
+          current.qualityLevel
+        ) || "balanced",
+
+      autoMiniAudit:
+        input.autoMiniAudit !== undefined
+          ? Boolean(input.autoMiniAudit)
+          : current.autoMiniAudit,
+
+      timezone:
+        clean(
+          input.timezone ??
+          current.timezone
+        ) || "UTC",
+
+      updatedAt:
+        new Date().toISOString(),
+
+      updatedBy:
+        user.id,
+    };
 
     store.update((draft) => {
-      ensureCollections(draft);
-
       draft.workspaceSettings =
-        isPlainObject(
-          draft.workspaceSettings
-        )
-          ? draft.workspaceSettings
-          : {};
+        draft.workspaceSettings || {};
 
       draft.workspaceSettings[
-        workspaceId
+        ctx.workspaceId
       ] =
-        isPlainObject(
-          draft.workspaceSettings[
-            workspaceId
-          ]
-        )
-          ? draft.workspaceSettings[
-              workspaceId
-            ]
-          : {};
+        draft.workspaceSettings[
+          ctx.workspaceId
+        ] || {};
 
       draft.workspaceSettings[
-        workspaceId
-      ].dailyLeads = {
-        ...next,
-        updatedBy:
-          user.id,
-        updatedAt:
-          new Date().toISOString(),
-      };
+        ctx.workspaceId
+      ].dailyLeadAutomation =
+        next;
     });
-
-    scheduleNextRun();
 
     return {
       ok: true,
@@ -361,548 +298,53 @@ export function createDailyLeadAutomationService({
     };
   }
 
-  async function runForUser(
-    user,
-    {
-      force = false,
-      trigger = "manual",
-    } = {}
-  ) {
+  async function runAllWorkspaces({
+    force = false,
+    source = "scheduler",
+  } = {}) {
     const state = store.read();
 
-    const context =
-      getWorkspaceContext(
-        workspaceService,
-        user,
-        state
-      );
-
-    requireManager(context);
-
-    return runWorkspace({
-      workspaceId:
-        context.workspaceId,
-      requestedBy:
-        user.id,
-      force,
-      trigger,
-    });
-  }
-
-  async function runWorkspace({
-    workspaceId,
-    requestedBy = "system",
-    force = false,
-    trigger = "scheduler",
-  } = {}) {
-    if (!workspaceId) {
-      throw httpError(
-        400,
-        "workspaceId is required."
-      );
-    }
-
-    const initialState =
-      store.read();
-
-    ensureCollections(
-      initialState
-    );
-
-    const config =
-      getWorkspaceConfig(
-        workspaceId,
-        initialState
-      );
-
-    if (
-      !config.enabled &&
-      !force
-    ) {
-      return {
-        ok: true,
-        skipped: true,
-        reason:
-          "Daily lead automation is disabled.",
-        workspaceId,
-      };
-    }
-
-    const now =
-      new Date();
-
-    const dateKey =
-      getDateKey(
-        now,
-        config.timezone
-      );
-
-    recoverStaleRuns({
-      workspaceId,
-      dateKey,
-      staleRunMinutes:
-        config.staleRunMinutes,
-    });
-
-    const stateAfterRecovery =
-      store.read();
-
-    ensureCollections(
-      stateAfterRecovery
-    );
-
-    const existingRun =
-      getTodayRun(
-        stateAfterRecovery,
-        workspaceId,
-        dateKey
-      );
-
-    if (
-      existingRun &&
-      RUN_COMPLETE_STATUSES.has(
-        normalizeStatus(
-          existingRun.status
+    const workspaceIds = uniqueStrings([
+      ...(state.workspaces || [])
+        .filter(
+          (workspace) =>
+            workspace.active !== false &&
+            workspace.isActive !== false
         )
-      ) &&
-      !force
-    ) {
-      return {
-        ok: true,
-        skipped: true,
-        reason:
-          "Today's automatic allocation has already completed.",
-        run: existingRun,
-      };
-    }
+        .map((workspace) => workspace.id),
 
-    if (
-      existingRun &&
-      RUN_ACTIVE_STATUSES.has(
-        normalizeStatus(
-          existingRun.status
-        )
-      ) &&
-      !force
-    ) {
-      return {
-        ok: true,
-        skipped: true,
-        reason:
-          "Today's automatic allocation is already running.",
-        run: existingRun,
-      };
-    }
-
-    const runId =
-      crypto.randomUUID();
-
-    const startedAt =
-      new Date().toISOString();
-
-    const runRecord = {
-      id: runId,
-      workspaceId,
-      dateKey,
-      timezone:
-        config.timezone,
-      trigger,
-      requestedBy,
-      force:
-        Boolean(force),
-      status: "running",
-      targetPerCaller:
-        config.leadsPerCaller,
-      callerCount: 0,
-      requestedCount: 0,
-      existingCount: 0,
-      reusedCount: 0,
-      generatedCount: 0,
-      assignedCount: 0,
-      shortageCount: 0,
-      assignedByCaller: {},
-      errors: [],
-      startedAt,
-      createdAt: startedAt,
-      updatedAt: startedAt,
-      completedAt: "",
-    };
-
-    store.update((draft) => {
-      ensureCollections(draft);
-
-      const oldRun =
-        getTodayRun(
-          draft,
-          workspaceId,
-          dateKey
-        );
-
-      if (oldRun) {
-        oldRun.status =
-          "superseded";
-        oldRun.supersededBy =
-          runId;
-        oldRun.updatedAt =
-          startedAt;
-      }
-
-      draft.dailyLeadRuns.unshift(
-        runRecord
-      );
-    });
-
-    emitEvent({
-      workspaceId,
-      event:
-        "daily-leads:run-started",
-      payload: {
-        run: runRecord,
-      },
-    });
-
-    try {
-      const state =
-        store.read();
-
-      ensureCollections(state);
-
-      const callers =
-        getActiveCallers({
-          state,
-          workspaceId,
-          workspaceService,
-        });
-
-      if (!callers.length) {
-        throw httpError(
-          422,
-          "No active callers were found in this workspace."
-        );
-      }
-
-      const targetTotal =
-        callers.length *
-        config.leadsPerCaller;
-
-      updateRun(runId, {
-        callerCount:
-          callers.length,
-        requestedCount:
-          targetTotal,
-      });
-
-      const callerPlans =
-        callers.map(
-          (caller) => {
-            const activeCount =
-              countActiveAssignmentsForCaller({
-                state,
-                workspaceId,
-                callerId:
-                  caller.id,
-                dateKey,
-              });
-
-            return {
-              caller,
-              activeCount,
-              shortage:
-                Math.max(
-                  0,
-                  config.leadsPerCaller -
-                    activeCount
-                ),
-              assigned: 0,
-            };
-          }
-        );
-
-      const totalShortage =
-        callerPlans.reduce(
-          (sum, plan) =>
-            sum +
-            plan.shortage,
-          0
-        );
-
-      if (!totalShortage) {
-        const result =
-          completeRun({
-            runId,
-            status:
-              "completed",
-            assignedCount: 0,
-            shortageCount: 0,
-            assignedByCaller:
-              Object.fromEntries(
-                callerPlans.map(
-                  (plan) => [
-                    plan.caller.id,
-                    0,
-                  ]
-                )
-              ),
-          });
-
-        emitEvent({
-          workspaceId,
-          event:
-            "daily-leads:run-completed",
-          payload: {
-            run: result,
-          },
-        });
-
-        return {
-          ok: true,
-          run: result,
-        };
-      }
-
-      const reusableRefs =
-        collectReusableLeadRefs({
-          state,
-          workspaceId,
-          dateKey,
-          config,
-        });
-
-      const selectedReusable =
-        reusableRefs.slice(
-          0,
-          totalShortage
-        );
-
-      const remainingShortage =
-        Math.max(
-          0,
-          totalShortage -
-            selectedReusable.length
-        );
-
-      let generatedRefs = [];
-
-      if (remainingShortage > 0) {
-        generatedRefs =
-          await generateLeadShortage({
-            workspaceId,
-            requestedBy,
-            shortage:
-              Math.min(
-                remainingShortage,
-                config
-                  .maxGenerationPerRun
-              ),
-            config,
-            runId,
-          });
-      }
-
-      const allLeadRefs =
-        deduplicateLeadRefs([
-          ...selectedReusable,
-          ...generatedRefs,
-        ]);
-
-      const assignmentResult =
-        assignLeadRefsToCallers({
-          workspaceId,
-          dateKey,
-          requestedBy,
-          callerPlans,
-          leadRefs:
-            allLeadRefs,
-          runId,
-        });
-
-      const assignedCount =
-        assignmentResult
-          .assignedCount;
-
-      const finalShortage =
-        Math.max(
-          0,
-          targetTotal -
-            callerPlans.reduce(
-              (sum, plan) =>
-                sum +
-                plan.activeCount,
-              0
-            ) -
-            assignedCount
-        );
-
-      if (
-        config.autoMiniAudit &&
-        assignedCount > 0
-      ) {
-        queueMiniAudits({
-          workspaceId,
-          requestedBy,
-          assignedRefs:
-            assignmentResult
-              .assignedRefs,
-        });
-      }
-
-      const completedStatus =
-        finalShortage > 0
-          ? "completed_partial"
-          : "completed";
-
-      const completedRun =
-        completeRun({
-          runId,
-          status:
-            completedStatus,
-          existingCount:
-            selectedReusable.length,
-          reusedCount:
-            assignmentResult
-              .reusedCount,
-          generatedCount:
-            generatedRefs.length,
-          assignedCount,
-          shortageCount:
-            finalShortage,
-          assignedByCaller:
-            assignmentResult
-              .assignedByCaller,
-        });
-
-      emitEvent({
-        workspaceId,
-        event:
-          "daily-leads:run-completed",
-        payload: {
-          run:
-            completedRun,
-        },
-      });
-
-      return {
-        ok: true,
-        run:
-          completedRun,
-      };
-    } catch (error) {
-      const failedRun =
-        failRun({
-          runId,
-          error,
-        });
-
-      emitEvent({
-        workspaceId,
-        event:
-          "daily-leads:run-failed",
-        payload: {
-          run:
-            failedRun,
-          error:
-            error.message,
-        },
-      });
-
-      throw error;
-    }
-  }
-
-  async function runAllWorkspaces({
-    trigger = "scheduler",
-    force = false,
-  } = {}) {
-    const state =
-      store.read();
-
-    ensureCollections(state);
-
-    const workspaceIds =
-      new Set();
-
-    for (
-      const workspace
-      of state.workspaces
-    ) {
-      if (
-        workspace?.id &&
-        workspace.active !== false &&
-        workspace.isActive !== false &&
-        normalizeStatus(
-          workspace.status
-        ) !== "inactive"
-      ) {
-        workspaceIds.add(
-          workspace.id
-        );
-      }
-    }
-
-    for (
-      const user
-      of state.users
-    ) {
-      if (
-        user?.workspaceId &&
-        user.active !== false &&
-        user.isActive !== false
-      ) {
-        workspaceIds.add(
-          user.workspaceId
-        );
-      }
-    }
+      ...(state.users || [])
+        .map((user) => user.workspaceId)
+        .filter(Boolean),
+    ]);
 
     const results = [];
 
-    for (
-      const workspaceId
-      of workspaceIds
-    ) {
-      const config =
-        getWorkspaceConfig(
-          workspaceId,
-          state
-        );
+    for (const workspaceId of workspaceIds) {
+      const config = getConfig(
+        workspaceId,
+        state
+      );
 
-      if (
-        !config.enabled &&
-        !force
-      ) {
+      if (!config.enabled) {
         continue;
       }
 
       try {
-        const result =
+        results.push(
           await runWorkspace({
             workspaceId,
-            requestedBy:
-              "system",
             force,
-            trigger,
-          });
-
-        results.push({
-          workspaceId,
-          ok: true,
-          result,
-        });
-      } catch (error) {
-        console.error(
-          `[daily-leads] workspace run failed ${JSON.stringify({
-            workspaceId,
-            trigger,
-            error:
-              error.message,
-          })}`
+            source,
+          })
         );
-
+      } catch (error) {
         results.push({
-          workspaceId,
           ok: false,
+          workspaceId,
           error:
-            error.message,
+            error?.message ||
+            String(error),
         });
       }
     }
@@ -911,418 +353,1475 @@ export function createDailyLeadAutomationService({
       ok:
         results.every(
           (item) =>
-            item.ok
+            item.ok !== false
         ),
       results,
+      completedAt:
+        new Date().toISOString(),
     };
   }
 
-  function startScheduler() {
-    stopped = false;
+  async function runForUser(
+    user,
+    {
+      force = false,
+    } = {}
+  ) {
+    const ctx = requireManager(user);
 
-    clearSchedulerTimers();
+    return runWorkspace({
+      workspaceId:
+        ctx.workspaceId,
+      force,
+      source:
+        "manual",
+      requestedBy:
+        user.id,
+    });
+  }
 
-    const environmentConfig =
-      getEnvironmentConfig();
+  async function runWorkspace({
+    workspaceId,
+    force = false,
+    source = "scheduler",
+    requestedBy = "",
+  }) {
+    if (!workspaceId) {
+      throw httpError(
+        400,
+        "workspaceId is required."
+      );
+    }
 
     if (
-      !environmentConfig.enabled
+      runningWorkspaces.has(
+        workspaceId
+      )
     ) {
-      console.log(
-        "[daily-leads] scheduler disabled"
+      return runningWorkspaces.get(
+        workspaceId
       );
+    }
 
+    const promise =
+      performWorkspaceRun({
+        workspaceId,
+        force,
+        source,
+        requestedBy,
+      }).finally(() => {
+        runningWorkspaces.delete(
+          workspaceId
+        );
+      });
+
+    runningWorkspaces.set(
+      workspaceId,
+      promise
+    );
+
+    return promise;
+  }
+
+  async function performWorkspaceRun({
+    workspaceId,
+    force,
+    source,
+    requestedBy,
+  }) {
+    const initialState = store.read();
+    const config = getConfig(
+      workspaceId,
+      initialState
+    );
+
+    if (!config.enabled && source !== "manual") {
       return {
-        stop,
+        ok: true,
+        skipped: true,
+        workspaceId,
+        reason:
+          "Daily lead automation is disabled.",
       };
     }
 
-    const startupDelayMs =
-      environmentConfig
-        .startupDelayMs;
-
-    startupTimer =
-      setTimeout(
-        async () => {
-          try {
-            await runStartupCatchUp();
-          } catch (error) {
-            console.error(
-              "[daily-leads] startup catch-up failed",
-              error
-            );
-          } finally {
-            scheduleNextRun();
-          }
-        },
-        startupDelayMs
-      );
-
-    startupTimer.unref?.();
-
-    console.log(
-      `[daily-leads] startup catch-up scheduled ${JSON.stringify({
-        delayMs:
-          startupDelayMs,
-      })}`
-    );
-
-    return {
-      stop,
-    };
-  }
-
-  async function runStartupCatchUp() {
     if (
-      stopped ||
-      schedulerRunning
+      !config.niches.length ||
+      !config.locations.length
     ) {
-      return;
+      throw httpError(
+        400,
+        "Configure at least one niche and one location before running daily lead automation."
+      );
     }
 
-    schedulerRunning = true;
+    const dateKey =
+      getDateKey(
+        new Date(),
+        config.timezone
+      );
 
-    try {
-      const state =
-        store.read();
-
-      ensureCollections(state);
-
-      const workspaceIds =
-        getActiveWorkspaceIds(state);
-
-      for (
-        const workspaceId
-        of workspaceIds
-      ) {
-        const config =
-          getWorkspaceConfig(
-            workspaceId,
-            state
-          );
-
-        if (!config.enabled) {
-          continue;
-        }
-
-        const currentParts =
-          getZonedDateParts(
-            new Date(),
-            config.timezone
-          );
-
-        const afterScheduledTime =
-          currentParts.hour >
-            config.assignmentHour ||
-          (
-            currentParts.hour ===
-              config.assignmentHour &&
-            currentParts.minute >=
-              config.assignmentMinute
-          );
-
-        if (!afterScheduledTime) {
-          continue;
-        }
-
-        const dateKey =
-          getDateKey(
-            new Date(),
-            config.timezone
-          );
-
-        recoverStaleRuns({
-          workspaceId,
-          dateKey,
-          staleRunMinutes:
-            config.staleRunMinutes,
-        });
-
-        const currentState =
-          store.read();
-
-        const currentRun =
-          getTodayRun(
-            currentState,
-            workspaceId,
+    const existingRuns =
+      (
+        initialState.dailyLeadRuns ||
+        []
+      ).filter(
+        (run) =>
+          run.workspaceId ===
+            workspaceId &&
+          run.dateKey ===
             dateKey
-          );
-
-        if (
-          currentRun &&
-          RUN_COMPLETE_STATUSES.has(
-            normalizeStatus(
-              currentRun.status
-            )
-          )
-        ) {
-          continue;
-        }
-
-        await runWorkspace({
-          workspaceId,
-          requestedBy:
-            "system",
-          trigger:
-            "startup-catch-up",
-          force:
-            Boolean(
-              currentRun &&
-              RUN_ACTIVE_STATUSES.has(
-                normalizeStatus(
-                  currentRun.status
-                )
-              )
-            ),
-        });
-      }
-    } finally {
-      schedulerRunning = false;
-    }
-  }
-
-  function scheduleNextRun() {
-    if (stopped) {
-      return;
-    }
-
-    if (schedulerTimer) {
-      clearTimeout(
-        schedulerTimer
-      );
-    }
-
-    const config =
-      getEnvironmentConfig();
-
-    const nextRun =
-      calculateNextRunAt(
-        config
       );
 
-    const delayMs =
-      Math.max(
-        1000,
-        nextRun.getTime() -
-          Date.now()
-      );
-
-    console.log(
-      `[daily-leads] next run scheduled ${JSON.stringify({
-        nextRunAt:
-          nextRun.toISOString(),
-        timezone:
-          config.timezone,
-        assignmentHour:
-          config.assignmentHour,
-        assignmentMinute:
-          config.assignmentMinute,
-        delayMs,
-      })}`
-    );
-
-    schedulerTimer =
-      setTimeout(
-        async () => {
-          if (
-            stopped ||
-            schedulerRunning
-          ) {
-            scheduleNextRun();
-            return;
-          }
-
-          schedulerRunning = true;
-
-          try {
-            await runAllWorkspaces({
-              trigger:
-                "midnight-scheduler",
-              force: false,
-            });
-          } catch (error) {
-            console.error(
-              "[daily-leads] scheduled run failed",
-              error
-            );
-          } finally {
-            schedulerRunning = false;
-            scheduleNextRun();
-          }
-        },
-        delayMs
-      );
-
-    schedulerTimer.unref?.();
-  }
-
-  function stop() {
-    stopped = true;
-    clearSchedulerTimers();
-  }
-
-  function clearSchedulerTimers() {
-    if (startupTimer) {
-      clearTimeout(
-        startupTimer
-      );
-      startupTimer = null;
-    }
-
-    if (schedulerTimer) {
-      clearTimeout(
-        schedulerTimer
-      );
-      schedulerTimer = null;
-    }
-  }
-
-  function emitEvent({
-    workspaceId,
-    event,
-    payload,
-  }) {
-    if (!emit) {
-      return;
-    }
-
-    try {
-      if (
-        typeof emit ===
-        "function"
-      ) {
-        emit({
-          workspaceId,
-          event,
-          payload,
-        });
-
-        return;
-      }
-
-      emit.emit?.({
-        workspaceId,
-        event,
-        payload,
-      });
-    } catch (error) {
-      console.error(
-        "[daily-leads] emit failed",
-        error
-      );
-    }
-  }
-
-  return {
-    status,
-    getStatus: status,
-
-    updateConfig,
-    saveConfig: updateConfig,
-
-    runForUser,
-    run: runForUser,
-
-    runWorkspace,
-    runAllWorkspaces,
-
-    startScheduler,
-    stop,
-  };
-
-  /* ========================================================================
-     Run persistence
-     ======================================================================== */
-
-  function recoverStaleRuns({
-    workspaceId,
-    dateKey,
-    staleRunMinutes,
-  }) {
-    const cutoff =
-      Date.now() -
-      staleRunMinutes *
-        60_000;
-
-    store.update((draft) => {
-      ensureCollections(draft);
-
-      for (
-        const run
-        of draft.dailyLeadRuns
-      ) {
-        if (
-          run.workspaceId !==
-            workspaceId ||
-          run.dateKey !==
-            dateKey ||
-          !RUN_ACTIVE_STATUSES.has(
+    const completedRun =
+      existingRuns.find(
+        (run) =>
+          [
+            "completed",
+            "completed_partial",
+          ].includes(
             normalizeStatus(
               run.status
             )
           )
+      );
+
+    if (
+      completedRun &&
+      !force
+    ) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        run:
+          publicRun(
+            completedRun
+          ),
+        reason:
+          "Today's automatic allocation has already completed.",
+      };
+    }
+
+    const runningRun =
+      existingRuns.find(
+        (run) =>
+          normalizeStatus(
+            run.status
+          ) === "running"
+      );
+
+    if (runningRun) {
+      const startedAtMs =
+        Date.parse(
+          runningRun.startedAt ||
+          runningRun.createdAt ||
+          0
+        );
+
+      const ageMs =
+        Number.isFinite(
+          startedAtMs
+        )
+          ? Date.now() -
+            startedAtMs
+          : Number.POSITIVE_INFINITY;
+
+      const staleAfterMs =
+        config.staleRunMinutes *
+        60_000;
+
+      if (
+        !force &&
+        ageMs < staleAfterMs
+      ) {
+        return {
+          ok: true,
+          skipped: true,
+          workspaceId,
+          run:
+            publicRun(
+              runningRun
+            ),
+          reason:
+            "Today's automatic allocation is still running.",
+        };
+      }
+
+      markRunAbandoned(
+        runningRun.id,
+        force
+          ? "Superseded by a forced daily allocation run."
+          : `Recovered stale running allocation after ${Math.max(
+              1,
+              Math.round(
+                ageMs / 60_000
+              )
+            )} minutes.`
+      );
+    }
+
+    const callers =
+      listActiveCallers(
+        initialState,
+        workspaceId
+      );
+
+    if (!callers.length) {
+      throw httpError(
+        409,
+        "No active callers were found in this workspace."
+      );
+    }
+
+    const now =
+      new Date().toISOString();
+
+    const run = {
+      id:
+        crypto.randomUUID(),
+      workspaceId,
+      dateKey,
+      source,
+      requestedBy,
+      status:
+        "running",
+      callerCount:
+        callers.length,
+      leadsPerCaller:
+        config.leadsPerCaller,
+      targetCount:
+        callers.length *
+        config.leadsPerCaller,
+      recycledCount:
+        0,
+      reusedCount:
+        0,
+      generatedCount:
+        0,
+      assignedCount:
+        0,
+      auditQueuedCount:
+        0,
+      shortfall:
+        0,
+      errors: [],
+      startedAt:
+        now,
+      completedAt:
+        "",
+      createdAt:
+        now,
+      updatedAt:
+        now,
+    };
+
+    store.update((draft) => {
+      draft.dailyLeadRuns =
+        Array.isArray(
+          draft.dailyLeadRuns
+        )
+          ? draft.dailyLeadRuns
+          : [];
+
+      draft.dailyLeadRuns.unshift(
+        run
+      );
+    });
+
+    emitEvent(
+      workspaceId,
+      "daily-leads:run-started",
+      {
+        run:
+          publicRun(run),
+      }
+    );
+
+    try {
+      releaseDueLeads({
+        workspaceId,
+        config,
+      });
+
+      let state =
+        store.read();
+
+      const activeCounts =
+        countCurrentDailyWorkload(
+          state,
+          workspaceId,
+          callers,
+          dateKey
+        );
+
+      const callerNeeds =
+        new Map(
+          callers.map(
+            (caller) => [
+              caller.id,
+              Math.max(
+                0,
+                config.leadsPerCaller -
+                (
+                  activeCounts.get(
+                    caller.id
+                  ) || 0
+                )
+              ),
+            ]
+          )
+        );
+
+      const totalNeeded =
+        [...callerNeeds.values()]
+          .reduce(
+            (sum, value) =>
+              sum + value,
+            0
+          );
+
+      if (!totalNeeded) {
+        finishRun(
+          run.id,
+          {
+            status:
+              "completed",
+            assignedCount:
+              0,
+            shortfall:
+              0,
+          }
+        );
+
+        return {
+          ok: true,
+          workspaceId,
+          run:
+            publicRun(
+              getRun(
+                run.id
+              )
+            ),
+        };
+      }
+
+      const reusable =
+        collectReusableLeadRefs(
+          state,
+          {
+            workspaceId,
+            config,
+            dateKey,
+          }
+        );
+
+      const selected = reusable.slice(
+        0,
+        totalNeeded
+      );
+
+      const generatedNeeded =
+        Math.min(
+          Math.max(
+            0,
+            totalNeeded -
+            selected.length
+          ),
+          config.maxGenerationPerRun
+        );
+
+      const generatedRefs =
+        generatedNeeded
+          ? await generateLeadShortfall({
+              workspaceId,
+              config,
+              count:
+                generatedNeeded,
+              runId:
+                run.id,
+            })
+          : [];
+
+      const combinedRefs =
+        dedupeLeadRefs([
+          ...selected,
+          ...generatedRefs,
+        ]).slice(
+          0,
+          totalNeeded
+        );
+
+      const assignmentResult =
+        assignDailyQueues({
+          workspaceId,
+          dateKey,
+          callers,
+          callerNeeds,
+          leadRefs:
+            combinedRefs,
+          runId:
+            run.id,
+        });
+
+      let auditQueuedCount =
+        0;
+
+      if (
+        config.autoMiniAudit &&
+        leadAuditService
+      ) {
+        auditQueuedCount =
+          queueMiniAudits({
+            workspaceId,
+            assignmentResult,
+            callers,
+          });
+      }
+
+      finishRun(
+        run.id,
+        {
+          status:
+            assignmentResult.shortfall
+              ? "completed_partial"
+              : "completed",
+          recycledCount:
+            selected.filter(
+              (ref) =>
+                ref.recycled
+            ).length,
+          reusedCount:
+            selected.length,
+          generatedCount:
+            generatedRefs.length,
+          assignedCount:
+            assignmentResult.assignedCount,
+          auditQueuedCount,
+          shortfall:
+            assignmentResult.shortfall,
+        }
+      );
+
+      const completed =
+        getRun(
+          run.id
+        );
+
+      emitEvent(
+        workspaceId,
+        "daily-leads:run-completed",
+        {
+          run:
+            publicRun(
+              completed
+            ),
+          callerQueues:
+            assignmentResult
+              .callerQueues,
+        }
+      );
+
+      return {
+        ok: true,
+        workspaceId,
+        run:
+          publicRun(
+            completed
+          ),
+        callerQueues:
+          assignmentResult
+            .callerQueues,
+      };
+    } catch (error) {
+      finishRun(
+        run.id,
+        {
+          status:
+            "failed",
+          errors: [
+            error?.message ||
+            String(error),
+          ],
+        }
+      );
+
+      emitEvent(
+        workspaceId,
+        "daily-leads:run-failed",
+        {
+          run:
+            publicRun(
+              getRun(
+                run.id
+              )
+            ),
+        }
+      );
+
+      throw error;
+    }
+  }
+
+  function releaseDueLeads({
+    workspaceId,
+    config,
+  }) {
+    const now =
+      Date.now();
+
+    store.update((draft) => {
+      for (
+        const campaign
+        of draft.campaigns ||
+        []
+      ) {
+        if (
+          !campaignBelongsToWorkspace(
+            campaign,
+            workspaceId
+          )
         ) {
           continue;
         }
 
-        const heartbeatTime =
-          Date.parse(
-            run.updatedAt ||
-              run.startedAt ||
-              run.createdAt ||
-              0
-          );
-
-        if (
-          !Number.isFinite(
-            heartbeatTime
-          ) ||
-          heartbeatTime <=
-            cutoff
+        for (
+          const lead
+          of campaign.leads ||
+          []
         ) {
-          run.status =
-            "failed";
+          const status =
+            normalizeStatus(
+              lead.status
+            );
 
-          run.failureReason =
-            "The previous automation run became stale and was recovered automatically.";
-
-          run.completedAt =
-            new Date().toISOString();
-
-          run.updatedAt =
-            run.completedAt;
-
-          run.errors =
-            Array.isArray(
-              run.errors
+          if (
+            ![
+              "no_answer",
+              "busy",
+              "voicemail",
+              "callback",
+              "follow_up",
+              "skipped",
+            ].includes(
+              status
             )
-              ? run.errors
-              : [];
+          ) {
+            continue;
+          }
 
-          run.errors.push({
-            code:
-              "STALE_RUN_RECOVERED",
-            message:
-              run.failureReason,
-            createdAt:
-              run.completedAt,
-          });
+          const attempts =
+            Number(
+              lead.callAttempts ||
+              0
+            );
+
+          if (
+            attempts >=
+            config.maxCallAttempts &&
+            ![
+              "callback",
+              "follow_up",
+            ].includes(
+              status
+            )
+          ) {
+            lead.status =
+              "exhausted";
+            lead.queueStatus =
+              "closed";
+            lead.completedAt =
+              lead.completedAt ||
+              new Date()
+                .toISOString();
+            lead.completedReason =
+              "maximum_attempts_reached";
+            continue;
+          }
+
+          const nextAction =
+            Date.parse(
+              lead.nextActionAt ||
+              lead.followUpAt ||
+              lead.callbackAt ||
+              0
+            );
+
+          const fallbackEligibleAt =
+            Date.parse(
+              lead.lastCallAt ||
+              lead.updatedAt ||
+              lead.assignedAt ||
+              0
+            ) +
+            config.recycleAfterHours *
+            60 *
+            60 *
+            1000;
+
+          const eligibleAt =
+            Number.isFinite(
+              nextAction
+            ) &&
+            nextAction > 0
+              ? nextAction
+              : fallbackEligibleAt;
+
+          if (
+            eligibleAt <= now
+          ) {
+            lead.queueStatus =
+              "ready";
+            lead.dailyQueueDate =
+              "";
+            lead.dailyQueuePosition =
+              null;
+            lead.updatedAt =
+              new Date()
+                .toISOString();
+
+            appendTimeline(
+              lead,
+              {
+                type:
+                  "queue_released",
+                status,
+                createdAt:
+                  lead.updatedAt,
+              }
+            );
+          }
         }
       }
     });
   }
 
-  function updateRun(
-    runId,
-    updates
+  function collectReusableLeadRefs(
+    state,
+    {
+      workspaceId,
+      config,
+      dateKey,
+    }
   ) {
-    let updated = null;
+    const result = [];
+    const seen =
+      new Set();
+
+    for (
+      const campaign
+      of state.campaigns ||
+      []
+    ) {
+      if (
+        !campaignBelongsToWorkspace(
+          campaign,
+          workspaceId
+        )
+      ) {
+        continue;
+      }
+
+      for (
+        const lead
+        of campaign.leads ||
+        []
+      ) {
+        const status =
+          normalizeStatus(
+            lead.status ||
+            "new"
+          );
+
+        if (
+          isClosedStatus(
+            status
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          Number(
+            lead.callAttempts ||
+              0
+          ) >=
+          config.maxCallAttempts &&
+          ![
+            "callback",
+            "follow_up",
+          ].includes(
+            status
+          )
+        ) {
+          continue;
+        }
+
+        const quality =
+          Number(
+            lead.qualityScore ||
+              lead.confidence ||
+              0
+          );
+
+        if (
+          quality <
+          config.minimumQualityScore
+        ) {
+          continue;
+        }
+
+        if (
+          lead.dailyQueueDate ===
+          dateKey
+        ) {
+          continue;
+        }
+
+        if (
+          !isLeadEligibleNow(
+            lead
+          )
+        ) {
+          continue;
+        }
+
+        const key =
+          leadIdentity(
+            lead
+          );
+
+        if (
+          !key ||
+          seen.has(
+            key
+          )
+        ) {
+          continue;
+        }
+
+        seen.add(key);
+
+        result.push({
+          campaignId:
+            campaign.id,
+          leadId:
+            lead.id,
+          key,
+          recycled:
+            [
+              "no_answer",
+              "busy",
+              "voicemail",
+              "callback",
+              "follow_up",
+              "skipped",
+            ].includes(
+              status
+            ),
+          score:
+            scoreLead(
+              lead
+            ),
+        });
+      }
+    }
+
+    return result.sort(
+      (left, right) =>
+        right.score -
+        left.score
+    );
+  }
+
+  async function generateLeadShortfall({
+    workspaceId,
+    config,
+    count,
+    runId,
+  }) {
+    const generated = [];
+    const seen =
+      new Set();
+
+    const queryPairs =
+      buildQueryPairs(
+        config.niches,
+        config.locations
+      );
+
+    let queryIndex = 0;
+
+    while (
+      generated.length <
+        count &&
+      queryIndex <
+        queryPairs.length *
+        4
+    ) {
+      const pair =
+        queryPairs[
+          queryIndex %
+          queryPairs.length
+        ];
+
+      const remaining =
+        count -
+        generated.length;
+
+      const batchSize =
+        Math.min(
+          config.generationBatchSize,
+          remaining
+        );
+
+      const result =
+        await leadFinder.findLeads({
+          runId:
+            `${runId}-${queryIndex + 1}`,
+          niche:
+            pair.niche,
+          location:
+            pair.location,
+          limit:
+            batchSize,
+          radiusKm:
+            config.radiusKm,
+          qualityLevel:
+            config.qualityLevel,
+          regionCode:
+            config.regionCode,
+          exact:
+            false,
+        });
+
+      const accepted =
+        [];
+
+      for (
+        const rawLead
+        of result?.leads ||
+        []
+      ) {
+        const lead =
+          normalizeGeneratedLead(
+            rawLead
+          );
+
+        const key =
+          leadIdentity(
+            lead
+          );
+
+        if (
+          !key ||
+          seen.has(
+            key
+          ) ||
+          leadExistsInWorkspace(
+            store.read(),
+            workspaceId,
+            key
+          )
+        ) {
+          continue;
+        }
+
+        seen.add(key);
+        accepted.push(lead);
+      }
+
+      if (accepted.length) {
+        const campaignId =
+          saveGeneratedCampaign({
+            workspaceId,
+            pair,
+            leads:
+              accepted,
+            runId,
+          });
+
+        for (
+          const lead
+          of accepted
+        ) {
+          generated.push({
+            campaignId,
+            leadId:
+              lead.id,
+            key:
+              leadIdentity(
+                lead
+              ),
+            recycled:
+              false,
+            score:
+              scoreLead(
+                lead
+              ),
+          });
+        }
+      }
+
+      queryIndex += 1;
+
+      if (
+        !accepted.length &&
+        queryIndex >=
+          queryPairs.length
+      ) {
+        break;
+      }
+    }
+
+    return generated.slice(
+      0,
+      count
+    );
+  }
+
+  function saveGeneratedCampaign({
+    workspaceId,
+    pair,
+    leads,
+    runId,
+  }) {
+    const now =
+      new Date().toISOString();
+
+    const campaign = {
+      id:
+        crypto.randomUUID(),
+      workspaceId,
+      name:
+        `Automatic daily leads · ${pair.niche} · ${pair.location}`,
+      niche:
+        pair.niche,
+      location:
+        pair.location,
+      source:
+        "automatic-google-places",
+      status:
+        "active",
+      pipelineStatus:
+        "ready",
+      automatic:
+        true,
+      automaticRunId:
+        runId,
+      leadCount:
+        leads.length,
+      leads,
+      createdAt:
+        now,
+      updatedAt:
+        now,
+    };
 
     store.update((draft) => {
-      ensureCollections(draft);
+      draft.campaigns =
+        Array.isArray(
+          draft.campaigns
+        )
+          ? draft.campaigns
+          : [];
 
+      draft.campaigns.unshift(
+        campaign
+      );
+
+      draft.activity =
+        Array.isArray(
+          draft.activity
+        )
+          ? draft.activity
+          : [];
+
+      draft.activity.unshift({
+        id:
+          crypto.randomUUID(),
+        workspaceId,
+        type:
+          "automatic_lead_generation",
+        title:
+          "Automatic Google Maps leads generated",
+        sub:
+          `${pair.niche} · ${pair.location} · ${leads.length} leads`,
+        createdAt:
+          now,
+      });
+    });
+
+    return campaign.id;
+  }
+
+  function assignDailyQueues({
+    workspaceId,
+    dateKey,
+    callers,
+    callerNeeds,
+    leadRefs,
+    runId,
+  }) {
+    const callerQueues =
+      Object.fromEntries(
+        callers.map(
+          (caller) => [
+            caller.id,
+            [],
+          ]
+        )
+      );
+
+    const orderedCallers =
+      callers
+        .map((caller) => ({
+          ...caller,
+          remaining:
+            callerNeeds.get(
+              caller.id
+            ) || 0,
+        }))
+        .filter(
+          (caller) =>
+            caller.remaining > 0
+        );
+
+    let assignedCount =
+      0;
+    let cursor =
+      0;
+
+    const assignments = [];
+
+    for (
+      const ref
+      of leadRefs
+    ) {
+      if (
+        !orderedCallers.length
+      ) {
+        break;
+      }
+
+      let attempts =
+        0;
+      let caller =
+        null;
+
+      while (
+        attempts <
+        orderedCallers.length
+      ) {
+        const candidate =
+          orderedCallers[
+            cursor %
+            orderedCallers.length
+          ];
+
+        cursor += 1;
+        attempts += 1;
+
+        if (
+          candidate.remaining > 0
+        ) {
+          caller =
+            candidate;
+          break;
+        }
+      }
+
+      if (!caller) {
+        break;
+      }
+
+      caller.remaining -= 1;
+
+      assignments.push({
+        ...ref,
+        callerId:
+          caller.id,
+        callerName:
+          caller.name,
+        position:
+          callerQueues[
+            caller.id
+          ].length + 1,
+      });
+
+      callerQueues[
+        caller.id
+      ].push(
+        ref.leadId
+      );
+
+      assignedCount += 1;
+    }
+
+    const now =
+      new Date().toISOString();
+
+    store.update((draft) => {
+      for (
+        const assignment
+        of assignments
+      ) {
+        const campaign =
+          (
+            draft.campaigns ||
+            []
+          ).find(
+            (item) =>
+              item.id ===
+                assignment.campaignId &&
+              campaignBelongsToWorkspace(
+                item,
+                workspaceId
+              )
+          );
+
+        const lead =
+          (
+            campaign?.leads ||
+            []
+          ).find(
+            (item) =>
+              item.id ===
+                assignment.leadId
+          );
+
+        if (!lead) {
+          continue;
+        }
+
+        lead.assignedTo =
+          assignment.callerId;
+        lead.assigneeId =
+          assignment.callerId;
+        lead.assignedToName =
+          assignment.callerName;
+        lead.assignedAt =
+          now;
+        lead.assignedBy =
+          "daily-automation";
+        lead.status =
+          normalizeStatus(
+            lead.status
+          ) === "new"
+            ? "assigned"
+            : normalizeStatus(
+                lead.status ||
+                "assigned"
+              );
+        lead.queueStatus =
+          "ready";
+        lead.dailyQueueDate =
+          dateKey;
+        lead.dailyQueuePosition =
+          assignment.position;
+        lead.dailyRunId =
+          runId;
+        lead.updatedAt =
+          now;
+
+        appendTimeline(
+          lead,
+          {
+            type:
+              "daily_assignment",
+            status:
+              lead.status,
+            actorId:
+              "daily-automation",
+            assignedTo:
+              assignment.callerId,
+            runId,
+            createdAt:
+              now,
+          }
+        );
+      }
+    });
+
+    const targetCount =
+      [...callerNeeds.values()]
+        .reduce(
+          (sum, value) =>
+            sum + value,
+          0
+        );
+
+    return {
+      assignedCount,
+      shortfall:
+        Math.max(
+          0,
+          targetCount -
+          assignedCount
+        ),
+      callerQueues:
+        Object.fromEntries(
+          callers.map(
+            (caller) => [
+              caller.id,
+              {
+                callerId:
+                  caller.id,
+                callerName:
+                  caller.name,
+                assigned:
+                  callerQueues[
+                    caller.id
+                  ].length,
+                target:
+                  callerNeeds.get(
+                    caller.id
+                  ) || 0,
+              },
+            ]
+          )
+        ),
+      assignments,
+    };
+  }
+
+  function queueMiniAudits({
+    assignmentResult,
+    callers,
+  }) {
+    const callerById =
+      new Map(
+        callers.map(
+          (caller) => [
+            caller.id,
+            caller,
+          ]
+        )
+      );
+
+    const grouped =
+      new Map();
+
+    for (
+      const assignment
+      of assignmentResult.assignments
+    ) {
+      const state =
+        store.read();
+
+      const campaign =
+        (
+          state.campaigns ||
+          []
+        ).find(
+          (item) =>
+            item.id ===
+            assignment.campaignId
+        );
+
+      const lead =
+        (
+          campaign?.leads ||
+          []
+        ).find(
+          (item) =>
+            item.id ===
+            assignment.leadId
+        );
+
+      if (
+        !lead?.website ||
+        lead.miniAudit ||
+        [
+          "queued",
+          "processing",
+          "running",
+          "complete",
+          "completed",
+        ].includes(
+          normalizeStatus(
+            lead.miniAuditStatus
+          )
+        )
+      ) {
+        continue;
+      }
+
+      const caller =
+        callerById.get(
+          assignment.callerId
+        );
+
+      if (!caller) {
+        continue;
+      }
+
+      const group =
+        grouped.get(
+          caller.id
+        ) || {
+          caller,
+          leads: [],
+        };
+
+      group.leads.push(
+        lead
+      );
+
+      grouped.set(
+        caller.id,
+        group
+      );
+    }
+
+    let queued = 0;
+
+    for (
+      const {
+        caller,
+        leads,
+      }
+      of grouped.values()
+    ) {
+      try {
+        const result =
+          leadAuditService.queueMiniBatch(
+            caller,
+            {
+              leads:
+                leads.slice(
+                  0,
+                  1000
+                ),
+              source:
+                "daily-automation",
+            }
+          );
+
+        queued +=
+          Number(
+            result?.queued ||
+            result?.count ||
+            leads.length
+          );
+      } catch (error) {
+        console.warn(
+          "[daily-leads] mini-audit queue failed",
+          {
+            callerId:
+              caller.id,
+            message:
+              error?.message ||
+              String(error),
+          }
+        );
+      }
+    }
+
+    return queued;
+  }
+
+  function getStatus(user) {
+    const ctx =
+      requireManager(user);
+
+    const state =
+      store.read();
+
+    return {
+      ok: true,
+      config:
+        getConfig(
+          ctx.workspaceId,
+          state
+        ),
+      running:
+        runningWorkspaces.has(
+          ctx.workspaceId
+        ),
+      latestRun:
+        publicRun(
+          (
+            state.dailyLeadRuns ||
+            []
+          ).find(
+            (run) =>
+              run.workspaceId ===
+              ctx.workspaceId
+          ) ||
+          null
+        ),
+    };
+  }
+
+  function getRun(runId) {
+    return (
+      (
+        store.read()
+          .dailyLeadRuns ||
+        []
+      ).find(
+        (run) =>
+          run.id === runId
+      ) ||
+      null
+    );
+  }
+
+  function markRunAbandoned(
+    runId,
+    reason
+  ) {
+    store.update((draft) => {
       const run =
-        draft.dailyLeadRuns.find(
+        (
+          draft.dailyLeadRuns ||
+          []
+        ).find(
+          (item) =>
+            item.id === runId
+        );
+
+      if (!run) {
+        return;
+      }
+
+      const now =
+        new Date().toISOString();
+
+      run.status =
+        "failed";
+
+      run.errors = [
+        ...(Array.isArray(
+          run.errors
+        )
+          ? run.errors
+          : []),
+        reason,
+      ];
+
+      run.completedAt =
+        now;
+
+      run.updatedAt =
+        now;
+
+      run.recoveredAt =
+        now;
+    });
+  }
+
+  function finishRun(
+    runId,
+    patch
+  ) {
+    store.update((draft) => {
+      const run =
+        (
+          draft.dailyLeadRuns ||
+          []
+        ).find(
           (item) =>
             item.id ===
             runId
@@ -1334,2271 +1833,396 @@ export function createDailyLeadAutomationService({
 
       Object.assign(
         run,
-        updates,
+        patch,
         {
+          completedAt:
+            patch.status ===
+              "running"
+              ? ""
+              : new Date()
+                  .toISOString(),
           updatedAt:
-            new Date().toISOString(),
+            new Date()
+              .toISOString(),
         }
       );
+    });
+  }
 
-      updated = {
-        ...run,
+  function requireManager(user) {
+    const ctx =
+      workspaceService?.getContext?.(
+        user,
+        store.read()
+      ) || {
+        user,
+        workspaceId:
+          user.workspaceId,
+        role:
+          user.workspaceRole ||
+          user.role,
+        permissions:
+          user.permissions ||
+          [],
       };
-    });
 
-    return updated;
-  }
-
-  function completeRun({
-    runId,
-    status,
-    existingCount,
-    reusedCount,
-    generatedCount,
-    assignedCount,
-    shortageCount,
-    assignedByCaller,
-  }) {
-    const completedAt =
-      new Date().toISOString();
-
-    return updateRun(
-      runId,
-      removeUndefined({
-        status,
-        existingCount,
-        reusedCount,
-        generatedCount,
-        assignedCount,
-        shortageCount,
-        assignedByCaller,
-        completedAt,
-      })
-    );
-  }
-
-  function failRun({
-    runId,
-    error,
-  }) {
-    const completedAt =
-      new Date().toISOString();
-
-    return updateRun(runId, {
-      status: "failed",
-      completedAt,
-      failureReason:
-        error?.message ||
-        "Daily lead automation failed.",
-      errors: [
-        {
-          code:
-            error?.code ||
-            "DAILY_LEAD_RUN_FAILED",
-          message:
-            error?.message ||
-            String(error),
-          createdAt:
-            completedAt,
-        },
-      ],
-    });
-  }
-
-  /* ========================================================================
-     Real lead collection
-     ======================================================================== */
-
-  function collectReusableLeadRefs({
-    state,
-    workspaceId,
-    dateKey,
-    config,
-  }) {
-    const assignedKeys =
-      collectActiveAssignmentKeys({
-        state,
-        workspaceId,
-        dateKey,
-      });
-
-    const now =
-      Date.now();
-
-    const recycleCutoff =
-      now -
-      config.recycleAfterHours *
-        60 *
-        60 *
-        1000;
-
-    const refs = [];
-
-    for (
-      const campaign
-      of state.campaigns || []
-    ) {
-      if (
-        campaign.workspaceId !==
-        workspaceId
-      ) {
-        continue;
-      }
-
-      if (
-        isSyntheticCampaign(
-          campaign
-        )
-      ) {
-        continue;
-      }
-
-      for (
-        const lead
-        of campaign.leads || []
-      ) {
-        if (
-          !lead?.id ||
-          !isRealLead(lead)
-        ) {
-          continue;
-        }
-
-        const leadKey =
-          `${campaign.id}:${lead.id}`;
-
-        if (
-          assignedKeys.has(
-            leadKey
-          )
-        ) {
-          continue;
-        }
-
-        const status =
-          normalizeStatus(
-            lead.status ||
-              lead.queueStatus
-          );
-
-        if (
-          TERMINAL_LEAD_STATUSES.has(
-            status
-          )
-        ) {
-          continue;
-        }
-
-        if (
-          lead.doNotCall ===
-          true
-        ) {
-          continue;
-        }
-
-        const attempts =
-          Number(
-            lead.callAttempts ||
-              lead.attempts ||
-              0
-          );
-
-        if (
-          attempts >=
-          config.maxCallAttempts
-        ) {
-          continue;
-        }
-
-        const nextActionTime =
-          Date.parse(
-            lead.nextActionAt ||
-              lead.callbackAt ||
-              lead.followUpAt ||
-              0
-          );
-
-        if (
-          Number.isFinite(
-            nextActionTime
-          ) &&
-          nextActionTime >
-            now
-        ) {
-          continue;
-        }
-
-        const assignmentTime =
-          Date.parse(
-            lead.assignedAt ||
-              lead.lastAssignedAt ||
-              0
-          );
-
-        const currentlyAssigned =
-          Boolean(
-            lead.assignedTo ||
-              lead.assigneeId
-          );
-
-        if (
-          currentlyAssigned &&
-          Number.isFinite(
-            assignmentTime
-          ) &&
-          assignmentTime >
-            recycleCutoff
-        ) {
-          continue;
-        }
-
-        refs.push({
-          campaignId:
-            campaign.id,
-          leadId:
-            lead.id,
-          lead,
-          source:
-            "existing",
-          priority:
-            getLeadPriority(
-              lead
-            ),
-          dueAt:
-            nextActionTime || 0,
-          createdAt:
-            Date.parse(
-              lead.createdAt ||
-                campaign.createdAt ||
-                0
-            ),
-        });
-      }
-    }
-
-    return refs.sort(
-      compareLeadRefs
-    );
-  }
-
-  async function generateLeadShortage({
-    workspaceId,
-    requestedBy,
-    shortage,
-    config,
-    runId,
-  }) {
-    if (shortage <= 0) {
-      return [];
-    }
+    const role =
+      normalizeStatus(
+        ctx.role
+      );
 
     if (
-      !config.niches.length ||
-      !config.locations.length
+      ![
+        "owner",
+        "admin",
+        "manager",
+      ].includes(role) &&
+      !ctx.permissions?.includes(
+        "manage_campaigns"
+      )
     ) {
       throw httpError(
-        422,
-        "Configure at least one niche and one location before running daily lead automation."
+        403,
+        "Manager access is required."
       );
     }
 
-    const refs = [];
-    const seenKeys =
-      collectExistingLeadIdentityKeys(
-        store.read(),
-        workspaceId
-      );
+    return ctx;
+  }
 
-    let combinationIndex = 0;
-    let remaining = shortage;
-
-    while (
-      remaining > 0 &&
-      refs.length <
-        config.maxGenerationPerRun
-    ) {
-      const niche =
-        config.niches[
-          combinationIndex %
-            config.niches.length
-        ];
-
-      const location =
-        config.locations[
-          Math.floor(
-            combinationIndex /
-              config.niches.length
-          ) %
-            config.locations.length
-        ];
-
-      const batchSize =
-        Math.min(
-          remaining,
-          config.generationBatchSize,
-          1000
-        );
-
-      updateRun(runId, {
-        currentNiche:
-          niche,
-        currentLocation:
-          location,
-        heartbeatAt:
-          new Date().toISOString(),
+  function emitEvent(
+    workspaceId,
+    event,
+    payload
+  ) {
+    try {
+      emit?.({
+        workspaceId,
+        event,
+        payload,
       });
-
-      let result;
-
-      try {
-        result =
-          await leadFinder.findLeads({
-            runId:
-              `${runId}-${combinationIndex + 1}`,
-            niche,
-            location,
-            limit:
-              batchSize,
-            radiusKm:
-              config.radiusKm,
-            qualityLevel:
-              config.qualityLevel,
-            regionCode:
-              config.regionCode,
-            exact: false,
-          });
-      } catch (error) {
-        console.error(
-          `[daily-leads] Google lead generation failed ${JSON.stringify({
-            workspaceId,
-            niche,
-            location,
-            batchSize,
-            error:
-              error.message,
-          })}`
-        );
-
-        combinationIndex += 1;
-
-        if (
-          combinationIndex >=
-          config.niches.length *
-            config.locations.length
-        ) {
-          break;
-        }
-
-        continue;
-      }
-
-      const generatedLeads =
-        Array.isArray(
-          result?.leads
-        )
-          ? result.leads
-          : [];
-
-      const uniqueLeads = [];
-
-      for (
-        const rawLead
-        of generatedLeads
-      ) {
-        const lead =
-          normalizeGeneratedLead(
-            rawLead
-          );
-
-        if (!isRealLead(lead)) {
-          continue;
-        }
-
-        const identityKey =
-          getLeadIdentityKey(
-            lead
-          );
-
-        if (
-          !identityKey ||
-          seenKeys.has(
-            identityKey
-          )
-        ) {
-          continue;
-        }
-
-        seenKeys.add(
-          identityKey
-        );
-
-        uniqueLeads.push(
-          lead
-        );
-      }
-
-      if (
-        uniqueLeads.length
-      ) {
-        const campaign =
-          persistGeneratedCampaign({
-            workspaceId,
-            requestedBy,
-            niche,
-            location,
-            leads:
-              uniqueLeads,
-            runId,
-          });
-
-        for (
-          const lead
-          of campaign.leads
-        ) {
-          refs.push({
-            campaignId:
-              campaign.id,
-            leadId:
-              lead.id,
-            lead,
-            source:
-              "generated",
-            priority:
-              getLeadPriority(
-                lead
-              ),
-            dueAt: 0,
-            createdAt:
-              Date.parse(
-                lead.createdAt ||
-                  campaign.createdAt
-              ),
-          });
-        }
-
-        remaining =
-          Math.max(
-            0,
-            shortage -
-              refs.length
-          );
-      }
-
-      combinationIndex += 1;
-
-      if (
-        combinationIndex >=
-          config.niches.length *
-            config.locations.length *
-            3 &&
-        refs.length === 0
-      ) {
-        break;
-      }
-
-      if (
-        combinationIndex >=
-          config.niches.length *
-            config.locations.length *
-            10
-      ) {
-        break;
-      }
-    }
-
-    return refs.slice(
-      0,
-      shortage
-    );
-  }
-
-  function persistGeneratedCampaign({
-    workspaceId,
-    requestedBy,
-    niche,
-    location,
-    leads,
-    runId,
-  }) {
-    const now =
-      new Date().toISOString();
-
-    const campaign = {
-      id:
-        crypto.randomUUID(),
-      workspaceId,
-      userId:
-        requestedBy,
-      ownerId:
-        requestedBy,
-      createdBy:
-        requestedBy,
-      name:
-        `Automatic ${niche} leads · ${location} · ${now.slice(0, 10)}`,
-      niche,
-      location,
-      source:
-        "google-places",
-      provider:
-        "google-places",
-      automatic:
-        true,
-      dailyLeadRunId:
-        runId,
-      status:
-        "active",
-      pipelineStatus:
-        "ready",
-      leadCount:
-        leads.length,
-      leads:
-        leads.map(
-          (lead) => ({
-            ...lead,
-            id:
-              lead.id ||
-              crypto.randomUUID(),
-            workspaceId,
-            source:
-              lead.source ||
-              "google-places",
-            provider:
-              lead.provider ||
-              "google-places",
-            status:
-              lead.status ||
-              "new",
-            queueStatus:
-              lead.queueStatus ||
-              "ready",
-            assignedTo: "",
-            assigneeId: "",
-            assignedAt: "",
-            createdAt:
-              lead.createdAt ||
-              now,
-            updatedAt:
-              now,
-          })
-        ),
-      createdAt:
-        now,
-      updatedAt:
-        now,
-    };
-
-    store.update((draft) => {
-      ensureCollections(draft);
-
-      draft.campaigns.push(
-        campaign
-      );
-    });
-
-    return campaign;
-  }
-
-  /* ========================================================================
-     Assignment
-     ======================================================================== */
-
-  function assignLeadRefsToCallers({
-    workspaceId,
-    dateKey,
-    requestedBy,
-    callerPlans,
-    leadRefs,
-    runId,
-  }) {
-    const now =
-      new Date().toISOString();
-
-    const assignedByCaller = {};
-    const assignedRefs = [];
-
-    let leadIndex = 0;
-    let reusedCount = 0;
-
-    store.update((draft) => {
-      ensureCollections(draft);
-
-      for (
-        const plan
-        of callerPlans
-      ) {
-        assignedByCaller[
-          plan.caller.id
-        ] = 0;
-
-        let callerAssigned = 0;
-
-        while (
-          callerAssigned <
-            plan.shortage &&
-          leadIndex <
-            leadRefs.length
-        ) {
-          const ref =
-            leadRefs[
-              leadIndex
-            ];
-
-          leadIndex += 1;
-
-          const campaign =
-            draft.campaigns.find(
-              (item) =>
-                item.id ===
-                ref.campaignId
-            );
-
-          const lead =
-            campaign?.leads?.find(
-              (item) =>
-                item.id ===
-                ref.leadId
-            );
-
-          if (!campaign || !lead) {
-            continue;
-          }
-
-          if (
-            hasActiveAssignment({
-              draft,
-              workspaceId,
-              campaignId:
-                campaign.id,
-              leadId:
-                lead.id,
-              dateKey,
-            })
-          ) {
-            continue;
-          }
-
-          const assignmentId =
-            crypto.randomUUID();
-
-          const previousAssignee =
-            lead.assignedTo ||
-            lead.assigneeId ||
-            "";
-
-          lead.assignedTo =
-            plan.caller.id;
-
-          lead.assigneeId =
-            plan.caller.id;
-
-          lead.assignedToName =
-            plan.caller.name ||
-            plan.caller.email ||
-            "Caller";
-
-          lead.assignedBy =
-            requestedBy;
-
-          lead.assignedAt =
-            now;
-
-          lead.lastAssignedAt =
-            now;
-
-          lead.assignmentId =
-            assignmentId;
-
-          lead.dailyQueueDate =
-            dateKey;
-
-          lead.dailyLeadRunId =
-            runId;
-
-          lead.status =
-            normalizeAssignableStatus(
-              lead.status
-            );
-
-          lead.queueStatus =
-            "ready";
-
-          lead.nextActionAt =
-            now;
-
-          lead.updatedAt =
-            now;
-
-          lead.timeline =
-            Array.isArray(
-              lead.timeline
-            )
-              ? lead.timeline
-              : [];
-
-          lead.timeline.unshift({
-            id:
-              crypto.randomUUID(),
-            type:
-              previousAssignee
-                ? "lead_reassigned"
-                : "lead_assigned",
-            actorId:
-              requestedBy,
-            assignedTo:
-              plan.caller.id,
-            previousAssignee,
-            dailyLeadRunId:
-              runId,
-            createdAt:
-              now,
-          });
-
-          const assignment = {
-            id:
-              assignmentId,
-            workspaceId,
-            campaignId:
-              campaign.id,
-            campaignName:
-              campaign.name ||
-              "",
-            leadId:
-              lead.id,
-            userId:
-              plan.caller.id,
-            assignedTo:
-              plan.caller.id,
-            assigneeId:
-              plan.caller.id,
-            assignedBy:
-              requestedBy,
-            status:
-              "assigned",
-            queueStatus:
-              "ready",
-            priority:
-              getLeadPriority(
-                lead
-              ),
-            assignmentDate:
-              dateKey,
-            dailyQueueDate:
-              dateKey,
-            dailyLeadRunId:
-              runId,
-            nextActionAt:
-              now,
-            source:
-              ref.source,
-            createdAt:
-              now,
-            updatedAt:
-              now,
-          };
-
-          draft.salesAssignments.push(
-            assignment
-          );
-
-          draft.teamTasks.push({
-            id:
-              crypto.randomUUID(),
-            workspaceId,
-            campaignId:
-              campaign.id,
-            leadId:
-              lead.id,
-            assignmentId,
-            title:
-              `Call ${
-                lead.name ||
-                lead.business ||
-                "assigned lead"
-              }`,
-            description:
-              "Review the mini audit, call the lead, record the outcome and schedule the next action when required.",
-            type:
-              "lead_call",
-            status:
-              "pending",
-            priority:
-              assignment.priority,
-            assignedTo:
-              plan.caller.id,
-            assignedToUserId:
-              plan.caller.id,
-            createdBy:
-              requestedBy,
-            dueAt:
-              now,
-            dailyQueueDate:
-              dateKey,
-            dailyLeadRunId:
-              runId,
-            createdAt:
-              now,
-            updatedAt:
-              now,
-          });
-
-          callerAssigned += 1;
-
-          assignedByCaller[
-            plan.caller.id
-          ] += 1;
-
-          if (
-            ref.source ===
-            "existing"
-          ) {
-            reusedCount += 1;
-          }
-
-          assignedRefs.push({
-            campaignId:
-              campaign.id,
-            leadId:
-              lead.id,
-            assignmentId,
-            callerId:
-              plan.caller.id,
-            lead: {
-              ...lead,
-            },
-          });
-        }
-
-        plan.assigned =
-          callerAssigned;
-      }
-    });
-
-    return {
-      assignedCount:
-        assignedRefs.length,
-      reusedCount,
-      assignedByCaller,
-      assignedRefs,
-    };
-  }
-
-  function queueMiniAudits({
-    assignedRefs,
-  }) {
-    if (
-      !leadAuditService ||
-      !assignedRefs.length
-    ) {
-      return;
-    }
-
-    const auditCandidates =
-      assignedRefs
-        .filter(
-          (ref) =>
-            Boolean(
-              ref.lead.website ||
-              ref.lead.websiteUri
-            )
-        )
-        .slice(0, 500);
-
-    for (
-      const ref
-      of auditCandidates
-    ) {
-      Promise.resolve()
-        .then(() => {
-          if (
-            typeof leadAuditService
-              .queueMiniAudit ===
-            "function"
-          ) {
-            return leadAuditService
-              .queueMiniAudit(
-                getSystemUser(
-                  ref.callerId
-                ),
-                {
-                  campaignId:
-                    ref.campaignId,
-                  leadId:
-                    ref.leadId,
-                  website:
-                    ref.lead.website ||
-                    ref.lead.websiteUri,
-                  businessName:
-                    ref.lead.name ||
-                    ref.lead.business ||
-                    "",
-                  source:
-                    "daily-lead-automation",
-                }
-              );
-          }
-
-          return null;
-        })
-        .catch((error) => {
-          console.warn(
-            `[daily-leads] mini audit queue failed ${JSON.stringify({
-              campaignId:
-                ref.campaignId,
-              leadId:
-                ref.leadId,
-              error:
-                error.message,
-            })}`
-          );
-        });
+    } catch {
+      // Realtime delivery must not stop allocation.
     }
   }
-
-  function getSystemUser(
-    preferredUserId
-  ) {
-    const state =
-      store.read();
-
-    return (
-      state.users.find(
-        (user) =>
-          user.id ===
-          preferredUserId
-      ) ||
-      state.users.find(
-        (user) =>
-          normalizeRole(
-            user.workspaceRole ||
-              user.role
-          ) ===
-          "manager"
-      ) ||
-      state.users[0] ||
-      {
-        id: "system",
-        role: "manager",
-        workspaceRole:
-          "manager",
-      }
-    );
-  }
-}
-
-/* ==========================================================================
-   Workspace and caller helpers
-   ========================================================================== */
-
-function getActiveWorkspaceIds(
-  state
-) {
-  const workspaceIds =
-    new Set();
-
-  for (
-    const workspace
-    of state.workspaces || []
-  ) {
-    if (
-      workspace?.id &&
-      workspace.active !== false &&
-      workspace.isActive !== false &&
-      normalizeStatus(
-        workspace.status
-      ) !== "inactive"
-    ) {
-      workspaceIds.add(
-        workspace.id
-      );
-    }
-  }
-
-  for (
-    const user
-    of state.users || []
-  ) {
-    if (
-      user?.workspaceId &&
-      user.active !== false &&
-      user.isActive !== false
-    ) {
-      workspaceIds.add(
-        user.workspaceId
-      );
-    }
-  }
-
-  return [
-    ...workspaceIds,
-  ];
-}
-
-function getWorkspaceContext(
-  workspaceService,
-  user,
-  state
-) {
-  const context =
-    workspaceService.getContext(
-      user,
-      state
-    );
-
-  if (
-    !context?.workspaceId
-  ) {
-    throw httpError(
-      400,
-      "Workspace context could not be resolved."
-    );
-  }
-
-  return context;
-}
-
-function getActiveCallers({
-  state,
-  workspaceId,
-  workspaceService,
-}) {
-  const members = [];
-
-  try {
-    const manager =
-      (state.users || []).find(
-        (user) =>
-          user.workspaceId ===
-            workspaceId &&
-          [
-            "manager",
-            "owner",
-            "admin",
-          ].includes(
-            normalizeRole(
-              user.workspaceRole ||
-                user.role
-            )
-          )
-      );
-
-    if (
-      manager &&
-      typeof workspaceService
-        .listMembers ===
-        "function"
-    ) {
-      members.push(
-        ...(
-          workspaceService.listMembers(
-            manager
-          ) || []
-        )
-      );
-    }
-  } catch {
-    // Fall back to state.users.
-  }
-
-  if (!members.length) {
-    members.push(
-      ...(
-        state.users || []
-      ).filter(
-        (user) =>
-          user.workspaceId ===
-          workspaceId
-      )
-    );
-  }
-
-  const byId =
-    new Map();
-
-  for (
-    const member
-    of members
-  ) {
-    if (!member?.id) {
-      continue;
-    }
-
-    byId.set(
-      member.id,
-      member
-    );
-  }
-
-  return [
-    ...byId.values(),
-  ].filter(
-    (member) =>
-      normalizeRole(
-        member.workspaceRole ||
-          member.role
-      ) === "caller" &&
-      member.active !== false &&
-      member.isActive !== false &&
-      normalizeStatus(
-        member.status
-      ) !== "inactive"
-  );
-}
-
-function requireManager(
-  context
-) {
-  const role =
-    normalizeRole(
-      context?.role ||
-      context?.user
-        ?.workspaceRole ||
-      context?.user?.role
-    );
-
-  if (
-    ![
-      "owner",
-      "admin",
-      "manager",
-    ].includes(role)
-  ) {
-    throw httpError(
-      403,
-      "Manager access is required."
-    );
-  }
-}
-
-/* ==========================================================================
-   Assignment helpers
-   ========================================================================== */
-
-function countActiveAssignmentsForCaller({
-  state,
-  workspaceId,
-  callerId,
-  dateKey,
-}) {
-  const assignments =
-    getAssignments(state);
-
-  const uniqueLeadIds =
-    new Set();
-
-  for (
-    const assignment
-    of assignments
-  ) {
-    if (
-      assignment.workspaceId !==
-        workspaceId ||
-      (
-        assignment.assignedTo !==
-          callerId &&
-        assignment.assigneeId !==
-          callerId &&
-        assignment.userId !==
-          callerId
-      )
-    ) {
-      continue;
-    }
-
-    const status =
-      normalizeStatus(
-        assignment.status ||
-          assignment.queueStatus
-      );
-
-    if (
-      TERMINAL_LEAD_STATUSES.has(
-        status
-      ) ||
-      [
-        "cancelled",
-        "unassigned",
-        "archived",
-      ].includes(status)
-    ) {
-      continue;
-    }
-
-    const assignmentDate =
-      assignment.assignmentDate ||
-      assignment.dailyQueueDate ||
-      String(
-        assignment.assignedAt ||
-          assignment.createdAt ||
-          ""
-      ).slice(0, 10);
-
-    if (
-      assignmentDate !==
-      dateKey
-    ) {
-      continue;
-    }
-
-    if (
-      assignment.leadId
-    ) {
-      uniqueLeadIds.add(
-        assignment.leadId
-      );
-    }
-  }
-
-  return uniqueLeadIds.size;
-}
-
-function collectActiveAssignmentKeys({
-  state,
-  workspaceId,
-}) {
-  const keys =
-    new Set();
-
-  for (
-    const assignment
-    of getAssignments(state)
-  ) {
-    if (
-      assignment.workspaceId !==
-      workspaceId
-    ) {
-      continue;
-    }
-
-    const status =
-      normalizeStatus(
-        assignment.status ||
-          assignment.queueStatus
-      );
-
-    if (
-      TERMINAL_LEAD_STATUSES.has(
-        status
-      ) ||
-      [
-        "cancelled",
-        "unassigned",
-        "archived",
-      ].includes(status)
-    ) {
-      continue;
-    }
-
-    if (
-      assignment.campaignId &&
-      assignment.leadId
-    ) {
-      keys.add(
-        `${assignment.campaignId}:${assignment.leadId}`
-      );
-    }
-  }
-
-  return keys;
-}
-
-function hasActiveAssignment({
-  draft,
-  workspaceId,
-  campaignId,
-  leadId,
-  dateKey,
-}) {
-  return getAssignments(
-    draft
-  ).some(
-    (assignment) => {
-      if (
-        assignment.workspaceId !==
-          workspaceId ||
-        assignment.campaignId !==
-          campaignId ||
-        assignment.leadId !==
-          leadId
-      ) {
-        return false;
-      }
-
-      const status =
-        normalizeStatus(
-          assignment.status ||
-            assignment.queueStatus
-        );
-
-      if (
-        TERMINAL_LEAD_STATUSES.has(
-          status
-        ) ||
-        [
-          "cancelled",
-          "unassigned",
-          "archived",
-        ].includes(status)
-      ) {
-        return false;
-      }
-
-      const assignmentDate =
-        assignment.assignmentDate ||
-        assignment.dailyQueueDate ||
-        String(
-          assignment.createdAt ||
-            ""
-        ).slice(0, 10);
-
-      return (
-        assignmentDate ===
-        dateKey
-      );
-    }
-  );
-}
-
-function getAssignments(
-  state
-) {
-  if (
-    Array.isArray(
-      state.salesAssignments
-    )
-  ) {
-    return state
-      .salesAssignments;
-  }
-
-  if (
-    Array.isArray(
-      state.leadAssignments
-    )
-  ) {
-    return state
-      .leadAssignments;
-  }
-
-  return [];
-}
-
-/* ==========================================================================
-   Lead helpers
-   ========================================================================== */
-
-function isRealLead(
-  lead
-) {
-  if (!lead) {
-    return false;
-  }
-
-  const source =
-    normalizeStatus(
-      lead.source ||
-        lead.provider
-    );
-
-  if (
-    [
-      "test_seed",
-      "seed",
-      "synthetic_seed",
-      "demo_seed",
-    ].includes(source)
-  ) {
-    return false;
-  }
-
-  const name =
-    String(
-      lead.name ||
-        lead.business ||
-        ""
-    )
-      .trim()
-      .toLowerCase();
-
-  if (
-    !name ||
-    name.includes(
-      "seed business"
-    )
-  ) {
-    return false;
-  }
-
-  return Boolean(
-    lead.placeId ||
-    lead.phone ||
-    lead.nationalPhoneNumber ||
-    lead.internationalPhoneNumber ||
-    lead.website ||
-    lead.websiteUri ||
-    lead.email ||
-    lead.address ||
-    lead.formattedAddress
-  );
-}
-
-function isSyntheticCampaign(
-  campaign
-) {
-  const source =
-    normalizeStatus(
-      campaign?.source
-    );
-
-  if (
-    [
-      "test_seed",
-      "seed",
-      "synthetic_seed",
-      "demo_seed",
-    ].includes(source)
-  ) {
-    return true;
-  }
-
-  if (
-    campaign?.automaticSeed ===
-      true ||
-    campaign?.seeded ===
-      true
-  ) {
-    return true;
-  }
-
-  const name =
-    String(
-      campaign?.name ||
-        ""
-    ).toLowerCase();
-
-  return (
-    name.includes(
-      "seed business"
-    ) ||
-    name.includes(
-      "daily calling queue"
-    )
-  );
-}
-
-function normalizeGeneratedLead(
-  raw
-) {
-  const now =
-    new Date().toISOString();
 
   return {
-    ...raw,
-
-    id:
-      raw?.id ||
-      crypto.randomUUID(),
-
-    placeId:
-      raw?.placeId ||
-      raw?.googlePlaceId ||
-      "",
-
-    name:
-      raw?.name ||
-      raw?.business ||
-      raw?.displayName ||
-      "Google business",
-
-    business:
-      raw?.business ||
-      raw?.name ||
-      raw?.displayName ||
-      "Google business",
-
-    address:
-      raw?.address ||
-      raw?.formattedAddress ||
-      "",
-
-    formattedAddress:
-      raw?.formattedAddress ||
-      raw?.address ||
-      "",
-
-    phone:
-      raw?.phone ||
-      raw?.internationalPhoneNumber ||
-      raw?.nationalPhoneNumber ||
-      "",
-
-    website:
-      raw?.website ||
-      raw?.websiteUri ||
-      "",
-
-    websiteUri:
-      raw?.websiteUri ||
-      raw?.website ||
-      "",
-
-    source:
-      "google-places",
-
-    provider:
-      "google-places",
-
-    status:
-      "new",
-
-    queueStatus:
-      "ready",
-
-    assignedTo: "",
-    assigneeId: "",
-
-    callAttempts:
-      Number(
-        raw?.callAttempts || 0
-      ),
-
-    createdAt:
-      raw?.createdAt ||
-      now,
-
-    updatedAt:
-      now,
+    getConfig,
+    saveConfig,
+    getStatus,
+    runAllWorkspaces,
+    runForUser,
+    runWorkspace,
+    releaseDueLeads,
   };
 }
 
-function collectExistingLeadIdentityKeys(
+function listActiveCallers(
   state,
   workspaceId
 ) {
-  const keys =
-    new Set();
+  return (
+    state.users ||
+    []
+  )
+    .filter(
+      (user) =>
+        user.workspaceId ===
+          workspaceId &&
+        user.active !==
+          false &&
+        normalizeStatus(
+          user.workspaceRole ||
+          user.role
+        ) ===
+          "caller"
+    )
+    .map(
+      (user) => ({
+        ...user,
+        name:
+          user.name ||
+          user.fullName ||
+          user.email ||
+          "Caller",
+      })
+    );
+}
+
+function countCurrentDailyWorkload(
+  state,
+  workspaceId,
+  callers,
+  dateKey
+) {
+  const counts =
+    new Map(
+      callers.map(
+        (caller) => [
+          caller.id,
+          0,
+        ]
+      )
+    );
 
   for (
     const campaign
-    of state.campaigns || []
+    of state.campaigns ||
+    []
   ) {
     if (
-      campaign.workspaceId !==
-      workspaceId
+      !campaignBelongsToWorkspace(
+        campaign,
+        workspaceId
+      )
     ) {
       continue;
     }
 
     for (
       const lead
-      of campaign.leads || []
+      of campaign.leads ||
+      []
     ) {
-      const key =
-        getLeadIdentityKey(
-          lead
-        );
-
-      if (key) {
-        keys.add(key);
+      if (
+        lead.dailyQueueDate !==
+          dateKey ||
+        !counts.has(
+          lead.assignedTo
+        ) ||
+        isClosedStatus(
+          normalizeStatus(
+            lead.status
+          )
+        )
+      ) {
+        continue;
       }
+
+      counts.set(
+        lead.assignedTo,
+        (
+          counts.get(
+            lead.assignedTo
+          ) || 0
+        ) + 1
+      );
     }
   }
 
-  return keys;
+  return counts;
 }
 
-function getLeadIdentityKey(
-  lead
+function normalizeGeneratedLead(
+  rawLead
 ) {
-  const placeId =
-    clean(
-      lead?.placeId ||
-        lead?.googlePlaceId
-    ).toLowerCase();
+  const now =
+    new Date().toISOString();
 
-  if (placeId) {
-    return `place:${placeId}`;
-  }
-
-  const website =
-    normalizeWebsite(
-      lead?.website ||
-        lead?.websiteUri
-    );
-
-  if (website) {
-    return `website:${website}`;
-  }
-
-  const phone =
-    normalizePhone(
-      lead?.phone ||
-        lead?.internationalPhoneNumber ||
-        lead?.nationalPhoneNumber
-    );
-
-  if (phone) {
-    return `phone:${phone}`;
-  }
-
-  const name =
-    clean(
-      lead?.name ||
-        lead?.business
-    ).toLowerCase();
-
-  const address =
-    clean(
-      lead?.address ||
-        lead?.formattedAddress
-    ).toLowerCase();
-
-  if (name && address) {
-    return `name-address:${name}|${address}`;
-  }
-
-  return "";
+  return {
+    ...rawLead,
+    id:
+      rawLead.id ||
+      crypto.randomUUID(),
+    business:
+      clean(
+        rawLead.business ||
+        rawLead.name
+      ),
+    name:
+      clean(
+        rawLead.name ||
+        rawLead.business
+      ),
+    phone:
+      clean(
+        rawLead.phone
+      ),
+    email:
+      clean(
+        rawLead.email
+      ),
+    website:
+      clean(
+        rawLead.website
+      ),
+    address:
+      clean(
+        rawLead.address ||
+        rawLead.location
+      ),
+    location:
+      clean(
+        rawLead.location ||
+        rawLead.address
+      ),
+    status:
+      "new",
+    queueStatus:
+      "ready",
+    callAttempts:
+      0,
+    answeredCalls:
+      0,
+    timeline:
+      Array.isArray(
+        rawLead.timeline
+      )
+        ? rawLead.timeline
+        : [],
+    createdAt:
+      rawLead.createdAt ||
+      now,
+    updatedAt:
+      now,
+  };
 }
 
-function deduplicateLeadRefs(
+function campaignBelongsToWorkspace(
+  campaign,
+  workspaceId
+) {
+  return (
+    campaign.workspaceId ===
+      workspaceId ||
+    (
+      !campaign.workspaceId &&
+      campaign.companyId ===
+        workspaceId
+    )
+  );
+}
+
+function leadExistsInWorkspace(
+  state,
+  workspaceId,
+  identity
+) {
+  return (
+    state.campaigns ||
+    []
+  ).some(
+    (campaign) =>
+      campaignBelongsToWorkspace(
+        campaign,
+        workspaceId
+      ) &&
+      (
+        campaign.leads ||
+        []
+      ).some(
+        (lead) =>
+          leadIdentity(
+            lead
+          ) ===
+            identity
+      )
+  );
+}
+
+function dedupeLeadRefs(
   refs
 ) {
   const seen =
     new Set();
 
-  const result = [];
+  return refs.filter(
+    (ref) => {
+      const key =
+        ref.key ||
+        `${ref.campaignId}:${ref.leadId}`;
 
-  for (
-    const ref
-    of refs
-  ) {
-    const identity =
-      getLeadIdentityKey(
-        ref.lead
-      ) ||
-      `${ref.campaignId}:${ref.leadId}`;
+      if (
+        seen.has(
+          key
+        )
+      ) {
+        return false;
+      }
 
-    if (
-      seen.has(identity)
-    ) {
-      continue;
+      seen.add(key);
+      return true;
     }
-
-    seen.add(identity);
-    result.push(ref);
-  }
-
-  return result;
-}
-
-function compareLeadRefs(
-  left,
-  right
-) {
-  if (
-    left.dueAt &&
-    right.dueAt &&
-    left.dueAt !==
-      right.dueAt
-  ) {
-    return (
-      left.dueAt -
-      right.dueAt
-    );
-  }
-
-  if (
-    left.priority !==
-    right.priority
-  ) {
-    return (
-      right.priority -
-      left.priority
-    );
-  }
-
-  return (
-    left.createdAt -
-    right.createdAt
   );
 }
 
-function getLeadPriority(
+function buildQueryPairs(
+  niches,
+  locations
+) {
+  const pairs = [];
+
+  for (
+    const niche
+    of niches
+  ) {
+    for (
+      const location
+      of locations
+    ) {
+      pairs.push({
+        niche,
+        location,
+      });
+    }
+  }
+
+  return pairs;
+}
+
+function leadIdentity(
   lead
 ) {
-  const value =
+  const placeId =
+    clean(
+      lead.placeId
+    );
+
+  const phone =
     String(
-      lead?.priority ||
-        ""
+      lead.phone ||
+      ""
+    ).replace(
+      /\D/g,
+      ""
+    );
+
+  const website =
+    normalizeHost(
+      lead.website
+    );
+
+  const email =
+    clean(
+      lead.email
     ).toLowerCase();
 
-  if (value === "urgent") {
-    return 4;
-  }
+  const business =
+    clean(
+      lead.business ||
+      lead.name
+    ).toLowerCase();
 
-  if (value === "high") {
-    return 3;
-  }
+  const location =
+    clean(
+      lead.address ||
+      lead.location
+    ).toLowerCase();
 
-  if (value === "low") {
-    return 1;
-  }
-
-  const score =
-    Number(
-      lead?.qualityScore ||
-        lead?.score ||
-        0
-    );
-
-  if (score >= 85) {
-    return 3;
-  }
-
-  if (score >= 60) {
-    return 2;
-  }
-
-  return 1;
+  return placeId
+    ? `place:${placeId}`
+    : phone
+      ? `phone:${phone}`
+      : website
+        ? `host:${website}`
+        : email
+          ? `email:${email}`
+          : business
+            ? `business:${business}|${location}`
+            : "";
 }
 
-function normalizeAssignableStatus(
-  value
-) {
-  const status =
-    normalizeStatus(value);
-
-  if (
-    !status ||
-    TERMINAL_LEAD_STATUSES.has(
-      status
-    )
-  ) {
-    return "assigned";
-  }
-
-  if (
-    RETRYABLE_LEAD_STATUSES.has(
-      status
-    )
-  ) {
-    return status === "new"
-      ? "assigned"
-      : status;
-  }
-
-  return "assigned";
-}
-
-/* ==========================================================================
-   Run helpers
-   ========================================================================== */
-
-function getTodayRun(
-  state,
-  workspaceId,
-  dateKey
-) {
-  return (
-    (state.dailyLeadRuns || [])
-      .filter(
-        (run) =>
-          run.workspaceId ===
-            workspaceId &&
-          run.dateKey ===
-            dateKey &&
-          normalizeStatus(
-            run.status
-          ) !== "superseded"
-      )
-      .sort(
-        (left, right) =>
-          Date.parse(
-            right.createdAt || 0
-          ) -
-          Date.parse(
-            left.createdAt || 0
-          )
-      )[0] || null
-  );
-}
-
-/* ==========================================================================
-   Scheduler date helpers
-   ========================================================================== */
-
-function calculateNextRunAt(
-  config
-) {
-  const now =
-    new Date();
-
-  const current =
-    getZonedDateParts(
-      now,
-      config.timezone
-    );
-
-  let dateKey =
-    [
-      current.year,
-      String(
-        current.month
-      ).padStart(2, "0"),
-      String(
-        current.day
-      ).padStart(2, "0"),
-    ].join("-");
-
-  const scheduledPassed =
-    current.hour >
-      config.assignmentHour ||
-    (
-      current.hour ===
-        config.assignmentHour &&
-      current.minute >=
-        config.assignmentMinute
-    );
-
-  if (scheduledPassed) {
-    dateKey =
-      addDaysToDateKey(
-        dateKey,
-        1
-      );
-  }
-
-  return zonedDateTimeToUtc({
-    dateKey,
-    hour:
-      config.assignmentHour,
-    minute:
-      config.assignmentMinute,
-    timeZone:
-      config.timezone,
-  });
-}
-
-function getDateKey(
-  date,
-  timeZone
-) {
-  const parts =
-    getZonedDateParts(
-      date,
-      timeZone
-    );
-
-  return [
-    parts.year,
-    String(
-      parts.month
-    ).padStart(2, "0"),
-    String(
-      parts.day
-    ).padStart(2, "0"),
-  ].join("-");
-}
-
-function getZonedDateParts(
-  date,
-  timeZone
-) {
-  const parts =
-    new Intl.DateTimeFormat(
-      "en-CA",
-      {
-        timeZone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hourCycle: "h23",
-      }
-    ).formatToParts(date);
-
-  const values =
-    Object.fromEntries(
-      parts.map(
-        ({
-          type,
-          value,
-        }) => [
-          type,
-          value,
-        ]
-      )
-    );
-
-  return {
-    year:
-      Number(values.year),
-    month:
-      Number(values.month),
-    day:
-      Number(values.day),
-    hour:
-      Number(values.hour),
-    minute:
-      Number(values.minute),
-    second:
-      Number(values.second),
-  };
-}
-
-function zonedDateTimeToUtc({
-  dateKey,
-  hour,
-  minute,
-  timeZone,
-}) {
-  const [
-    year,
-    month,
-    day,
-  ] = dateKey
-    .split("-")
-    .map(Number);
-
-  let estimate =
-    new Date(
-      Date.UTC(
-        year,
-        month - 1,
-        day,
-        hour,
-        minute,
-        0,
-        0
-      )
-    );
-
-  for (
-    let index = 0;
-    index < 4;
-    index += 1
-  ) {
-    const parts =
-      getZonedDateParts(
-        estimate,
-        timeZone
-      );
-
-    const represented =
-      Date.UTC(
-        parts.year,
-        parts.month - 1,
-        parts.day,
-        parts.hour,
-        parts.minute,
-        parts.second
-      );
-
-    const expected =
-      Date.UTC(
-        year,
-        month - 1,
-        day,
-        hour,
-        minute,
-        0
-      );
-
-    estimate =
-      new Date(
-        estimate.getTime() +
-          expected -
-          represented
-      );
-  }
-
-  return estimate;
-}
-
-function addDaysToDateKey(
-  dateKey,
-  days
-) {
-  const [
-    year,
-    month,
-    day,
-  ] = dateKey
-    .split("-")
-    .map(Number);
-
-  return new Date(
-    Date.UTC(
-      year,
-      month - 1,
-      day + days
-    )
-  )
-    .toISOString()
-    .slice(0, 10);
-}
-
-/* ==========================================================================
-   State and configuration
-   ========================================================================== */
-
-function ensureCollections(
-  state
-) {
-  const collections = [
-    "users",
-    "workspaces",
-    "workspaceMembers",
-    "campaigns",
-    "salesAssignments",
-    "leadAssignments",
-    "calls",
-    "callRecords",
-    "teamTasks",
-    "dailyLeadRuns",
-    "activity",
-  ];
-
-  for (
-    const key
-    of collections
-  ) {
-    if (
-      !Array.isArray(
-        state[key]
-      )
-    ) {
-      state[key] = [];
-    }
-  }
-
-  state.workspaceSettings =
-    isPlainObject(
-      state.workspaceSettings
-    )
-      ? state.workspaceSettings
-      : {};
-}
-
-function normalizeConfig(
-  input
-) {
-  return {
-    enabled:
-      Boolean(
-        input.enabled
-      ),
-
-    leadsPerCaller:
-      clampInteger(
-        input.leadsPerCaller,
-        100,
-        1,
-        1000
-      ),
-
-    timezone:
-      clean(
-        input.timezone
-      ) ||
-      "Asia/Karachi",
-
-    assignmentHour:
-      clampInteger(
-        input.assignmentHour,
-        0,
-        0,
-        23
-      ),
-
-    assignmentMinute:
-      clampInteger(
-        input.assignmentMinute,
-        0,
-        0,
-        59
-      ),
-
-    startupDelayMs:
-      clampInteger(
-        input.startupDelayMs,
-        15_000,
-        0,
-        10 * 60_000
-      ),
-
-    recycleAfterHours:
-      clampInteger(
-        input.recycleAfterHours,
-        24,
-        1,
-        24 * 365
-      ),
-
-    maxCallAttempts:
-      clampInteger(
-        input.maxCallAttempts,
-        5,
-        1,
-        100
-      ),
-
-    maxGenerationPerRun:
-      clampInteger(
-        input.maxGenerationPerRun,
-        2000,
-        1,
-        20_000
-      ),
-
-    generationBatchSize:
-      clampInteger(
-        input.generationBatchSize,
-        200,
-        1,
-        1000
-      ),
-
-    niches:
-      normalizeStringArray(
-        input.niches
-      ),
-
-    locations:
-      normalizeStringArray(
-        input.locations
-      ),
-
-    regionCode:
-      clean(
-        input.regionCode
-      ) ||
-      "US",
-
-    radiusKm:
-      clampInteger(
-        input.radiusKm,
-        50,
-        1,
-        500
-      ),
-
-    qualityLevel:
-      clean(
-        input.qualityLevel
-      ) ||
-      "balanced",
-
-    autoMiniAudit:
-      input.autoMiniAudit !==
-      false,
-
-    staleRunMinutes:
-      clampInteger(
-        input.staleRunMinutes,
-        30,
-        5,
-        24 * 60
-      ),
-  };
-}
-
-/* ==========================================================================
-   General utilities
-   ========================================================================== */
-
-function splitCsv(
-  value
-) {
-  return String(
-    value || ""
-  )
-    .split(",")
-    .map(
-      (item) =>
-        item.trim()
-    )
-    .filter(Boolean);
-}
-
-function normalizeStringArray(
-  value
-) {
-  if (
-    Array.isArray(value)
-  ) {
-    return [
-      ...new Set(
-        value
-          .map(
-            (item) =>
-              clean(item)
-          )
-          .filter(Boolean)
-      ),
-    ];
-  }
-
-  return splitCsv(value);
-}
-
-function normalizeRole(
-  value
-) {
-  const role =
-    normalizeStatus(value);
-
-  if (
-    role.includes("owner")
-  ) {
-    return "owner";
-  }
-
-  if (
-    role.includes("admin")
-  ) {
-    return "admin";
-  }
-
-  if (
-    role.includes("manager")
-  ) {
-    return "manager";
-  }
-
-  if (
-    role.includes("caller")
-  ) {
-    return "caller";
-  }
-
-  return role;
-}
-
-function normalizeStatus(
-  value
-) {
-  return clean(value)
-    .toLowerCase()
-    .replace(
-      /[\s-]+/g,
-      "_"
-    );
-}
-
-function normalizePhone(
-  value
-) {
-  return String(
-    value || ""
-  ).replace(
-    /\D/g,
-    ""
-  );
-}
-
-function normalizeWebsite(
+function normalizeHost(
   value
 ) {
   const raw =
@@ -3609,16 +2233,15 @@ function normalizeWebsite(
   }
 
   try {
-    const url =
-      new URL(
-        raw.startsWith("http")
-          ? raw
-          : `https://${raw}`
-      );
-
-    return url.hostname
+    return new URL(
+      /^https?:\/\//i.test(
+        raw
+      )
+        ? raw
+        : `https://${raw}`
+    ).hostname
       .replace(
-        /^www\./,
+        /^www\./i,
         ""
       )
       .toLowerCase();
@@ -3637,21 +2260,243 @@ function normalizeWebsite(
   }
 }
 
-function clean(
-  value
+function isLeadEligibleNow(
+  lead
 ) {
-  return String(
-    value ?? ""
-  ).trim();
+  if (
+    isClosedStatus(
+      normalizeStatus(
+        lead.status
+      )
+    )
+  ) {
+    return false;
+  }
+
+  const nextAction =
+    Date.parse(
+      lead.nextActionAt ||
+      lead.followUpAt ||
+      lead.callbackAt ||
+      0
+    );
+
+  if (
+    Number.isFinite(
+      nextAction
+    ) &&
+    nextAction >
+      Date.now()
+  ) {
+    return false;
+  }
+
+  return (
+    lead.queueStatus !==
+    "held"
+  );
 }
 
-function clampInteger(
+function isClosedStatus(
+  status
+) {
+  return [
+    "qualified",
+    "meeting_booked",
+    "converted",
+    "not_interested",
+    "invalid_number",
+    "do_not_contact",
+    "do_not_call",
+    "completed",
+    "exhausted",
+  ].includes(status);
+}
+
+function scoreLead(
+  lead
+) {
+  const status =
+    normalizeStatus(
+      lead.status
+    );
+
+  let score =
+    Number(
+      lead.qualityScore ||
+      lead.confidence ||
+      0
+    );
+
+  if (
+    lead.priority ===
+    "urgent"
+  ) {
+    score += 1000;
+  }
+
+  if (
+    lead.priority ===
+    "high"
+  ) {
+    score += 500;
+  }
+
+  if (
+    status ===
+    "callback"
+  ) {
+    score += 450;
+  }
+
+  if (
+    status ===
+    "follow_up"
+  ) {
+    score += 400;
+  }
+
+  if (
+    status ===
+    "assigned"
+  ) {
+    score += 300;
+  }
+
+  if (
+    [
+      "no_answer",
+      "busy",
+      "voicemail",
+    ].includes(
+      status
+    )
+  ) {
+    score += 150;
+  }
+
+  score -=
+    Number(
+      lead.callAttempts ||
+      0
+    ) * 20;
+
+  return score;
+}
+
+function appendTimeline(
+  lead,
+  event
+) {
+  lead.timeline =
+    Array.isArray(
+      lead.timeline
+    )
+      ? lead.timeline
+      : [];
+
+  lead.timeline.unshift({
+    id:
+      crypto.randomUUID(),
+    ...event,
+  });
+}
+
+function publicRun(
+  run
+) {
+  if (!run) {
+    return null;
+  }
+
+  return {
+    ...run,
+    errors:
+      Array.isArray(
+        run.errors
+      )
+        ? run.errors
+        : [],
+  };
+}
+
+function getDateKey(
+  date,
+  timezone
+) {
+  try {
+    const parts =
+      new Intl.DateTimeFormat(
+        "en-CA",
+        {
+          timeZone:
+            timezone,
+          year:
+            "numeric",
+          month:
+            "2-digit",
+          day:
+            "2-digit",
+        }
+      ).formatToParts(
+        date
+      );
+
+    const map =
+      Object.fromEntries(
+        parts.map(
+          (part) => [
+            part.type,
+            part.value,
+          ]
+        )
+      );
+
+    return `${map.year}-${map.month}-${map.day}`;
+  } catch {
+    return date
+      .toISOString()
+      .slice(0, 10);
+  }
+}
+
+function normalizeStringList(
+  value
+) {
+  const list =
+    Array.isArray(value)
+      ? value
+      : String(
+          value ||
+          ""
+        ).split(",");
+
+  return uniqueStrings(
+    list
+      .map(clean)
+      .filter(Boolean)
+  );
+}
+
+function uniqueStrings(
+  values
+) {
+  return [
+    ...new Set(
+      values
+        .map(clean)
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function positiveInteger(
   value,
   fallback,
   minimum,
   maximum
 ) {
-  const parsed =
+  const number =
     Number.parseInt(
       value,
       10
@@ -3659,7 +2504,7 @@ function clampInteger(
 
   if (
     !Number.isFinite(
-      parsed
+      number
     )
   ) {
     return fallback;
@@ -3669,28 +2514,38 @@ function clampInteger(
     maximum,
     Math.max(
       minimum,
-      parsed
+      number
     )
   );
 }
 
-function envInteger(
-  name,
-  fallback,
-  minimum,
-  maximum
+function normalizeStatus(
+  value
 ) {
-  return clampInteger(
-    process.env[name],
-    fallback,
-    minimum,
-    maximum
-  );
+  return clean(value)
+    .toLowerCase()
+    .replace(
+      /\s+/g,
+      "_"
+    )
+    .replace(
+      /-/g,
+      "_"
+    );
+}
+
+function clean(
+  value
+) {
+  return String(
+    value ??
+    ""
+  ).trim();
 }
 
 function envFlag(
   name,
-  fallback = false
+  fallback
 ) {
   const value =
     clean(
@@ -3709,43 +2564,15 @@ function envFlag(
   ].includes(value);
 }
 
-function isPlainObject(
-  value
-) {
-  return Boolean(
-    value &&
-    typeof value ===
-      "object" &&
-    !Array.isArray(value)
-  );
-}
-
-function removeUndefined(
-  value
-) {
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(
-        ([, item]) =>
-          item !== undefined
-      )
-  );
-}
-
 function httpError(
   statusCode,
-  message,
-  code = ""
+  message
 ) {
   const error =
     new Error(message);
 
   error.statusCode =
     statusCode;
-
-  if (code) {
-    error.code = code;
-  }
 
   return error;
 }

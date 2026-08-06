@@ -6,8 +6,9 @@ const defaultState = {
   workspaces: [],
   workspaceMembers: [],
   workspaceInvites: [],
-
   campaigns: [],
+
+  // Canonical operational collections.
   salesAssignments: [],
   calls: [],
   attendanceRecords: [],
@@ -25,16 +26,15 @@ const defaultState = {
   internalCalls: [],
 
   dailyLeadRuns: [],
+  telnyxDialers: [],
+  telnyxWebhookEvents: [],
+
   notifications: [],
   inbox: [],
-  activity: [],
 
-  // Temporary compatibility collections for older builds.
+  // Kept for one-way migration from older builds.
   leadAssignments: [],
   callRecords: [],
-
-  workspaceSettings: {},
-  workspaceWhatsApp: {},
 
   settings: {
     app: {
@@ -63,6 +63,8 @@ const defaultState = {
     mode: "demo",
     message: "WhatsApp not linked.",
   },
+
+  activity: [],
 };
 
 export function createStore({ dataDir = "./data" } = {}) {
@@ -77,17 +79,10 @@ export function createStore({ dataDir = "./data" } = {}) {
 
   function read() {
     try {
-      const parsed = JSON.parse(
-        fs.readFileSync(filePath, "utf8")
-      );
-
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
       return mergeState(parsed);
     } catch (error) {
-      console.error(
-        "[store] read failed; restoring defaults",
-        error
-      );
-
+      console.error("[store] read failed; restoring defaults", error);
       const restored = structuredClone(defaultState);
       writeJson(filePath, restored);
       return restored;
@@ -106,17 +101,9 @@ export function createStore({ dataDir = "./data" } = {}) {
     return write(next);
   }
 
-  function addActivity(
-    title,
-    sub,
-    icon = "🎯",
-    extra = {}
-  ) {
+  function addActivity(title, sub, icon = "🎯", extra = {}) {
     update((state) => {
-      state.activity = Array.isArray(state.activity)
-        ? state.activity
-        : [];
-
+      state.activity = Array.isArray(state.activity) ? state.activity : [];
       state.activity.unshift({
         id: uid("act"),
         title,
@@ -126,18 +113,11 @@ export function createStore({ dataDir = "./data" } = {}) {
         createdAt: new Date().toISOString(),
         ...extra,
       });
-
       state.activity = state.activity.slice(0, 500);
     });
   }
 
-  return {
-    filePath,
-    read,
-    write,
-    update,
-    addActivity,
-  };
+  return { filePath, read, write, update, addActivity };
 }
 
 export function uid(prefix = "id") {
@@ -147,65 +127,36 @@ export function uid(prefix = "id") {
 }
 
 function mergeState(value) {
-  const source =
-    value && typeof value === "object" ? value : {};
-
+  const source = value && typeof value === "object" ? value : {};
   const next = {
     ...structuredClone(defaultState),
     ...source,
-
     settings: {
       ...defaultState.settings,
       ...(source.settings || {}),
-
       app: {
         ...defaultState.settings.app,
         ...(source.settings?.app || {}),
       },
-
       email: {
         ...defaultState.settings.email,
         ...(source.settings?.email || {}),
       },
     },
-
-    workspaceSettings:
-      source.workspaceSettings &&
-      typeof source.workspaceSettings === "object"
-        ? source.workspaceSettings
-        : {},
-
-    workspaceWhatsApp:
-      source.workspaceWhatsApp &&
-      typeof source.workspaceWhatsApp === "object"
-        ? source.workspaceWhatsApp
-        : {},
   };
 
   for (const [key, fallback] of Object.entries(defaultState)) {
     if (Array.isArray(fallback)) {
-      next[key] = Array.isArray(source[key])
-        ? source[key]
-        : [];
+      next[key] = Array.isArray(source[key]) ? source[key] : [];
     }
   }
 
-  // One-way migration from older collection names.
-  if (
-    next.salesAssignments.length === 0 &&
-    Array.isArray(source.leadAssignments) &&
-    source.leadAssignments.length
-  ) {
-    next.salesAssignments = structuredClone(
-      source.leadAssignments
-    );
+  // One-time compatibility migration. New code writes only canonical names.
+  if (!next.salesAssignments.length && Array.isArray(source.leadAssignments)) {
+    next.salesAssignments = structuredClone(source.leadAssignments);
   }
 
-  if (
-    next.calls.length === 0 &&
-    Array.isArray(source.callRecords) &&
-    source.callRecords.length
-  ) {
+  if (!next.calls.length && Array.isArray(source.callRecords)) {
     next.calls = structuredClone(source.callRecords);
   }
 
@@ -214,12 +165,6 @@ function mergeState(value) {
 
 function writeJson(filePath, data) {
   const temporaryPath = `${filePath}.tmp`;
-
-  fs.writeFileSync(
-    temporaryPath,
-    JSON.stringify(data, null, 2),
-    "utf8"
-  );
-
+  fs.writeFileSync(temporaryPath, JSON.stringify(data, null, 2));
   fs.renameSync(temporaryPath, filePath);
 }

@@ -24,9 +24,9 @@ import {
 import {
   createCallerQueueService,
 } from "./caller-queue-service.js";
-import { createTeamControlService } from "./team-control-service.js";
+import { createTeamControlService } from "../src/team-control-service.js";
 import { seedRoleTestAccounts } from "./role-test-seed.js";
-import { createVonageCallService } from "./vonage-call-service.js";
+import { createTelnyxCallService } from "./telnyx-call-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
 import fs from "node:fs";
@@ -45,20 +45,8 @@ const API_HOST =
   process.env.API_HOST ||
   "0.0.0.0";
 
-const DATA_DIR = path.resolve(
-  process.env.DATA_DIR ||
-    path.join(__dirname, "data")
-);
-
-console.log(
-  `[startup] data-directory ${JSON.stringify({
-    configuredValue:
-      process.env.DATA_DIR || "",
-    resolvedValue: DATA_DIR,
-    cwd: process.cwd(),
-    dirname: __dirname,
-  })}`
-);
+const DATA_DIR =
+  process.env.DATA_DIR || path.resolve(__dirname, "../../../data");
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
@@ -876,9 +864,14 @@ const teamCommunicationService =
   });
 const seededTestAccounts = seedRoleTestAccounts({ store });
 
-const vonageCallService =
-  createVonageCallService({
-    salesOperationsService,
+const telnyxCallService =
+  createTelnyxCallService({
+    store,
+    workspaceService,
+    dataDir: DATA_DIR,
+    emit({ workspaceId, event, payload }) {
+      emitToWorkspace(workspaceId, event, payload);
+    },
   });
 
 const leadAuditService =
@@ -887,6 +880,9 @@ const leadAuditService =
     workspaceService,
     reportTemplateProvider: (user) =>
       salesOperationsService.getReportTemplate(user),
+    emit({ workspaceId, event, payload }) {
+      emitToWorkspace(workspaceId, event, payload);
+    },
   });
 
 const callerQueueService =
@@ -1538,6 +1534,12 @@ app.use(
 app.use(
   express.json({
     limit: BODY_LIMIT,
+    verify(req, _res, buffer) {
+      // Telnyx webhook signatures must be verified against the exact raw body.
+      if (req.originalUrl?.startsWith("/api/telnyx/webhooks")) {
+        req.rawBody = buffer.toString("utf8");
+      }
+    },
   })
 );
 
@@ -1551,27 +1553,7 @@ app.use(
 /* ==========================================================
    Team communication routes
    ========================================================== */
-app.get("/", (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    name: "ReachFly API",
-    health: "/api/health",
-    timestamp: new Date().toISOString(),
-  });
-});
 
-app.get("/api/health", (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    name: "ReachFly API",
-    version: "5.6.1",
-    timestamp: new Date().toISOString(),
-    uptimeSeconds: Math.round(process.uptime()),
-    host: API_HOST,
-    port: PORT,
-    googlePlaces: placesProvider.getDiagnostics(),
-  });
-});
 app.get(
   "/api/team-communication/channels",
   requireAuth,
@@ -6125,6 +6107,23 @@ app.get(
 );
 
 app.get(
+  "/api/caller-queue/:id",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        callerQueueService.getAssignment(
+          req.user,
+          req.params.id
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.get(
   "/api/caller-queue/:id/history",
   requireAuth,
   (req, res, next) => {
@@ -6298,7 +6297,7 @@ app.post(
 
 
 /* ==========================================================
-   Vonage click-to-call, call tracking and sales operations
+   Telnyx browser dialer, call tracking and recordings
    ========================================================== */
 
 app.use(
@@ -6308,70 +6307,124 @@ app.use(
     {
       fallthrough: false,
       index: false,
-      maxAge:
-        IS_PRODUCTION
-          ? "7d"
-          : 0,
+      maxAge: IS_PRODUCTION ? "7d" : 0,
     }
   )
 );
 
-app.get("/api/vonage/diagnostics", requireAuth, (req, res) => {
-  res.json(vonageCallService.diagnostics());
-});
+app.get(
+  "/api/telnyx/diagnostics",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(await telnyxCallService.diagnostics(req.user));
+  })
+);
 
-app.post("/api/vonage/calls", requireAuth, async (req, res, next) => {
-  try {
-    const call = await vonageCallService.startClickToCall(req.user, req.body || {});
-    res.status(202).json(call);
-  } catch (error) {
-    next(error);
-  }
-});
+app.get(
+  "/api/telnyx/session",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(await telnyxCallService.getBrowserSession(req.user));
+  })
+);
 
-app.get("/api/vonage/calls", requireAuth, (req, res, next) => {
-  try {
-    res.json({ calls: salesOperationsService.listCalls(req.user, req.query || {}) });
-  } catch (error) { next(error); }
-});
+app.get(
+  "/api/telnyx/dialers",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxCallService.listDialers(req.user));
+  })
+);
 
-app.get("/api/vonage/calls/:id", requireAuth, (req, res, next) => {
-  try { res.json(salesOperationsService.getCall(req.user, req.params.id)); }
-  catch (error) { next(error); }
-});
+app.post(
+  "/api/telnyx/dialers/provision",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.status(201).json(await telnyxCallService.provisionAllCallers(req.user));
+  })
+);
 
-app.patch("/api/vonage/calls/:id", requireAuth, (req, res, next) => {
-  try { res.json(vonageCallService.completeCall(req.user, req.params.id, req.body || {})); }
-  catch (error) { next(error); }
-});
+app.post(
+  "/api/telnyx/calls",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.status(201).json(telnyxCallService.createCall(req.user, req.body || {}));
+  })
+);
 
-app.get("/api/vonage/contact-policy", requireAuth, (req, res, next) => {
-  try {
+app.get(
+  "/api/telnyx/calls",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxCallService.listCalls(req.user, req.query || {}));
+  })
+);
+
+app.get(
+  "/api/telnyx/calls/:id",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxCallService.getCall(req.user, req.params.id));
+  })
+);
+
+app.patch(
+  "/api/telnyx/calls/:id/link",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxCallService.linkCall(req.user, req.params.id, req.body || {}));
+  })
+);
+
+app.patch(
+  "/api/telnyx/calls/:id/state",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxCallService.updateClientState(req.user, req.params.id, req.body || {}));
+  })
+);
+
+app.patch(
+  "/api/telnyx/calls/:id/complete",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxCallService.completeCall(req.user, req.params.id, req.body || {}));
+  })
+);
+
+app.get(
+  "/api/telnyx/recordings/:callId",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const recording = telnyxCallService.getRecording(req.user, req.params.callId);
+    res.setHeader("Content-Type", recording.mimeType);
+    res.setHeader("Content-Disposition", `inline; filename="${recording.filename}"`);
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.sendFile(recording.filePath);
+  })
+);
+
+app.post(
+  "/api/telnyx/webhooks/call-control",
+  asyncRoute(async (req, res) => {
+    // Respond only after signature verification and durable event storage.
+    const result = await telnyxCallService.handleWebhook({
+      rawBody: req.rawBody || JSON.stringify(req.body || {}),
+      headers: req.headers,
+      body: req.body || {},
+    });
+    res.status(200).json(result);
+  })
+);
+
+app.get(
+  "/api/telnyx/contact-policy",
+  requireAuth,
+  asyncRoute(async (req, res) => {
     const lead = req.query.lead ? JSON.parse(String(req.query.lead)) : req.query;
     res.json(salesOperationsService.getContactPolicy(req.user, lead));
-  } catch (error) { next(error); }
-});
-
-app.get("/api/vonage/webhooks/answer", (req, res, next) => {
-  try {
-    res.json(vonageCallService.answerNcco({ sessionId: req.query.sessionId, token: req.query.token }));
-  } catch (error) { next(error); }
-});
-
-app.post("/api/vonage/webhooks/events", (req, res, next) => {
-  try {
-    vonageCallService.handleEvent({ sessionId: req.query.sessionId, token: req.query.token, payload: req.body || {} });
-    res.status(204).end();
-  } catch (error) { next(error); }
-});
-
-app.post("/api/vonage/webhooks/recordings", (req, res, next) => {
-  try {
-    vonageCallService.handleRecording({ sessionId: req.query.sessionId, token: req.query.token, payload: req.body || {} });
-    res.status(204).end();
-  } catch (error) { next(error); }
-});
-
+  })
+);
 
 app.get(
   "/api/attendance/today",
@@ -6967,29 +7020,16 @@ app.use(
   }
 );
 
-const httpServer = app.listen(
-  PORT,
-  API_HOST,
-  () => {
-    console.log(
-      `[startup] ReachFly API listening ${JSON.stringify({
-        host: API_HOST,
-        port: PORT,
-        healthUrl: `http://127.0.0.1:${PORT}/api/health`,
-      })}`
-    );
-  }
-);
-
-httpServer.on("error", (error) => {
-  console.error("[startup] HTTP server failed", {
-    code: error?.code,
-    message: error?.message,
-    stack: error?.stack,
-  });
-
-  process.exitCode = 1;
-});
+const httpServer =
+  app.listen(
+    PORT,
+    API_HOST,
+    () => {
+      console.log(
+        `ReachFly API listening on ${API_HOST}:${PORT}`
+      );
+    }
+  );
 
 
 
