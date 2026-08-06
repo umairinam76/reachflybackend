@@ -24,7 +24,7 @@ import {
 import {
   createCallerQueueService,
 } from "./caller-queue-service.js";
-import { createTeamControlService } from "../src/team-control-service.js";
+import { createTeamControlService } from "./team-control-service.js";
 import { createResourceBoardService } from "./resource-board-service.js";
 import { seedRoleTestAccounts } from "./role-test-seed.js";
 import { createTelnyxCallService } from "./telnyx-call-service.js";
