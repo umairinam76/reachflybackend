@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { createStore } from "../store.js";
+import { createStore } from "./store.js";
 
 const DATA_DIR =
   process.env.DATA_DIR ||
