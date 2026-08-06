@@ -24,10 +24,11 @@ import {
 import {
   createCallerQueueService,
 } from "./caller-queue-service.js";
-import { createTeamControlService } from "./team-control-service.js";
+import { createTeamControlService } from "../src/team-control-service.js";
 import { createResourceBoardService } from "./resource-board-service.js";
 import { seedRoleTestAccounts } from "./role-test-seed.js";
 import { createTelnyxCallService } from "./telnyx-call-service.js";
+import { createTelnyxAIAgentService } from "./telnyx-ai-agent-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
 import fs from "node:fs";
@@ -875,6 +876,15 @@ const telnyxCallService =
     },
   });
 
+const telnyxAiAgentService =
+  createTelnyxAIAgentService({
+    store,
+    workspaceService,
+    emit({ workspaceId, event, payload }) {
+      emitToWorkspace(workspaceId, event, payload);
+    },
+  });
+
 const leadAuditService =
   createLeadAuditService({
     store,
@@ -1545,7 +1555,7 @@ app.use(
     limit: BODY_LIMIT,
     verify(req, _res, buffer) {
       // Telnyx webhook signatures must be verified against the exact raw body.
-      if (req.originalUrl?.startsWith("/api/telnyx/webhooks")) {
+      if (req.originalUrl?.startsWith("/api/telnyx/")) {
         req.rawBody = buffer.toString("utf8");
       }
     },
@@ -6405,6 +6415,137 @@ app.post(
       headers: req.headers,
       body: req.body || {},
     });
+    res.status(200).json(result);
+  })
+);
+
+/* ==========================================================
+   Workspace-scoped Telnyx AI voice agent
+   ========================================================== */
+
+app.get(
+  "/api/telnyx/ai-agent/access",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxAiAgentService.getAccess(req.user));
+  })
+);
+
+app.get(
+  "/api/telnyx/ai-agent/dashboard",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(telnyxAiAgentService.getDashboard(req.user));
+  })
+);
+
+app.get(
+  "/api/telnyx/ai-agent/voices",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxAiAgentService.listVoices(req.user, {
+        force: String(req.query.force || "") === "true",
+      })
+    );
+  })
+);
+
+app.put(
+  "/api/telnyx/ai-agent",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxAiAgentService.saveAgent(
+        req.user,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/leads/assign",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.status(201).json(
+      telnyxAiAgentService.assignLeads(
+        req.user,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/campaigns/start",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.status(202).json(
+      await telnyxAiAgentService.startCampaign(
+        req.user,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/calls/:id/cancel",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxAiAgentService.cancelCall(
+        req.user,
+        req.params.id
+      )
+    );
+  })
+);
+
+/*
+ * These two tool routes are called by the Telnyx AI Assistant itself.
+ * They are protected by TELNYX_AI_AGENT_TOOL_SECRET configured as a
+ * custom header on each Telnyx webhook tool.
+ */
+app.post(
+  "/api/telnyx/ai-agent/tools/book-meeting",
+  asyncRoute(async (req, res) => {
+    res.json(
+      telnyxAiAgentService.bookMeeting({
+        headers: req.headers,
+        body: req.body || {},
+      })
+    );
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/tools/update-lead",
+  asyncRoute(async (req, res) => {
+    res.json(
+      telnyxAiAgentService.updateLeadOutcome({
+        headers: req.headers,
+        body: req.body || {},
+      })
+    );
+  })
+);
+
+/*
+ * Telnyx call lifecycle and AI-conversation webhooks. Signature verification
+ * is performed inside telnyxAiAgentService using req.rawBody.
+ */
+app.post(
+  "/api/telnyx/ai-agent/webhooks",
+  asyncRoute(async (req, res) => {
+    const result =
+      await telnyxAiAgentService.handleWebhook({
+        rawBody:
+          req.rawBody || JSON.stringify(req.body || {}),
+        headers: req.headers,
+        body: req.body || {},
+      });
     res.status(200).json(result);
   })
 );

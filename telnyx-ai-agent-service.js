@@ -1,0 +1,3102 @@
+import crypto from "node:crypto";
+
+const TELNYX_API_BASE = "https://api.telnyx.com/v2";
+const DEFAULT_VOICE =
+  process.env.TELNYX_AI_AGENT_DEFAULT_VOICE ||
+  "Telnyx.NaturalHD.astra";
+const DEFAULT_LEAD_TIMEZONE =
+  process.env.TELNYX_AI_AGENT_DEFAULT_TIMEZONE ||
+  "America/New_York";
+const AH_GROWTH_WORKSPACE_ID = "ah-growth-workspace";
+
+const TERMINAL_QUEUE_STATUSES = new Set([
+  "completed",
+  "cancelled",
+  "failed",
+  "meeting_booked",
+  "do_not_call",
+  "not_interested",
+  "invalid_number",
+]);
+
+const ACTIVE_CALL_STATUSES = new Set([
+  "queued",
+  "initiated",
+  "ringing",
+  "answered",
+  "assistant_active",
+  "active",
+]);
+
+/**
+ * Workspace-scoped Telnyx AI voice-agent integration.
+ *
+ * Design goals:
+ * - reuse the current Telnyx API key, public key and Call Control application;
+ * - never expose the feature to AH Growth, in either the UI or API;
+ * - keep every assistant, queue item, call, meeting and suppression decision
+ *   scoped to one ReachFly workspace;
+ * - attach a Telnyx AI Assistant after the outbound PSTN call is answered;
+ * - allow the assistant to update lead outcomes and create a confirmed meeting
+ *   through secret-protected webhook tools;
+ * - prevent blind auto-dialing through DNC, quiet-hours, daily-limit and
+ *   concurrency checks.
+ */
+export function createTelnyxAIAgentService({
+  store,
+  workspaceService,
+  emit = () => {},
+} = {}) {
+  if (!store?.read || !store?.update) {
+    throw new Error(
+      "createTelnyxAIAgentService requires a store exposing read() and update()."
+    );
+  }
+
+  const voiceCache = {
+    expiresAt: 0,
+    value: [],
+  };
+
+  function getAccess(user) {
+    const state = store.read();
+    const ctx = getContext(user, state);
+    const hidden = isAhGrowth(ctx, user);
+    const role = normalizeRole(
+      ctx.role || user?.workspaceRole || user?.role
+    );
+    const individual = normalizeStatus(
+      user?.accountType ||
+        user?.workspaceType ||
+        ctx.workspace?.accountType ||
+        ctx.workspace?.workspaceType
+    ) === "individual";
+    const authorized =
+      ["owner", "admin", "manager"].includes(role) ||
+      individual;
+    const workspaceSettings =
+      state.workspaceSettings?.[ctx.workspaceId] || {};
+    const featureSetting =
+      workspaceSettings.features?.telnyxVoiceAgent;
+    const globallyEnabled = envFlag(
+      "TELNYX_AI_AGENT_ENABLED",
+      true
+    );
+
+    return {
+      available:
+        Boolean(ctx.workspaceId || individual) &&
+        !hidden &&
+        authorized &&
+        globallyEnabled &&
+        featureSetting !== false,
+      hidden,
+      authorized,
+      globallyEnabled,
+      featureSetting:
+        featureSetting === undefined
+          ? null
+          : Boolean(featureSetting),
+      workspaceId: ctx.workspaceId || user?.id || "",
+      workspaceName:
+        ctx.workspace?.name ||
+        ctx.workspace?.companyName ||
+        user?.companyName ||
+        user?.workspaceName ||
+        user?.name ||
+        "Individual workspace",
+      role,
+      accountType: individual ? "individual" : "company",
+      reason: hidden
+        ? "The Telnyx voice agent is disabled for AH Growth."
+        : !authorized
+          ? "Owner, administrator or manager access is required."
+          : !globallyEnabled
+            ? "The Telnyx voice-agent service is disabled by the server configuration."
+            : featureSetting === false
+              ? "The Telnyx voice agent is disabled for this workspace."
+              : "",
+    };
+  }
+
+  function getDashboard(user) {
+    const state = store.read();
+    const ctx = requireAccess(user, state);
+    ensureStateShape(state);
+
+    const agent = findWorkspaceAgent(
+      state,
+      ctx.workspaceId
+    );
+    const queue = (state.telnyxAiAgentAssignments || [])
+      .filter(
+        (item) => item.workspaceId === ctx.workspaceId
+      )
+      .sort(sortNewest)
+      .slice(0, 500)
+      .map((item) => publicQueueItem(item, state));
+    const calls = (state.telnyxAiAgentCalls || [])
+      .filter(
+        (item) => item.workspaceId === ctx.workspaceId
+      )
+      .sort(sortNewest)
+      .slice(0, 200)
+      .map(publicCall);
+    const meetings = (state.telnyxAiAgentMeetings || [])
+      .filter(
+        (item) => item.workspaceId === ctx.workspaceId
+      )
+      .sort(sortMeeting)
+      .slice(0, 200)
+      .map(publicMeeting);
+    const assignableLeads = collectLeads(
+      state,
+      ctx.workspaceId
+    )
+      .filter((item) => item.phone)
+      .sort(sortNewest)
+      .slice(0, 1000);
+    const now = new Date();
+    const todayKey = dateKey(now);
+    const callsToday = calls.filter(
+      (item) => dateKey(item.createdAt) === todayKey
+    ).length;
+    const activeCalls = calls.filter((item) =>
+      ACTIVE_CALL_STATUSES.has(
+        normalizeStatus(item.status)
+      )
+    ).length;
+
+    return {
+      ok: true,
+      access: getAccess(user),
+      workspace: {
+        id: ctx.workspaceId,
+        name:
+          ctx.workspace?.name ||
+          ctx.workspace?.companyName ||
+          user?.companyName ||
+          user?.name ||
+          "Workspace",
+      },
+      agent: agent ? publicAgent(agent) : null,
+      diagnostics: diagnostics(state, ctx.workspaceId),
+      summary: {
+        assignableLeads: assignableLeads.length,
+        queuedLeads: queue.filter(
+          (item) => normalizeStatus(item.status) === "queued"
+        ).length,
+        activeCalls,
+        callsToday,
+        meetings: meetings.length,
+        meetingsUpcoming: meetings.filter(
+          (item) =>
+            Date.parse(item.startAt || 0) > Date.now() &&
+            normalizeStatus(item.status) !== "cancelled"
+        ).length,
+      },
+      assignableLeads,
+      queue,
+      calls,
+      meetings,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  async function listVoices(user, { force = false } = {}) {
+    const state = store.read();
+    requireAccess(user, state);
+
+    if (
+      !force &&
+      voiceCache.value.length &&
+      voiceCache.expiresAt > Date.now()
+    ) {
+      return {
+        ok: true,
+        voices: voiceCache.value,
+        cached: true,
+      };
+    }
+
+    const response = await telnyxRequest(
+      "/text-to-speech/voices?provider=telnyx"
+    );
+    const raw = Array.isArray(response?.voices)
+      ? response.voices
+      : Array.isArray(response?.data?.voices)
+        ? response.data.voices
+        : [];
+    const voices = raw
+      .map((voice) => normalizeVoice(voice))
+      .filter((voice) => voice.id)
+      .sort((left, right) =>
+        `${left.language} ${left.name}`.localeCompare(
+          `${right.language} ${right.name}`
+        )
+      );
+
+    if (
+      !voices.some((voice) => voice.id === DEFAULT_VOICE)
+    ) {
+      voices.unshift({
+        id: DEFAULT_VOICE,
+        name: "Astra",
+        provider: "telnyx",
+        model: "NaturalHD",
+        language: "en-US",
+        gender: "",
+        label: `${DEFAULT_VOICE} · recommended default`,
+      });
+    }
+
+    voiceCache.value = voices;
+    voiceCache.expiresAt = Date.now() + 10 * 60_000;
+
+    return {
+      ok: true,
+      voices,
+      cached: false,
+    };
+  }
+
+  async function saveAgent(user, input = {}) {
+    const state = store.read();
+    const ctx = requireAccess(user, state);
+    const existing = findWorkspaceAgent(
+      state,
+      ctx.workspaceId
+    );
+    const config = normalizeAgentInput({
+      input,
+      existing,
+      workspaceName:
+        ctx.workspace?.name ||
+        ctx.workspace?.companyName ||
+        user?.companyName ||
+        "ReachFly workspace",
+    });
+
+    if (!config.complianceConfirmed) {
+      throw httpError(
+        422,
+        "Confirm the workspace calling, consent, suppression and recording policy before enabling the agent."
+      );
+    }
+
+    const toolSecret = requireToolSecret();
+    const webhookBaseUrl = resolveWebhookBaseUrl();
+    const assistantPayload = buildAssistantPayload({
+      config,
+      webhookBaseUrl,
+      toolSecret,
+      workspaceId: ctx.workspaceId,
+    });
+
+    const providerResponse = existing?.telnyxAssistantId
+      ? await telnyxRequest(
+          `/ai/assistants/${encodeURIComponent(
+            existing.telnyxAssistantId
+          )}`,
+          {
+            method: "POST",
+            body: assistantPayload,
+          }
+        )
+      : await telnyxRequest("/ai/assistants", {
+          method: "POST",
+          body: assistantPayload,
+        });
+
+    const providerAgent =
+      providerResponse?.data || providerResponse || {};
+    const telnyxAssistantId = clean(
+      providerAgent.id ||
+        providerAgent.assistant_id ||
+        existing?.telnyxAssistantId
+    );
+
+    if (!telnyxAssistantId) {
+      throw httpError(
+        502,
+        "Telnyx did not return an AI Assistant ID."
+      );
+    }
+
+    const now = new Date().toISOString();
+    let saved = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      let agent = findWorkspaceAgent(
+        draft,
+        ctx.workspaceId
+      );
+
+      if (!agent) {
+        agent = {
+          id: crypto.randomUUID(),
+          workspaceId: ctx.workspaceId,
+          createdAt: now,
+          createdBy: user.id,
+        };
+        draft.telnyxAiAgents.push(agent);
+      }
+
+      Object.assign(agent, {
+        ...config,
+        telnyxAssistantId,
+        telnyxVersionId:
+          providerAgent.version_id ||
+          providerAgent.versionId ||
+          agent.telnyxVersionId ||
+          "",
+        provider: "telnyx",
+        enabled: input.enabled !== false,
+        updatedAt: now,
+        updatedBy: user.id,
+      });
+
+      setWorkspaceFeature(
+        draft,
+        ctx.workspaceId,
+        true
+      );
+      addActivity(draft, {
+        workspaceId: ctx.workspaceId,
+        type: "agent_saved",
+        title: "Voice agent configuration saved",
+        detail: `${agent.name} is linked to Telnyx assistant ${telnyxAssistantId}.`,
+        actorId: user.id,
+        createdAt: now,
+      });
+      saved = { ...agent };
+    });
+
+    emitEvent(ctx.workspaceId, "telnyx-ai-agent:updated", {
+      agent: publicAgent(saved),
+    });
+
+    return {
+      ok: true,
+      agent: publicAgent(saved),
+      provider: {
+        id: telnyxAssistantId,
+        versionId: saved.telnyxVersionId || "",
+      },
+    };
+  }
+
+  function assignLeads(user, input = {}) {
+    const state = store.read();
+    const ctx = requireAccess(user, state);
+    const agent = requireConfiguredAgent(
+      state,
+      ctx.workspaceId
+    );
+    const requestedIds = uniqueStrings(
+      input.assignmentIds ||
+        input.leadIds ||
+        input.ids ||
+        []
+    ).slice(0, 500);
+
+    if (!requestedIds.length) {
+      throw httpError(
+        422,
+        "Select at least one lead for the voice agent."
+      );
+    }
+
+    const now = new Date().toISOString();
+    const created = [];
+    const skipped = [];
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+
+      for (const requestedId of requestedIds) {
+        const found = findLead(
+          draft,
+          ctx.workspaceId,
+          requestedId
+        );
+
+        if (!found) {
+          skipped.push({
+            id: requestedId,
+            reason: "Lead not found.",
+          });
+          continue;
+        }
+
+        const { campaign, lead } = found;
+        const phone = normalizePhone(
+          lead.phone || lead.phoneNumber
+        );
+
+        if (!phone) {
+          skipped.push({
+            id: requestedId,
+            reason: "Lead has no valid phone number.",
+          });
+          continue;
+        }
+
+        if (isSuppressed(draft, ctx.workspaceId, lead)) {
+          skipped.push({
+            id: requestedId,
+            reason: "Lead is on a do-not-call or suppression list.",
+          });
+          continue;
+        }
+
+        const assignmentId = stableAssignmentId(
+          campaign,
+          lead,
+          true
+        );
+        const duplicate = draft.telnyxAiAgentAssignments.find(
+          (item) =>
+            item.workspaceId === ctx.workspaceId &&
+            item.assignmentId === assignmentId &&
+            !TERMINAL_QUEUE_STATUSES.has(
+              normalizeStatus(item.status)
+            )
+        );
+
+        if (duplicate) {
+          skipped.push({
+            id: assignmentId,
+            reason: "Lead is already in the AI-agent queue.",
+          });
+          continue;
+        }
+
+        const queueItem = {
+          id: crypto.randomUUID(),
+          workspaceId: ctx.workspaceId,
+          agentId: agent.id,
+          telnyxAssistantId: agent.telnyxAssistantId,
+          assignmentId,
+          campaignId: campaign.id,
+          campaignName:
+            campaign.name || campaign.title || "",
+          leadId: lead.id,
+          leadName: getLeadName(lead),
+          phone,
+          email: clean(lead.email),
+          timezone:
+            clean(
+              lead.timezone ||
+                lead.timeZone ||
+                input.defaultTimezone ||
+                agent.defaultLeadTimezone
+            ) || DEFAULT_LEAD_TIMEZONE,
+          status: "queued",
+          attemptCount: 0,
+          maxAttempts: clampInteger(
+            input.maxAttempts || agent.maxAttempts,
+            3,
+            1,
+            10
+          ),
+          priority: normalizeStatus(
+            lead.priority || input.priority || "normal"
+          ),
+          source: clean(input.source) || "manager",
+          createdBy: user.id,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        draft.telnyxAiAgentAssignments.push(queueItem);
+        lead.aiAgentAssigned = true;
+        lead.aiAgentQueueId = queueItem.id;
+        lead.aiAgentStatus = "queued";
+        lead.updatedAt = now;
+        campaign.updatedAt = now;
+        appendTimeline(lead, {
+          type: "ai_agent_queued",
+          actorId: user.id,
+          queueId: queueItem.id,
+          createdAt: now,
+        });
+        created.push({ ...queueItem });
+      }
+
+      if (created.length) {
+        addActivity(draft, {
+          workspaceId: ctx.workspaceId,
+          type: "leads_assigned",
+          title: `${created.length} lead${
+            created.length === 1 ? "" : "s"
+          } assigned to the voice agent`,
+          detail: `${skipped.length} skipped.`,
+          actorId: user.id,
+          createdAt: now,
+        });
+      }
+    });
+
+    emitEvent(
+      ctx.workspaceId,
+      "telnyx-ai-agent:updated",
+      {
+        type: "leads_assigned",
+        queued: created.length,
+        skipped: skipped.length,
+      }
+    );
+
+    return {
+      ok: true,
+      queued: created.length,
+      skipped,
+      assignments: created.map((item) =>
+        publicQueueItem(item, store.read())
+      ),
+    };
+  }
+
+  async function startCampaign(user, input = {}) {
+    const state = store.read();
+    const ctx = requireAccess(user, state);
+    const agent = requireConfiguredAgent(
+      state,
+      ctx.workspaceId
+    );
+
+    if (agent.enabled === false) {
+      throw httpError(
+        409,
+        "Enable the voice agent before starting calls."
+      );
+    }
+
+    const requestedQueueIds = uniqueStrings(
+      input.queueIds || input.assignmentIds || []
+    );
+    const queue = (state.telnyxAiAgentAssignments || [])
+      .filter(
+        (item) =>
+          item.workspaceId === ctx.workspaceId &&
+          normalizeStatus(item.status) === "queued" &&
+          (!requestedQueueIds.length ||
+            requestedQueueIds.includes(item.id) ||
+            requestedQueueIds.includes(item.assignmentId))
+      )
+      .sort(sortQueuePriority);
+
+    if (!queue.length) {
+      throw httpError(
+        409,
+        "There are no queued leads ready to call."
+      );
+    }
+
+    const dailyLimit = clampInteger(
+      input.dailyCallLimit || agent.dailyCallLimit,
+      25,
+      1,
+      5000
+    );
+    const callsToday = countCallsToday(
+      state,
+      ctx.workspaceId
+    );
+    const remainingToday = Math.max(
+      0,
+      dailyLimit - callsToday
+    );
+
+    if (!remainingToday) {
+      throw httpError(
+        409,
+        `The daily AI-agent call limit of ${dailyLimit} has been reached.`
+      );
+    }
+
+    const batchLimit = Math.min(
+      clampInteger(
+        input.limit || input.batchSize,
+        10,
+        1,
+        100
+      ),
+      remainingToday,
+      queue.length
+    );
+    const concurrency = Math.min(
+      clampInteger(
+        input.concurrency || agent.concurrency,
+        1,
+        1,
+        Number(
+          process.env.TELNYX_AI_AGENT_MAX_CONCURRENCY || 5
+        )
+      ),
+      batchLimit
+    );
+    const selected = queue.slice(0, batchLimit);
+    const results = await mapLimit(
+      selected,
+      concurrency,
+      (item) =>
+        startOneCall({
+          user,
+          ctx,
+          agent,
+          queueItem: item,
+          input,
+        })
+    );
+
+    const started = results.filter(
+      (item) => item.ok
+    ).length;
+    const deferred = results.filter(
+      (item) => item.deferred
+    ).length;
+    const failed = results.length - started - deferred;
+
+    emitEvent(
+      ctx.workspaceId,
+      "telnyx-ai-agent:updated",
+      {
+        type: "campaign_started",
+        started,
+        deferred,
+        failed,
+      }
+    );
+
+    return {
+      ok: failed === 0,
+      requested: selected.length,
+      started,
+      deferred,
+      failed,
+      results,
+    };
+  }
+
+  async function cancelCall(user, callId) {
+    const state = store.read();
+    const ctx = requireAccess(user, state);
+    const call = (state.telnyxAiAgentCalls || []).find(
+      (item) =>
+        item.id === callId &&
+        item.workspaceId === ctx.workspaceId
+    );
+
+    if (!call) {
+      throw httpError(404, "AI-agent call not found.");
+    }
+
+    if (
+      call.callControlId &&
+      ACTIVE_CALL_STATUSES.has(normalizeStatus(call.status))
+    ) {
+      await telnyxRequest(
+        `/calls/${encodeURIComponent(
+          call.callControlId
+        )}/actions/hangup`,
+        {
+          method: "POST",
+          body: {
+            command_id: crypto.randomUUID(),
+          },
+        }
+      );
+    }
+
+    const now = new Date().toISOString();
+    let updated = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (target) {
+        target.status = "cancelled";
+        target.endedAt = target.endedAt || now;
+        target.updatedAt = now;
+        updated = { ...target };
+      }
+      const queueItem = draft.telnyxAiAgentAssignments.find(
+        (item) => item.id === call.queueId
+      );
+      if (queueItem) {
+        queueItem.status = "cancelled";
+        queueItem.updatedAt = now;
+      }
+    });
+
+    emitEvent(
+      ctx.workspaceId,
+      "telnyx-ai-agent:call-updated",
+      { call: publicCall(updated || call) }
+    );
+
+    return {
+      ok: true,
+      call: publicCall(updated || call),
+    };
+  }
+
+  async function handleWebhook({
+    rawBody,
+    headers = {},
+    body = {},
+  } = {}) {
+    verifyTelnyxWebhook(rawBody, headers);
+    const data = body?.data || {};
+    const payload = data.payload || {};
+    const eventType = clean(
+      data.event_type || body.event_type
+    );
+    const eventId = clean(data.id || body.id);
+
+    if (!eventType || !eventId) {
+      return { ok: true, ignored: true };
+    }
+
+    const state = store.read();
+    ensureStateShape(state);
+
+    if (
+      (state.telnyxAiAgentWebhookEvents || []).some(
+        (item) => item.id === eventId
+      )
+    ) {
+      return { ok: true, duplicate: true };
+    }
+
+    const clientState = decodeClientState(
+      payload.client_state || data.client_state
+    );
+    const call = findCallForWebhook(
+      state,
+      payload,
+      clientState
+    );
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.telnyxAiAgentWebhookEvents.unshift({
+        id: eventId,
+        eventType,
+        callId: call?.id || "",
+        workspaceId:
+          call?.workspaceId ||
+          clean(clientState.workspaceId),
+        occurredAt:
+          data.occurred_at || new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+      });
+      draft.telnyxAiAgentWebhookEvents =
+        draft.telnyxAiAgentWebhookEvents.slice(0, 5000);
+    });
+
+    if (!call) {
+      return {
+        ok: true,
+        unmatched: true,
+        eventType,
+      };
+    }
+
+    const occurredAt =
+      data.occurred_at || new Date().toISOString();
+    let updated = updateCallFromWebhook({
+      callId: call.id,
+      eventType,
+      payload,
+      occurredAt,
+      body,
+    });
+
+    if (eventType === "call.answered") {
+      try {
+        updated = await startAssistantForCall(
+          updated || call
+        );
+      } catch (error) {
+        updated = markCallFailed(
+          call.id,
+          `AI assistant could not start: ${error.message}`
+        );
+      }
+    }
+
+    if (
+      eventType === "call.hangup" ||
+      eventType === "call.conversation.ended"
+    ) {
+      finalizeCallFromWebhook(
+        updated || call,
+        eventType,
+        payload,
+        occurredAt
+      );
+      updated = findCallById(call.id);
+    }
+
+    emitEvent(
+      call.workspaceId,
+      "telnyx-ai-agent:call-updated",
+      {
+        call: publicCall(updated || call),
+        eventType,
+      }
+    );
+
+    return {
+      ok: true,
+      eventType,
+      callId: call.id,
+    };
+  }
+
+  function bookMeeting({ headers = {}, body = {} } = {}) {
+    verifyToolRequest(headers);
+    const call = resolveToolCall(headers, body);
+    const confirmed = Boolean(
+      body.explicit_confirmation === true ||
+        body.explicitConfirmation === true ||
+        ["yes", "true", "confirmed"].includes(
+          normalizeStatus(body.explicit_confirmation)
+        )
+    );
+
+    if (!confirmed) {
+      return {
+        ok: false,
+        booked: false,
+        message:
+          "Do not book yet. Ask the lead to explicitly confirm the proposed date and time.",
+      };
+    }
+
+    const startAt = normalizeDate(
+      body.proposed_start ||
+        body.start_at ||
+        body.startAt
+    );
+
+    if (!startAt) {
+      return {
+        ok: false,
+        booked: false,
+        message:
+          "A valid confirmed meeting start date and time is required.",
+      };
+    }
+
+    const durationMinutes = clampInteger(
+      body.duration_minutes || body.durationMinutes,
+      30,
+      10,
+      180
+    );
+    const now = new Date().toISOString();
+    const meeting = {
+      id: crypto.randomUUID(),
+      workspaceId: call.workspaceId,
+      agentId: call.agentId,
+      callId: call.id,
+      queueId: call.queueId,
+      assignmentId: call.assignmentId,
+      campaignId: call.campaignId,
+      leadId: call.leadId,
+      leadName: call.leadName,
+      attendeeName: clean(
+        body.attendee_name || body.attendeeName
+      ),
+      attendeeEmail: clean(
+        body.attendee_email || body.attendeeEmail
+      ),
+      attendeePhone:
+        normalizePhone(
+          body.attendee_phone || body.attendeePhone
+        ) || call.toNumber,
+      startAt,
+      endAt: new Date(
+        Date.parse(startAt) + durationMinutes * 60_000
+      ).toISOString(),
+      durationMinutes,
+      timezone:
+        clean(body.timezone) ||
+        call.leadTimezone ||
+        DEFAULT_LEAD_TIMEZONE,
+      notes: clean(body.notes).slice(0, 2000),
+      status: "confirmed",
+      source: "telnyx-ai-agent",
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.telnyxAiAgentMeetings.push(meeting);
+      updateQueueAndLead(draft, call, {
+        queueStatus: "meeting_booked",
+        leadStatus: "meeting_booked",
+        outcome: "meeting_booked",
+        notes: meeting.notes,
+        meetingId: meeting.id,
+        nextActionAt: meeting.startAt,
+        doNotCall: false,
+        now,
+      });
+      const targetCall = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (targetCall) {
+        targetCall.outcome = "meeting_booked";
+        targetCall.meetingId = meeting.id;
+        targetCall.updatedAt = now;
+      }
+      addActivity(draft, {
+        workspaceId: call.workspaceId,
+        type: "meeting_booked",
+        title: `Meeting booked with ${call.leadName || call.toNumber}`,
+        detail: meeting.startAt,
+        callId: call.id,
+        createdAt: now,
+      });
+    });
+
+    emitEvent(
+      call.workspaceId,
+      "telnyx-ai-agent:meeting-booked",
+      {
+        meeting: publicMeeting(meeting),
+        call: publicCall(findCallById(call.id)),
+      }
+    );
+    emitEvent(call.workspaceId, "lead:updated", {
+      assignmentId: call.assignmentId,
+      leadId: call.leadId,
+      status: "meeting_booked",
+    });
+
+    return {
+      ok: true,
+      booked: true,
+      meeting: publicMeeting(meeting),
+      message:
+        "The meeting is confirmed and saved in ReachFly. Repeat the date, time and timezone to the lead.",
+    };
+  }
+
+  function updateLeadOutcome({
+    headers = {},
+    body = {},
+  } = {}) {
+    verifyToolRequest(headers);
+    const call = resolveToolCall(headers, body);
+    const outcome = normalizeOutcome(body.outcome);
+    const notes = clean(body.notes).slice(0, 3000);
+    const callbackAt = normalizeDate(
+      body.callback_at || body.callbackAt
+    );
+    const doNotCall = Boolean(
+      body.do_not_call === true ||
+        body.doNotCall === true ||
+        outcome === "do_not_call"
+    );
+    const now = new Date().toISOString();
+    const queueStatus = outcomeToQueueStatus(outcome);
+    const leadStatus = outcomeToLeadStatus(outcome);
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      updateQueueAndLead(draft, call, {
+        queueStatus,
+        leadStatus,
+        outcome,
+        notes,
+        nextActionAt: callbackAt,
+        doNotCall,
+        now,
+      });
+      const targetCall = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (targetCall) {
+        targetCall.outcome = outcome;
+        targetCall.notes = mergeNotes(
+          targetCall.notes,
+          notes
+        );
+        targetCall.callbackAt = callbackAt || "";
+        targetCall.doNotCall = doNotCall;
+        targetCall.updatedAt = now;
+      }
+      if (doNotCall) {
+        draft.telnyxAiAgentSuppressions.push({
+          id: crypto.randomUUID(),
+          workspaceId: call.workspaceId,
+          phone: call.toNumber,
+          leadId: call.leadId,
+          reason: notes || "Lead requested no further calls.",
+          source: "telnyx-ai-agent",
+          createdAt: now,
+        });
+      }
+    });
+
+    emitEvent(call.workspaceId, "lead:updated", {
+      assignmentId: call.assignmentId,
+      leadId: call.leadId,
+      status: leadStatus,
+      outcome,
+      doNotCall,
+    });
+    emitEvent(
+      call.workspaceId,
+      "telnyx-ai-agent:call-updated",
+      { call: publicCall(findCallById(call.id)) }
+    );
+
+    return {
+      ok: true,
+      outcome,
+      status: leadStatus,
+      doNotCall,
+      callbackAt: callbackAt || "",
+      message: doNotCall
+        ? "The lead has been suppressed from future AI-agent calls."
+        : "The ReachFly lead outcome has been updated.",
+    };
+  }
+
+  async function startOneCall({
+    user,
+    ctx,
+    agent,
+    queueItem,
+    input,
+  }) {
+    const latestState = store.read();
+    const latestQueue = (
+      latestState.telnyxAiAgentAssignments || []
+    ).find((item) => item.id === queueItem.id);
+
+    if (
+      !latestQueue ||
+      normalizeStatus(latestQueue.status) !== "queued"
+    ) {
+      return {
+        ok: false,
+        queueId: queueItem.id,
+        error: "Queue item is no longer available.",
+      };
+    }
+
+    const found = findLead(
+      latestState,
+      ctx.workspaceId,
+      latestQueue.assignmentId || latestQueue.leadId
+    );
+
+    if (!found) {
+      return failQueueItem(
+        queueItem.id,
+        "Lead not found."
+      );
+    }
+
+    const policy = checkCallPolicy({
+      state: latestState,
+      workspaceId: ctx.workspaceId,
+      lead: found.lead,
+      queueItem: latestQueue,
+      agent,
+      input,
+    });
+
+    if (!policy.allowed) {
+      const deferred = policy.deferred === true;
+      updateQueueStatus(queueItem.id, {
+        status: deferred ? "deferred" : "skipped",
+        error: policy.reason,
+        nextAttemptAt: policy.nextAttemptAt || "",
+      });
+      return {
+        ok: false,
+        deferred,
+        queueId: queueItem.id,
+        reason: policy.reason,
+        nextAttemptAt: policy.nextAttemptAt || "",
+      };
+    }
+
+    const applicationId = requireCallControlApplicationId();
+    const fromNumber = normalizePhone(
+      input.fromNumber ||
+        agent.fromNumber ||
+        process.env.TELNYX_AI_AGENT_FROM_NUMBER ||
+        configuredFromNumbers()[0]
+    );
+
+    if (!fromNumber) {
+      return failQueueItem(
+        queueItem.id,
+        "No Telnyx AI-agent caller ID is configured."
+      );
+    }
+
+    const now = new Date().toISOString();
+    const call = {
+      id: crypto.randomUUID(),
+      workspaceId: ctx.workspaceId,
+      agentId: agent.id,
+      telnyxAssistantId: agent.telnyxAssistantId,
+      queueId: latestQueue.id,
+      assignmentId: latestQueue.assignmentId,
+      campaignId: latestQueue.campaignId,
+      campaignName: latestQueue.campaignName,
+      leadId: latestQueue.leadId,
+      leadName: latestQueue.leadName,
+      leadTimezone:
+        latestQueue.timezone ||
+        agent.defaultLeadTimezone ||
+        DEFAULT_LEAD_TIMEZONE,
+      fromNumber,
+      toNumber: latestQueue.phone,
+      status: "creating",
+      outcome: "",
+      createdBy: user.id,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.telnyxAiAgentCalls.push(call);
+      const targetQueue =
+        draft.telnyxAiAgentAssignments.find(
+          (item) => item.id === latestQueue.id
+        );
+      if (targetQueue) {
+        targetQueue.status = "dialing";
+        targetQueue.callId = call.id;
+        targetQueue.attemptCount =
+          Number(targetQueue.attemptCount || 0) + 1;
+        targetQueue.lastAttemptAt = now;
+        targetQueue.updatedAt = now;
+      }
+    });
+
+    const clientState = encodeClientState({
+      workspaceId: ctx.workspaceId,
+      callId: call.id,
+      queueId: call.queueId,
+      assignmentId: call.assignmentId,
+      leadId: call.leadId,
+    });
+    const webhookUrl = resolveWebhookUrl();
+
+    try {
+      const response = await telnyxRequest("/calls", {
+        method: "POST",
+        body: {
+          connection_id: applicationId,
+          to: call.toNumber,
+          from: call.fromNumber,
+          webhook_url: webhookUrl,
+          webhook_url_method: "POST",
+          client_state: clientState,
+          command_id: crypto.randomUUID(),
+          timeout_secs: clampInteger(
+            agent.ringTimeoutSeconds,
+            45,
+            15,
+            120
+          ),
+        },
+        idempotencyKey: call.id,
+      });
+      const providerCall = response?.data || response || {};
+      let updated = null;
+
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentCalls.find(
+          (item) => item.id === call.id
+        );
+        if (target) {
+          target.status = "initiated";
+          target.providerCallId = clean(
+            providerCall.call_leg_id || providerCall.id
+          );
+          target.callControlId = clean(
+            providerCall.call_control_id
+          );
+          target.callSessionId = clean(
+            providerCall.call_session_id
+          );
+          target.clientState = clientState;
+          target.initiatedAt = now;
+          target.updatedAt = new Date().toISOString();
+          updated = { ...target };
+        }
+        const targetQueue =
+          draft.telnyxAiAgentAssignments.find(
+            (item) => item.id === latestQueue.id
+          );
+        if (targetQueue) {
+          targetQueue.status = "initiated";
+          targetQueue.updatedAt = new Date().toISOString();
+        }
+      });
+
+      emitEvent(
+        ctx.workspaceId,
+        "telnyx-ai-agent:call-updated",
+        { call: publicCall(updated || call) }
+      );
+
+      return {
+        ok: true,
+        queueId: latestQueue.id,
+        call: publicCall(updated || call),
+      };
+    } catch (error) {
+      markCallFailed(call.id, error.message);
+      failQueueItem(latestQueue.id, error.message);
+      return {
+        ok: false,
+        queueId: latestQueue.id,
+        error: error.message,
+      };
+    }
+  }
+
+  async function startAssistantForCall(call) {
+    const state = store.read();
+    const agent = (state.telnyxAiAgents || []).find(
+      (item) =>
+        item.id === call.agentId &&
+        item.workspaceId === call.workspaceId
+    );
+
+    if (!agent?.telnyxAssistantId) {
+      throw new Error(
+        "The workspace has no linked Telnyx AI Assistant."
+      );
+    }
+
+    const found = findLead(
+      state,
+      call.workspaceId,
+      call.assignmentId || call.leadId
+    );
+    const briefing = buildLeadBriefing({
+      agent,
+      call,
+      lead: found?.lead || {},
+      campaign: found?.campaign || {},
+    });
+    const clientState =
+      call.clientState ||
+      encodeClientState({
+        workspaceId: call.workspaceId,
+        callId: call.id,
+        queueId: call.queueId,
+        assignmentId: call.assignmentId,
+        leadId: call.leadId,
+      });
+
+    const response = await telnyxRequest(
+      `/calls/${encodeURIComponent(
+        call.callControlId
+      )}/actions/ai_assistant_start`,
+      {
+        method: "POST",
+        body: {
+          assistant: {
+            id: agent.telnyxAssistantId,
+          },
+          voice: agent.voice || DEFAULT_VOICE,
+          greeting: resolveGreeting(agent, found?.lead || {}),
+          message_history: [
+            {
+              role: "developer",
+              content: briefing,
+            },
+          ],
+          send_message_history_updates: true,
+          client_state: clientState,
+          command_id: crypto.randomUUID(),
+        },
+      }
+    );
+    const result = response?.data || response || {};
+    const now = new Date().toISOString();
+    let updated = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (target) {
+        target.status = "assistant_active";
+        target.assistantStartedAt = now;
+        target.conversationId = clean(
+          result.conversation_id || result.conversationId
+        );
+        target.updatedAt = now;
+        updated = { ...target };
+      }
+      const queueItem = draft.telnyxAiAgentAssignments.find(
+        (item) => item.id === call.queueId
+      );
+      if (queueItem) {
+        queueItem.status = "in_progress";
+        queueItem.updatedAt = now;
+      }
+    });
+
+    return updated || call;
+  }
+
+  function updateCallFromWebhook({
+    callId,
+    eventType,
+    payload,
+    occurredAt,
+    body,
+  }) {
+    let updated = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const call = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === callId
+      );
+      if (!call) return;
+
+      call.callControlId =
+        clean(payload.call_control_id) || call.callControlId;
+      call.callSessionId =
+        clean(payload.call_session_id) || call.callSessionId;
+      call.providerCallId =
+        clean(payload.call_leg_id) || call.providerCallId;
+      call.updatedAt = new Date().toISOString();
+
+      if (eventType === "call.initiated") {
+        call.status = "initiated";
+        call.initiatedAt = call.initiatedAt || occurredAt;
+      } else if (eventType === "call.ringing") {
+        call.status = "ringing";
+        call.ringingAt = call.ringingAt || occurredAt;
+      } else if (eventType === "call.answered") {
+        call.status = "answered";
+        call.answeredAt = call.answeredAt || occurredAt;
+      } else if (eventType === "call.hangup") {
+        call.status = "ended";
+        call.endedAt = call.endedAt || occurredAt;
+        call.hangupCause = clean(payload.hangup_cause);
+        call.hangupSource = clean(payload.hangup_source);
+        call.sipCode = Number(
+          payload.sip_hangup_cause || payload.sip_code || 0
+        );
+      } else if (eventType === "call.conversation.ended") {
+        call.status = "completed";
+        call.conversationEndedAt = occurredAt;
+        call.conversation = sanitizeProviderPayload(
+          payload
+        );
+      } else if (
+        [
+          "call.conversation.insights.generated",
+          "call.conversation_insights.generated",
+        ].includes(eventType)
+      ) {
+        call.insights = sanitizeProviderPayload(payload);
+      } else if (
+        eventType.includes("message_history")
+      ) {
+        call.messageHistory = sanitizeProviderPayload(
+          payload.message_history ||
+            payload.messages ||
+            body
+        );
+      }
+
+      if (call.answeredAt && call.endedAt) {
+        call.durationSeconds = Math.max(
+          0,
+          Math.round(
+            (Date.parse(call.endedAt) -
+              Date.parse(call.answeredAt)) /
+              1000
+          )
+        );
+      }
+      updated = { ...call };
+    });
+    return updated;
+  }
+
+  function finalizeCallFromWebhook(
+    call,
+    eventType,
+    payload,
+    occurredAt
+  ) {
+    const state = store.read();
+    const queueItem = (
+      state.telnyxAiAgentAssignments || []
+    ).find((item) => item.id === call.queueId);
+    const existingOutcome = normalizeOutcome(call.outcome);
+    let outcome = existingOutcome;
+
+    if (!outcome || outcome === "contacted") {
+      if (!call.answeredAt) {
+        const cause = normalizeStatus(
+          payload.hangup_cause || call.hangupCause
+        );
+        outcome = cause.includes("busy")
+          ? "busy"
+          : cause.includes("unallocated") ||
+              cause.includes("invalid")
+            ? "invalid_number"
+            : "no_answer";
+      } else if (
+        eventType === "call.conversation.ended"
+      ) {
+        outcome = "contacted";
+      }
+    }
+
+    const maxAttempts = Number(
+      queueItem?.maxAttempts || 3
+    );
+    const attemptCount = Number(
+      queueItem?.attemptCount || 1
+    );
+    const retryable = [
+      "no_answer",
+      "busy",
+      "voicemail",
+    ].includes(outcome);
+    const shouldRetry =
+      retryable && attemptCount < maxAttempts;
+    const nextAttemptAt = shouldRetry
+      ? new Date(
+          Date.now() +
+            retryDelayMinutes(attemptCount) * 60_000
+        ).toISOString()
+      : "";
+    const now = new Date().toISOString();
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const targetCall = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (targetCall) {
+        targetCall.outcome = targetCall.outcome || outcome;
+        targetCall.status =
+          targetCall.status === "cancelled"
+            ? "cancelled"
+            : "completed";
+        targetCall.endedAt =
+          targetCall.endedAt || occurredAt || now;
+        targetCall.updatedAt = now;
+      }
+      updateQueueAndLead(draft, call, {
+        queueStatus: shouldRetry
+          ? "queued"
+          : outcomeToQueueStatus(outcome),
+        leadStatus: shouldRetry
+          ? "follow_up"
+          : outcomeToLeadStatus(outcome),
+        outcome,
+        notes: "",
+        nextActionAt: nextAttemptAt,
+        doNotCall: outcome === "do_not_call",
+        now,
+      });
+      const targetQueue =
+        draft.telnyxAiAgentAssignments.find(
+          (item) => item.id === call.queueId
+        );
+      if (targetQueue && shouldRetry) {
+        targetQueue.nextAttemptAt = nextAttemptAt;
+        targetQueue.status = "queued";
+      }
+    });
+  }
+
+  function checkCallPolicy({
+    state,
+    workspaceId,
+    lead,
+    queueItem,
+    agent,
+    input,
+  }) {
+    if (isSuppressed(state, workspaceId, lead)) {
+      return {
+        allowed: false,
+        reason: "Lead is on a do-not-call or suppression list.",
+      };
+    }
+
+    const phone = normalizePhone(
+      lead.phone || lead.phoneNumber || queueItem.phone
+    );
+    if (!phone) {
+      return {
+        allowed: false,
+        reason: "Lead has no valid phone number.",
+      };
+    }
+
+    const activeCalls = (
+      state.telnyxAiAgentCalls || []
+    ).filter(
+      (item) =>
+        item.workspaceId === workspaceId &&
+        ACTIVE_CALL_STATUSES.has(
+          normalizeStatus(item.status)
+        )
+    ).length;
+    const maxConcurrency = clampInteger(
+      input.concurrency || agent.concurrency,
+      1,
+      1,
+      Number(
+        process.env.TELNYX_AI_AGENT_MAX_CONCURRENCY || 5
+      )
+    );
+
+    if (activeCalls >= maxConcurrency) {
+      return {
+        allowed: false,
+        deferred: true,
+        reason: `The workspace already has ${activeCalls} active AI-agent call${
+          activeCalls === 1 ? "" : "s"
+        }.`,
+        nextAttemptAt: new Date(
+          Date.now() + 5 * 60_000
+        ).toISOString(),
+      };
+    }
+
+    const timezone =
+      clean(
+        lead.timezone ||
+          lead.timeZone ||
+          queueItem.timezone ||
+          agent.defaultLeadTimezone
+      ) || DEFAULT_LEAD_TIMEZONE;
+    const allowedStart = clampInteger(
+      agent.callingWindowStartHour,
+      9,
+      8,
+      20
+    );
+    const allowedEnd = clampInteger(
+      agent.callingWindowEndHour,
+      17,
+      allowedStart + 1,
+      21
+    );
+    const local = getZonedParts(new Date(), timezone);
+
+    if (
+      local.hour < allowedStart ||
+      local.hour >= allowedEnd
+    ) {
+      return {
+        allowed: false,
+        deferred: true,
+        reason: `Outside the configured ${allowedStart}:00–${allowedEnd}:00 calling window in ${timezone}.`,
+        nextAttemptAt: nextWindowStart(
+          timezone,
+          allowedStart
+        ),
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  function resolveToolCall(headers, body) {
+    const state = store.read();
+    const callControlId = clean(
+      headers["x-telnyx-call-control-id"] ||
+        headers["X-Telnyx-Call-Control-Id"] ||
+        body.call_control_id ||
+        body.callControlId
+    );
+    const callId = clean(
+      body.reachfly_call_id ||
+        body.call_id ||
+        body.callId
+    );
+    const call = (state.telnyxAiAgentCalls || []).find(
+      (item) =>
+        (callControlId &&
+          item.callControlId === callControlId) ||
+        (callId && item.id === callId)
+    );
+
+    if (!call) {
+      throw httpError(
+        404,
+        "The ReachFly AI-agent call could not be resolved."
+      );
+    }
+    return call;
+  }
+
+  function verifyToolRequest(headers) {
+    const expected = requireToolSecret();
+    const supplied = clean(
+      headers["x-reachfly-agent-secret"] ||
+        headers["X-ReachFly-Agent-Secret"]
+    );
+    const expectedBuffer = Buffer.from(expected);
+    const suppliedBuffer = Buffer.from(supplied);
+
+    if (
+      !supplied ||
+      expectedBuffer.length !== suppliedBuffer.length ||
+      !crypto.timingSafeEqual(
+        expectedBuffer,
+        suppliedBuffer
+      )
+    ) {
+      throw httpError(403, "Invalid voice-agent tool secret.");
+    }
+  }
+
+  function verifyTelnyxWebhook(rawBody, headers) {
+    const publicKey = clean(process.env.TELNYX_PUBLIC_KEY);
+    if (!publicKey) {
+      throw httpError(
+        503,
+        "TELNYX_PUBLIC_KEY is required for webhook verification."
+      );
+    }
+    const signature = clean(
+      headers["telnyx-signature-ed25519"] ||
+        headers["Telnyx-Signature-Ed25519"]
+    );
+    const timestamp = clean(
+      headers["telnyx-timestamp"] ||
+        headers["Telnyx-Timestamp"]
+    );
+    if (!signature || !timestamp) {
+      throw httpError(
+        403,
+        "Missing Telnyx webhook signature headers."
+      );
+    }
+    const ageSeconds = Math.abs(
+      Date.now() / 1000 - Number(timestamp)
+    );
+    if (
+      !Number.isFinite(ageSeconds) ||
+      ageSeconds > 300
+    ) {
+      throw httpError(
+        403,
+        "Telnyx webhook timestamp is outside the allowed tolerance."
+      );
+    }
+    const message = Buffer.from(
+      `${timestamp}|${rawBody || ""}`
+    );
+    const signatureBuffer = Buffer.from(
+      signature,
+      "base64"
+    );
+    let key = publicKey;
+
+    if (!publicKey.includes("BEGIN PUBLIC KEY")) {
+      const der = Buffer.concat([
+        Buffer.from("302a300506032b6570032100", "hex"),
+        Buffer.from(publicKey, "base64"),
+      ]);
+      key = crypto.createPublicKey({
+        key: der,
+        format: "der",
+        type: "spki",
+      });
+    }
+
+    if (
+      !crypto.verify(
+        null,
+        message,
+        key,
+        signatureBuffer
+      )
+    ) {
+      throw httpError(403, "Invalid Telnyx webhook signature.");
+    }
+  }
+
+  async function telnyxRequest(
+    endpoint,
+    {
+      method = "GET",
+      body,
+      idempotencyKey = "",
+    } = {}
+  ) {
+    const apiKey = clean(process.env.TELNYX_API_KEY);
+    if (!apiKey) {
+      throw httpError(
+        503,
+        "TELNYX_API_KEY is not configured."
+      );
+    }
+    const response = await fetch(
+      `${TELNYX_API_BASE}${endpoint}`,
+      {
+        method,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+          ...(body !== undefined
+            ? { "Content-Type": "application/json" }
+            : {}),
+          ...(idempotencyKey
+            ? { "Idempotency-Key": idempotencyKey }
+            : {}),
+        },
+        body:
+          body === undefined
+            ? undefined
+            : JSON.stringify(body),
+      }
+    );
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
+    }
+
+    if (!response.ok) {
+      const message =
+        payload?.errors?.[0]?.detail ||
+        payload?.errors?.[0]?.title ||
+        payload?.error ||
+        payload?.message ||
+        `Telnyx request failed (${response.status}).`;
+      const error = httpError(
+        response.status >= 500 ? 502 : response.status,
+        message
+      );
+      error.code =
+        payload?.errors?.[0]?.code || "TELNYX_ERROR";
+      error.details = payload;
+      throw error;
+    }
+    return payload;
+  }
+
+  function requireAccess(user, state = store.read()) {
+    const access = getAccess(user);
+    if (!access.available) {
+      throw httpError(
+        access.hidden ? 404 : 403,
+        access.reason ||
+          "The Telnyx voice agent is not available for this workspace."
+      );
+    }
+    const ctx = getContext(user, state);
+    return {
+      ...ctx,
+      workspaceId:
+        ctx.workspaceId || user?.workspaceId || user?.id,
+    };
+  }
+
+  function getContext(user, state) {
+    return (
+      workspaceService?.getContext?.(user, state) || {
+        user,
+        workspaceId: user?.workspaceId || user?.id || "",
+        workspace:
+          (state.workspaces || []).find(
+            (item) => item.id === user?.workspaceId
+          ) || null,
+        role: user?.workspaceRole || user?.role || "owner",
+        permissions: user?.permissions || [],
+      }
+    );
+  }
+
+  return {
+    getAccess,
+    getDashboard,
+    listVoices,
+    saveAgent,
+    assignLeads,
+    startCampaign,
+    cancelCall,
+    handleWebhook,
+    bookMeeting,
+    updateLeadOutcome,
+  };
+
+  function emitEvent(workspaceId, event, payload) {
+    if (!workspaceId) return;
+    try {
+      emit({ workspaceId, event, payload });
+    } catch (error) {
+      console.warn("[telnyx-ai-agent] socket emit failed", {
+        event,
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  function findCallById(callId) {
+    return (
+      store
+        .read()
+        .telnyxAiAgentCalls?.find(
+          (item) => item.id === callId
+        ) || null
+    );
+  }
+
+  function markCallFailed(callId, message) {
+    let result = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const call = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === callId
+      );
+      if (call) {
+        call.status = "failed";
+        call.error = clean(message).slice(0, 2000);
+        call.endedAt = call.endedAt || new Date().toISOString();
+        call.updatedAt = new Date().toISOString();
+        result = { ...call };
+      }
+    });
+    return result;
+  }
+
+  function failQueueItem(queueId, message) {
+    updateQueueStatus(queueId, {
+      status: "failed",
+      error: message,
+    });
+    return {
+      ok: false,
+      queueId,
+      error: message,
+    };
+  }
+
+  function updateQueueStatus(queueId, patch) {
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const item = draft.telnyxAiAgentAssignments.find(
+        (current) => current.id === queueId
+      );
+      if (item) {
+        Object.assign(item, patch, {
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    });
+  }
+}
+
+function normalizeAgentInput({
+  input,
+  existing,
+  workspaceName,
+}) {
+  return {
+    name:
+      clean(input.name || existing?.name) ||
+      `${workspaceName} Voice Agent`,
+    description:
+      clean(input.description || existing?.description) ||
+      "ReachFly outbound qualification and meeting-booking agent.",
+    companyName:
+      clean(input.companyName || existing?.companyName) ||
+      workspaceName,
+    voice:
+      clean(input.voice || existing?.voice) || DEFAULT_VOICE,
+    model: clean(input.model || existing?.model),
+    greeting:
+      clean(input.greeting || existing?.greeting) ||
+      "Hi, this is the automated sales assistant calling from {{company_name}}. Is now an okay time for a quick question?",
+    disclosure:
+      clean(input.disclosure || existing?.disclosure) ||
+      "Clearly identify yourself as an automated AI sales assistant and identify the company at the beginning of the call.",
+    persona:
+      clean(input.persona || existing?.persona) ||
+      "Warm, confident, concise, curious, respectful, and conversational. Use short sentences and natural pauses. Never claim to be human.",
+    offer: clean(input.offer || existing?.offer),
+    idealCustomer: clean(
+      input.idealCustomer || existing?.idealCustomer
+    ),
+    qualificationQuestions: clean(
+      input.qualificationQuestions ||
+        existing?.qualificationQuestions
+    ),
+    objectionHandling: clean(
+      input.objectionHandling || existing?.objectionHandling
+    ),
+    bookingInstructions: clean(
+      input.bookingInstructions ||
+        existing?.bookingInstructions
+    ),
+    meetingGoal:
+      clean(input.meetingGoal || existing?.meetingGoal) ||
+      "Book a short discovery meeting only after the lead explicitly confirms the date and time.",
+    calendarOwnerEmail: clean(
+      input.calendarOwnerEmail ||
+        existing?.calendarOwnerEmail
+    ),
+    bookingTimezone:
+      clean(
+        input.bookingTimezone || existing?.bookingTimezone
+      ) || "America/New_York",
+    meetingDurationMinutes: clampInteger(
+      input.meetingDurationMinutes ||
+        existing?.meetingDurationMinutes,
+      30,
+      10,
+      180
+    ),
+    voicemailMessage: clean(
+      input.voicemailMessage || existing?.voicemailMessage
+    ),
+    fromNumber: normalizePhone(
+      input.fromNumber || existing?.fromNumber
+    ),
+    defaultLeadTimezone:
+      clean(
+        input.defaultLeadTimezone ||
+          existing?.defaultLeadTimezone
+      ) || DEFAULT_LEAD_TIMEZONE,
+    callingWindowStartHour: clampInteger(
+      input.callingWindowStartHour ||
+        existing?.callingWindowStartHour,
+      9,
+      8,
+      20
+    ),
+    callingWindowEndHour: clampInteger(
+      input.callingWindowEndHour ||
+        existing?.callingWindowEndHour,
+      17,
+      9,
+      21
+    ),
+    dailyCallLimit: clampInteger(
+      input.dailyCallLimit || existing?.dailyCallLimit,
+      Number(
+        process.env.TELNYX_AI_AGENT_DAILY_CALL_LIMIT || 25
+      ),
+      1,
+      5000
+    ),
+    concurrency: clampInteger(
+      input.concurrency || existing?.concurrency,
+      1,
+      1,
+      Number(
+        process.env.TELNYX_AI_AGENT_MAX_CONCURRENCY || 5
+      )
+    ),
+    maxAttempts: clampInteger(
+      input.maxAttempts || existing?.maxAttempts,
+      3,
+      1,
+      10
+    ),
+    maxCallSeconds: clampInteger(
+      input.maxCallSeconds || existing?.maxCallSeconds,
+      600,
+      60,
+      3600
+    ),
+    ringTimeoutSeconds: clampInteger(
+      input.ringTimeoutSeconds ||
+        existing?.ringTimeoutSeconds,
+      45,
+      15,
+      120
+    ),
+    recordingEnabled: input.recordingEnabled === true,
+    enabled: input.enabled !== false,
+    complianceConfirmed:
+      input.complianceConfirmed === true ||
+      existing?.complianceConfirmed === true,
+  };
+}
+
+function buildAssistantPayload({
+  config,
+  webhookBaseUrl,
+  toolSecret,
+  workspaceId,
+}) {
+  const tools = [
+    {
+      type: "webhook",
+      webhook: {
+        name: "book_meeting",
+        description:
+          "Create a ReachFly meeting only after the lead explicitly confirms a proposed date, time and timezone. Never call this tool without explicit confirmation.",
+        url: `${webhookBaseUrl}/api/telnyx/ai-agent/tools/book-meeting`,
+        method: "POST",
+        headers: [
+          {
+            name: "Content-Type",
+            value: "application/json",
+          },
+          {
+            name: "X-ReachFly-Agent-Secret",
+            value: toolSecret,
+          },
+        ],
+        body_parameters: {
+          type: "object",
+          properties: {
+            proposed_start: {
+              type: "string",
+              description:
+                "Confirmed ISO-8601 meeting start date and time including timezone offset.",
+            },
+            timezone: {
+              type: "string",
+              description:
+                "IANA timezone name confirmed with the lead.",
+            },
+            duration_minutes: {
+              type: "integer",
+              description: "Confirmed meeting duration in minutes.",
+            },
+            attendee_name: {
+              type: "string",
+              description: "Lead's confirmed name.",
+            },
+            attendee_email: {
+              type: "string",
+              description: "Lead's confirmed email address.",
+            },
+            attendee_phone: {
+              type: "string",
+              description: "Lead's telephone number.",
+            },
+            notes: {
+              type: "string",
+              description:
+                "Short summary of the lead's need and what the meeting should cover.",
+            },
+            explicit_confirmation: {
+              type: "boolean",
+              description:
+                "True only when the lead explicitly agreed to the exact date and time.",
+            },
+          },
+          required: [
+            "proposed_start",
+            "timezone",
+            "duration_minutes",
+            "explicit_confirmation",
+          ],
+        },
+        async: false,
+        timeout_ms: 5000,
+      },
+    },
+    {
+      type: "webhook",
+      webhook: {
+        name: "update_lead_outcome",
+        description:
+          "Update the ReachFly lead after a meaningful outcome. Immediately set do_not_call when the lead asks not to be contacted again.",
+        url: `${webhookBaseUrl}/api/telnyx/ai-agent/tools/update-lead`,
+        method: "POST",
+        headers: [
+          {
+            name: "Content-Type",
+            value: "application/json",
+          },
+          {
+            name: "X-ReachFly-Agent-Secret",
+            value: toolSecret,
+          },
+        ],
+        body_parameters: {
+          type: "object",
+          properties: {
+            outcome: {
+              type: "string",
+              description:
+                "One of contacted, qualified, meeting_booked, callback, voicemail, no_answer, busy, not_interested, do_not_call, invalid_number.",
+            },
+            notes: {
+              type: "string",
+              description:
+                "Concise factual summary of the conversation and next step.",
+            },
+            callback_at: {
+              type: "string",
+              description:
+                "ISO-8601 callback date and time only when the lead requested a callback.",
+            },
+            do_not_call: {
+              type: "boolean",
+              description:
+                "True immediately when the lead asks not to be called again.",
+            },
+          },
+          required: ["outcome"],
+        },
+        async: false,
+        timeout_ms: 5000,
+      },
+    },
+    {
+      type: "hangup",
+      hangup: {
+        description:
+          "End the call politely after the next step is confirmed, the lead declines, asks not to be called, or the conversation is complete.",
+      },
+    },
+  ];
+
+  const payload = {
+    name: config.name,
+    description: config.description,
+    instructions: buildAssistantInstructions(config),
+    greeting: config.greeting,
+    enabled_features: ["telephony"],
+    voice_settings: {
+      voice: config.voice,
+      expressive_mode: true,
+      language_boost: "auto",
+    },
+    transcription: {
+      language: "en",
+      model: "deepgram/flux",
+      settings: {
+        smart_format: true,
+        numerals: true,
+        interim_results: true,
+      },
+    },
+    interruption_settings: {
+      enable: true,
+      disable_greeting_interruption: false,
+    },
+    telephony_settings: {
+      noise_suppression: "krisp",
+      time_limit_secs: config.maxCallSeconds,
+      user_idle_reply_secs: 8,
+      user_idle_timeout_secs: 25,
+      recording_settings: {
+        enabled: config.recordingEnabled,
+        channels: "single",
+        format: "wav",
+        stop_on_conversation_end: true,
+      },
+    },
+    post_conversation_settings: {
+      enabled: true,
+    },
+    privacy_settings: {
+      data_retention: true,
+    },
+    tools,
+    tags: [
+      "reachfly",
+      `workspace-${workspaceId}`.slice(0, 128),
+      "outbound-sales",
+    ],
+  };
+
+  if (config.model) {
+    payload.model = config.model;
+  }
+  return payload;
+}
+
+function buildAssistantInstructions(config) {
+  return [
+    `You are ${config.name}, the outbound AI sales assistant for ${config.companyName}.`,
+    config.disclosure,
+    `Persona: ${config.persona}`,
+    config.offer ? `Offer: ${config.offer}` : "",
+    config.idealCustomer
+      ? `Ideal customer: ${config.idealCustomer}`
+      : "",
+    config.qualificationQuestions
+      ? `Qualification requirements: ${config.qualificationQuestions}`
+      : "",
+    config.objectionHandling
+      ? `Objection guidance: ${config.objectionHandling}`
+      : "",
+    `Meeting objective: ${config.meetingGoal}`,
+    config.bookingInstructions
+      ? `Booking rules: ${config.bookingInstructions}`
+      : "",
+    `Default booking timezone: ${config.bookingTimezone}. Default duration: ${config.meetingDurationMinutes} minutes.`,
+    config.calendarOwnerEmail
+      ? `Meeting owner: ${config.calendarOwnerEmail}.`
+      : "",
+    "Conversation rules:",
+    "- Be natural, warm and concise. Ask one question at a time and allow the lead to finish.",
+    "- Never claim to be a human. Do not use deceptive identities or fabricated personal experiences.",
+    "- Do not pressure, threaten, misrepresent, or promise results that are not supported.",
+    "- Respect a request to stop immediately. Call update_lead_outcome with do_not_call=true, apologize once, and end the call.",
+    "- Only call book_meeting after the lead explicitly confirms the exact date, time, timezone and duration.",
+    "- Repeat the confirmed meeting details before ending the call.",
+    "- Use update_lead_outcome once a meaningful outcome is known.",
+    "- Do not collect payment-card, government-ID, health, password, authentication-code or similarly sensitive information.",
+    "- If the lead asks for a human, record that request in the notes and offer a human follow-up.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function resolveGreeting(agent, lead) {
+  return String(agent.greeting || "")
+    .replace(/\{\{company_name\}\}/gi, agent.companyName || "our company")
+    .replace(/\{\{lead_name\}\}/gi, getLeadName(lead) || "there")
+    .replace(/\{\{agent_name\}\}/gi, agent.name || "the sales assistant")
+    .slice(0, 3000);
+}
+
+function buildLeadBriefing({
+  agent,
+  call,
+  lead,
+  campaign,
+}) {
+  const customFields = safeObject(lead.customFields);
+  return [
+    "Use this private ReachFly context for this call. Do not read it as a list unless naturally relevant.",
+    `ReachFly call ID: ${call.id}`,
+    `Lead name/business: ${getLeadName(lead) || call.leadName || "Unknown"}`,
+    `Phone: ${call.toNumber}`,
+    lead.email ? `Email: ${lead.email}` : "",
+    lead.website ? `Website: ${lead.website}` : "",
+    lead.address ? `Location: ${lead.address}` : "",
+    campaign?.name || campaign?.title
+      ? `Campaign: ${campaign.name || campaign.title}`
+      : "",
+    lead.notes ? `Existing notes: ${lead.notes}` : "",
+    lead.miniAudit?.summary
+      ? `Audit summary: ${lead.miniAudit.summary}`
+      : "",
+    Object.keys(customFields).length
+      ? `Custom context: ${JSON.stringify(customFields).slice(0, 3000)}`
+      : "",
+    `The lead's working timezone is ${call.leadTimezone || agent.defaultLeadTimezone || DEFAULT_LEAD_TIMEZONE}.`,
+    "Start with the configured greeting. Qualify fit, understand the problem, and book a meeting only with explicit confirmation.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function collectLeads(state, workspaceId) {
+  const queueByAssignment = new Map();
+  for (const item of state.telnyxAiAgentAssignments || []) {
+    if (item.workspaceId === workspaceId) {
+      queueByAssignment.set(item.assignmentId, item);
+    }
+  }
+  const output = [];
+  for (const campaign of state.campaigns || []) {
+    if (campaign.workspaceId !== workspaceId) continue;
+    for (const lead of campaign.leads || []) {
+      const assignmentId = stableAssignmentId(
+        campaign,
+        lead
+      );
+      const queue = queueByAssignment.get(assignmentId);
+      output.push({
+        id: assignmentId,
+        assignmentId,
+        campaignId: campaign.id,
+        campaignName:
+          campaign.name || campaign.title || "",
+        leadId: lead.id,
+        name: getLeadName(lead),
+        phone: normalizePhone(
+          lead.phone || lead.phoneNumber
+        ),
+        email: clean(lead.email),
+        website: clean(lead.website),
+        address: clean(lead.address),
+        timezone:
+          clean(lead.timezone || lead.timeZone) ||
+          DEFAULT_LEAD_TIMEZONE,
+        status: normalizeStatus(
+          lead.status || lead.queueStatus || "new"
+        ),
+        priority: normalizeStatus(
+          lead.priority || "normal"
+        ),
+        doNotCall: Boolean(
+          lead.doNotCall ||
+            lead.doNotContact ||
+            ["do_not_call", "do_not_contact"].includes(
+              normalizeStatus(lead.status)
+            )
+        ),
+        aiAgentStatus: queue?.status || "",
+        aiAgentQueueId: queue?.id || "",
+        createdAt:
+          lead.createdAt || campaign.createdAt || "",
+        updatedAt:
+          lead.updatedAt || campaign.updatedAt || "",
+      });
+    }
+  }
+  return output;
+}
+
+function findLead(state, workspaceId, requestedId) {
+  const id = clean(requestedId);
+  for (const campaign of state.campaigns || []) {
+    if (campaign.workspaceId !== workspaceId) continue;
+    for (const lead of campaign.leads || []) {
+      if (
+        stableAssignmentId(campaign, lead) === id ||
+        clean(lead.assignmentId) === id ||
+        clean(lead.id) === id
+      ) {
+        return { campaign, lead };
+      }
+    }
+  }
+  return null;
+}
+
+function updateQueueAndLead(
+  draft,
+  call,
+  {
+    queueStatus,
+    leadStatus,
+    outcome,
+    notes,
+    nextActionAt,
+    doNotCall,
+    meetingId = "",
+    now,
+  }
+) {
+  const queue = draft.telnyxAiAgentAssignments.find(
+    (item) => item.id === call.queueId
+  );
+  if (queue) {
+    queue.status = queueStatus;
+    queue.outcome = outcome;
+    queue.notes = mergeNotes(queue.notes, notes);
+    queue.nextAttemptAt = nextActionAt || "";
+    queue.meetingId = meetingId || queue.meetingId || "";
+    queue.updatedAt = now;
+  }
+  const found = findLead(
+    draft,
+    call.workspaceId,
+    call.assignmentId || call.leadId
+  );
+  if (found) {
+    const { campaign, lead } = found;
+    lead.status = leadStatus;
+    lead.queueStatus = queueStatus;
+    lead.aiAgentStatus = queueStatus;
+    lead.aiAgentOutcome = outcome;
+    lead.aiAgentLastCallId = call.id;
+    lead.lastCallAt = now;
+    lead.lastCallStatus = outcome;
+    lead.notes = mergeNotes(lead.notes, notes);
+    lead.nextActionAt = nextActionAt || lead.nextActionAt || "";
+    lead.callbackAt =
+      outcome === "callback"
+        ? nextActionAt || lead.callbackAt || ""
+        : lead.callbackAt || "";
+    lead.meetingId = meetingId || lead.meetingId || "";
+    lead.doNotCall = Boolean(doNotCall || lead.doNotCall);
+    lead.doNotContact = Boolean(
+      doNotCall || lead.doNotContact
+    );
+    lead.updatedAt = now;
+    campaign.updatedAt = now;
+    appendTimeline(lead, {
+      type: "ai_agent_outcome",
+      callId: call.id,
+      outcome,
+      status: leadStatus,
+      notes,
+      createdAt: now,
+    });
+  }
+}
+
+function isSuppressed(state, workspaceId, lead) {
+  const status = normalizeStatus(
+    lead.status || lead.queueStatus
+  );
+  if (
+    lead.doNotCall ||
+    lead.doNotContact ||
+    ["do_not_call", "do_not_contact"].includes(status)
+  ) {
+    return true;
+  }
+  const phone = normalizePhone(
+    lead.phone || lead.phoneNumber
+  );
+  const collections = [
+    state.telnyxAiAgentSuppressions,
+    state.doNotCall,
+    state.doNotCallList,
+    state.suppressionList,
+    state.workspaceSuppressionList,
+  ];
+  return collections.some((collection) =>
+    (Array.isArray(collection) ? collection : []).some(
+      (item) =>
+        (!item.workspaceId ||
+          item.workspaceId === workspaceId) &&
+        ((phone &&
+          normalizePhone(
+            item.phone || item.phoneNumber || item.value
+          ) === phone) ||
+          (lead.id && item.leadId === lead.id))
+    )
+  );
+}
+
+function diagnostics(state, workspaceId) {
+  const applicationId = clean(
+    process.env.TELNYX_AI_CALL_CONTROL_APPLICATION_ID ||
+      process.env.TELNYX_VOICE_API_APPLICATION_ID
+  );
+  const fromNumbers = configuredFromNumbers();
+  const agent = findWorkspaceAgent(state, workspaceId);
+  return {
+    provider: "telnyx",
+    configured: Boolean(
+      process.env.TELNYX_API_KEY &&
+        process.env.TELNYX_PUBLIC_KEY &&
+        applicationId &&
+        requireToolSecret(false)
+    ),
+    enabled: envFlag("TELNYX_AI_AGENT_ENABLED", true),
+    apiKeyPresent: Boolean(process.env.TELNYX_API_KEY),
+    publicKeyPresent: Boolean(process.env.TELNYX_PUBLIC_KEY),
+    callControlApplicationId: applicationId,
+    webhookUrl: resolveWebhookUrl(),
+    toolsBaseUrl: resolveWebhookBaseUrl(),
+    fromNumbers,
+    selectedFromNumber:
+      agent?.fromNumber ||
+      normalizePhone(
+        process.env.TELNYX_AI_AGENT_FROM_NUMBER
+      ) ||
+      fromNumbers[0] ||
+      "",
+    assistantConfigured: Boolean(
+      agent?.telnyxAssistantId
+    ),
+    assistantId: agent?.telnyxAssistantId || "",
+    maxConcurrency: Number(
+      process.env.TELNYX_AI_AGENT_MAX_CONCURRENCY || 5
+    ),
+  };
+}
+
+function findWorkspaceAgent(state, workspaceId) {
+  return (state.telnyxAiAgents || []).find(
+    (item) => item.workspaceId === workspaceId
+  );
+}
+
+function requireConfiguredAgent(state, workspaceId) {
+  const agent = findWorkspaceAgent(state, workspaceId);
+  if (!agent?.telnyxAssistantId) {
+    throw httpError(
+      409,
+      "Save the voice-agent configuration before assigning or calling leads."
+    );
+  }
+  return agent;
+}
+
+function publicAgent(agent) {
+  if (!agent) return null;
+  const {
+    createdBy,
+    updatedBy,
+    ...safe
+  } = agent;
+  return { ...safe };
+}
+
+function publicQueueItem(item, state) {
+  const found = findLead(
+    state,
+    item.workspaceId,
+    item.assignmentId || item.leadId
+  );
+  return {
+    ...item,
+    lead: found
+      ? {
+          id: found.lead.id,
+          name: getLeadName(found.lead),
+          phone: normalizePhone(
+            found.lead.phone || found.lead.phoneNumber
+          ),
+          email: clean(found.lead.email),
+          website: clean(found.lead.website),
+          status: normalizeStatus(found.lead.status),
+        }
+      : null,
+  };
+}
+
+function publicCall(call) {
+  if (!call) return null;
+  return {
+    ...call,
+    clientState: undefined,
+  };
+}
+
+function publicMeeting(meeting) {
+  return meeting ? { ...meeting } : null;
+}
+
+function findCallForWebhook(state, payload, clientState) {
+  const callControlId = clean(payload.call_control_id);
+  const callSessionId = clean(payload.call_session_id);
+  const callLegId = clean(payload.call_leg_id);
+  const localCallId = clean(clientState.callId);
+  return (state.telnyxAiAgentCalls || []).find(
+    (call) =>
+      (localCallId && call.id === localCallId) ||
+      (callControlId &&
+        call.callControlId === callControlId) ||
+      (callSessionId &&
+        call.callSessionId === callSessionId) ||
+      (callLegId && call.providerCallId === callLegId)
+  );
+}
+
+function isAhGrowth(ctx, user) {
+  const values = [
+    ctx.workspaceId,
+    ctx.workspace?.id,
+    ctx.workspace?.slug,
+    ctx.workspace?.name,
+    ctx.workspace?.companyName,
+    user?.workspaceId,
+    user?.companyId,
+    user?.companyName,
+    user?.workspaceName,
+  ]
+    .filter(Boolean)
+    .map((value) => normalizeStatus(value));
+  return (
+    values.includes(AH_GROWTH_WORKSPACE_ID) ||
+    values.some(
+      (value) =>
+        value === "ah_growth" ||
+        value === "ah_growth_workspace" ||
+        value.startsWith("ah_growth_")
+    )
+  );
+}
+
+function setWorkspaceFeature(
+  draft,
+  workspaceId,
+  enabled
+) {
+  draft.workspaceSettings =
+    draft.workspaceSettings || {};
+  draft.workspaceSettings[workspaceId] =
+    draft.workspaceSettings[workspaceId] || {};
+  draft.workspaceSettings[workspaceId].features =
+    draft.workspaceSettings[workspaceId].features || {};
+  draft.workspaceSettings[
+    workspaceId
+  ].features.telnyxVoiceAgent = Boolean(enabled);
+}
+
+function ensureStateShape(state) {
+  for (const key of [
+    "telnyxAiAgents",
+    "telnyxAiAgentAssignments",
+    "telnyxAiAgentCalls",
+    "telnyxAiAgentMeetings",
+    "telnyxAiAgentWebhookEvents",
+    "telnyxAiAgentSuppressions",
+    "telnyxAiAgentActivity",
+  ]) {
+    state[key] = Array.isArray(state[key])
+      ? state[key]
+      : [];
+  }
+  state.workspaceSettings =
+    state.workspaceSettings || {};
+}
+
+function addActivity(draft, activity) {
+  ensureStateShape(draft);
+  draft.telnyxAiAgentActivity.unshift({
+    id: crypto.randomUUID(),
+    ...activity,
+  });
+  draft.telnyxAiAgentActivity =
+    draft.telnyxAiAgentActivity.slice(0, 1000);
+}
+
+function appendTimeline(lead, entry) {
+  lead.timeline = Array.isArray(lead.timeline)
+    ? lead.timeline
+    : [];
+  lead.timeline.unshift({
+    id: crypto.randomUUID(),
+    ...entry,
+  });
+  lead.timeline = lead.timeline.slice(0, 500);
+}
+
+function stableAssignmentId(campaign, lead, create = false) {
+  if (lead.assignmentId) return clean(lead.assignmentId);
+  const id = `${campaign.id}:${lead.id}`;
+  if (create) lead.assignmentId = id;
+  return id;
+}
+
+function configuredFromNumbers() {
+  return uniqueStrings(
+    String(
+      process.env.TELNYX_AI_AGENT_FROM_NUMBERS ||
+        process.env.TELNYX_AI_AGENT_FROM_NUMBER ||
+        process.env.TELNYX_FROM_NUMBERS ||
+        process.env.TELNYX_FROM_NUMBER ||
+        ""
+    )
+      .split(",")
+      .map(normalizePhone)
+      .filter(Boolean)
+  );
+}
+
+function requireCallControlApplicationId() {
+  const value = clean(
+    process.env.TELNYX_AI_CALL_CONTROL_APPLICATION_ID ||
+      process.env.TELNYX_VOICE_API_APPLICATION_ID
+  );
+  if (!value) {
+    throw httpError(
+      503,
+      "TELNYX_AI_CALL_CONTROL_APPLICATION_ID or TELNYX_VOICE_API_APPLICATION_ID is required."
+    );
+  }
+  return value;
+}
+
+function resolveWebhookBaseUrl() {
+  return String(
+    process.env.TELNYX_WEBHOOK_BASE_URL ||
+      process.env.API_PUBLIC_URL ||
+      "https://api.reachflyai.com"
+  )
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/api$/i, "");
+}
+
+function resolveWebhookUrl() {
+  return (
+    clean(process.env.TELNYX_AI_AGENT_WEBHOOK_URL) ||
+    `${resolveWebhookBaseUrl()}/api/telnyx/ai-agent/webhooks`
+  );
+}
+
+function requireToolSecret(throwOnMissing = true) {
+  const value = clean(
+    process.env.TELNYX_AI_AGENT_TOOL_SECRET
+  );
+  if (!value && throwOnMissing) {
+    throw httpError(
+      503,
+      "TELNYX_AI_AGENT_TOOL_SECRET is required."
+    );
+  }
+  return value;
+}
+
+function normalizeVoice(voice) {
+  const id = clean(
+    voice.voice_id || voice.id || voice.voice
+  );
+  const parsed = id.split(".");
+  const model =
+    clean(voice.model || voice.model_id) ||
+    (parsed.length >= 3 ? parsed[1] : "");
+  return {
+    id,
+    name:
+      clean(voice.name) ||
+      parsed[parsed.length - 1] ||
+      id,
+    provider: clean(voice.provider) || "telnyx",
+    model,
+    language: clean(voice.language) || "",
+    gender: clean(voice.gender) || "",
+    label: [
+      clean(voice.name) ||
+        parsed[parsed.length - 1] ||
+        id,
+      model,
+      clean(voice.language),
+      clean(voice.gender),
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  };
+}
+
+function normalizeOutcome(value) {
+  const normalized = normalizeStatus(value || "contacted");
+  const aliases = {
+    interested: "qualified",
+    booked: "meeting_booked",
+    appointment: "meeting_booked",
+    appointment_booked: "meeting_booked",
+    callback_requested: "callback",
+    dnc: "do_not_call",
+    do_not_contact: "do_not_call",
+    declined: "not_interested",
+    wrong_number: "invalid_number",
+  };
+  const outcome = aliases[normalized] || normalized;
+  const allowed = new Set([
+    "contacted",
+    "qualified",
+    "meeting_booked",
+    "callback",
+    "voicemail",
+    "no_answer",
+    "busy",
+    "not_interested",
+    "do_not_call",
+    "invalid_number",
+  ]);
+  return allowed.has(outcome) ? outcome : "contacted";
+}
+
+function outcomeToQueueStatus(outcome) {
+  const map = {
+    qualified: "qualified",
+    meeting_booked: "meeting_booked",
+    callback: "callback",
+    voicemail: "follow_up",
+    no_answer: "follow_up",
+    busy: "follow_up",
+    not_interested: "not_interested",
+    do_not_call: "do_not_call",
+    invalid_number: "invalid_number",
+    contacted: "completed",
+  };
+  return map[outcome] || "completed";
+}
+
+function outcomeToLeadStatus(outcome) {
+  const map = {
+    qualified: "qualified",
+    meeting_booked: "meeting_booked",
+    callback: "follow_up",
+    voicemail: "follow_up",
+    no_answer: "follow_up",
+    busy: "follow_up",
+    not_interested: "not_interested",
+    do_not_call: "do_not_call",
+    invalid_number: "invalid_number",
+    contacted: "contacted",
+  };
+  return map[outcome] || "contacted";
+}
+
+function countCallsToday(state, workspaceId) {
+  const today = dateKey(new Date());
+  return (state.telnyxAiAgentCalls || []).filter(
+    (call) =>
+      call.workspaceId === workspaceId &&
+      dateKey(call.createdAt) === today
+  ).length;
+}
+
+function retryDelayMinutes(attemptCount) {
+  return [30, 120, 1440, 2880][
+    Math.min(3, Math.max(0, attemptCount - 1))
+  ];
+}
+
+function getZonedParts(date, timezone) {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(date)
+        .map((part) => [part.type, part.value])
+    );
+    return {
+      year: Number(parts.year),
+      month: Number(parts.month),
+      day: Number(parts.day),
+      hour: Number(parts.hour),
+      minute: Number(parts.minute),
+    };
+  } catch {
+    return getZonedParts(date, DEFAULT_LEAD_TIMEZONE);
+  }
+}
+
+function nextWindowStart(timezone, startHour) {
+  const now = new Date();
+  const local = getZonedParts(now, timezone);
+  const addDays = local.hour < startHour ? 0 : 1;
+  const approximate = new Date(
+    now.getTime() + addDays * 24 * 60 * 60_000
+  );
+  approximate.setUTCHours(
+    approximate.getUTCHours() +
+      (startHour - getZonedParts(approximate, timezone).hour),
+    0,
+    0,
+    0
+  );
+  return approximate.toISOString();
+}
+
+function normalizeDate(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? ""
+    : parsed.toISOString();
+}
+
+function encodeClientState(value) {
+  return Buffer.from(JSON.stringify(value)).toString("base64");
+}
+
+function decodeClientState(value) {
+  if (!value) return {};
+  try {
+    return JSON.parse(
+      Buffer.from(String(value), "base64").toString("utf8")
+    );
+  } catch {
+    return {};
+  }
+}
+
+function normalizePhone(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length < 8 || digits.length > 15) return "";
+  return `+${digits}`;
+}
+
+function getLeadName(lead) {
+  return clean(
+    lead.business ||
+      lead.companyName ||
+      lead.name ||
+      lead.contactName ||
+      lead.phone ||
+      "Unnamed lead"
+  );
+}
+
+function safeObject(value) {
+  return value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function sanitizeProviderPayload(value) {
+  try {
+    return JSON.parse(
+      JSON.stringify(value, (_key, item) => {
+        if (
+          typeof item === "string" &&
+          item.length > 20_000
+        ) {
+          return `${item.slice(0, 20_000)}…`;
+        }
+        return item;
+      })
+    );
+  } catch {
+    return null;
+  }
+}
+
+function mergeNotes(current, addition) {
+  const left = clean(current);
+  const right = clean(addition);
+  if (!right) return left;
+  if (!left) return right;
+  if (left.includes(right)) return left;
+  return `${left}\n\n${right}`.slice(-10_000);
+}
+
+function uniqueStrings(values) {
+  return [
+    ...new Set(
+      (Array.isArray(values) ? values : [values])
+        .map(clean)
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function normalizeRole(value) {
+  const role = normalizeStatus(value);
+  if (role.includes("owner")) return "owner";
+  if (role.includes("admin")) return "admin";
+  if (role.includes("manager")) return "manager";
+  if (
+    role === "caller" ||
+    role.includes("cold_caller") ||
+    role.includes("sales_rep") ||
+    role.includes("telemarketer")
+  ) {
+    return "caller";
+  }
+  return role || "owner";
+}
+
+function normalizeStatus(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/-/g, "_");
+}
+
+function clean(value) {
+  return String(value ?? "").trim();
+}
+
+function clampInteger(value, fallback, min, max) {
+  const number = Number(value);
+  const resolved = Number.isFinite(number)
+    ? Math.round(number)
+    : fallback;
+  return Math.max(min, Math.min(max, resolved));
+}
+
+function envFlag(name, fallback = false) {
+  const value = clean(process.env[name]).toLowerCase();
+  if (!value) return fallback;
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+function dateKey(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime())
+    ? ""
+    : date.toISOString().slice(0, 10);
+}
+
+function sortNewest(left, right) {
+  return (
+    (Date.parse(right.updatedAt || right.createdAt || 0) || 0) -
+    (Date.parse(left.updatedAt || left.createdAt || 0) || 0)
+  );
+}
+
+function sortMeeting(left, right) {
+  return (
+    (Date.parse(left.startAt || left.createdAt || 0) || 0) -
+    (Date.parse(right.startAt || right.createdAt || 0) || 0)
+  );
+}
+
+function sortQueuePriority(left, right) {
+  const ranks = {
+    urgent: 4,
+    high: 3,
+    normal: 2,
+    low: 1,
+  };
+  const priority =
+    (ranks[normalizeStatus(right.priority)] || 0) -
+    (ranks[normalizeStatus(left.priority)] || 0);
+  return priority || sortNewest(left, right);
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let index = 0;
+  async function run() {
+    while (true) {
+      const current = index;
+      index += 1;
+      if (current >= items.length) return;
+      try {
+        results[current] = await worker(items[current], current);
+      } catch (error) {
+        results[current] = {
+          ok: false,
+          error: error?.message || String(error),
+        };
+      }
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(limit, items.length) },
+      () => run()
+    )
+  );
+  return results;
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.statusCode = status;
+  return error;
+}
