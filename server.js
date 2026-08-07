@@ -26,7 +26,7 @@ import {
 } from "./caller-queue-service.js";
 import { createTeamControlService } from "./team-control-service.js";
 import { seedRoleTestAccounts } from "./role-test-seed.js";
-import { createTelnyxCallService } from "../src/telnyx-call-service.js";
+import { createTelnyxCallService } from "./telnyx-call-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
 import fs from "node:fs";
