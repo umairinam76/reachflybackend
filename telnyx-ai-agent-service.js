@@ -1444,14 +1444,39 @@ export function createTelnyxAIAgentService({
     });
 
     if (eventType === "call.answered") {
+      const answeredCall = updated || call;
+      const runtimeClientState =
+        answeredCall.clientState ||
+        encodeClientState({
+          workspaceId: answeredCall.workspaceId,
+          callId: answeredCall.id,
+          queueId: answeredCall.queueId,
+          assignmentId: answeredCall.assignmentId,
+          leadId: answeredCall.leadId,
+        });
+
+      // Start monitoring and independent call transcription as soon as the
+      // phone is answered. These do not depend on Claude attaching, so a
+      // provider-side AI failure must not leave the manager blind.
+      await Promise.allSettled([
+        startLiveMonitorStream(
+          answeredCall,
+          runtimeClientState
+        ),
+        startRealtimeCallTranscription(
+          answeredCall,
+          runtimeClientState
+        ),
+      ]);
+
       try {
         updated = await startAssistantForCall(
-          updated || call
+          answeredCall
         );
       } catch (error) {
-        updated = markCallFailed(
+        updated = markAssistantAttachFailed(
           call.id,
-          `AI assistant could not start: ${error.message}`
+          error
         );
       }
     }
@@ -1933,26 +1958,16 @@ export function createTelnyxAIAgentService({
       campaign: found?.campaign || {},
       queueItem: queueItem || {},
     });
-    const clientState =
-      call.clientState ||
-      encodeClientState({
-        workspaceId: call.workspaceId,
-        callId: call.id,
-        queueId: call.queueId,
-        assignmentId: call.assignmentId,
-        leadId: call.leadId,
-      });
 
     /*
-     * IMPORTANT:
-     * Do not seed the assistant with message_history here.
+     * IMPORTANT — use the exact minimal Telnyx start payload.
      *
-     * Telnyx accepted the PSTN call but returned "Invalid message format"
-     * when the prior implementation started the assistant with a developer
-     * message in message_history. Start the already-configured assistant with
-     * the provider's minimal supported payload, then inject the per-lead
-     * briefing with ai_assistant_add_messages. This keeps custom lead context
-     * while allowing the greeting/voice assistant to start reliably.
+     * The linked assistant already stores its model, instructions, greeting,
+     * voice and transcription settings. Telnyx documents that omitted fields
+     * fall back to that stored assistant configuration. Keeping this command
+     * to only the assistant id avoids the provider's "Invalid message format"
+     * failure seen when runtime message/voice/greeting overrides are attached
+     * to this call.
      */
     const response = await telnyxRequest(
       `/calls/${encodeURIComponent(
@@ -1964,11 +1979,6 @@ export function createTelnyxAIAgentService({
           assistant: {
             id: agent.telnyxAssistantId,
           },
-          voice: agent.voice || DEFAULT_VOICE,
-          greeting: resolveGreeting(agent, found?.lead || {}),
-          send_message_history_updates: true,
-          client_state: clientState,
-          command_id: crypto.randomUUID(),
         },
       }
     );
@@ -1989,6 +1999,9 @@ export function createTelnyxAIAgentService({
           result.conversation_id || result.conversationId
         );
         target.aiAssistantError = "";
+        target.aiAssistantErrorCode = "";
+        target.aiAssistantErrorDetails = null;
+        target.error = "";
         target.updatedAt = now;
         updated = { ...target };
       }
@@ -1998,17 +2011,13 @@ export function createTelnyxAIAgentService({
       );
       if (targetQueue) {
         targetQueue.status = "in_progress";
+        targetQueue.error = "";
         targetQueue.updatedAt = now;
       }
     });
 
-    /*
-     * Inject the private lead briefing after the assistant is live. Telnyx
-     * documents system messages for runtime context injection via
-     * ai_assistant_add_messages. A context-injection failure should not make a
-     * working phone call silent, so it is recorded as a warning rather than
-     * failing the call.
-     */
+    // Inject private per-lead context only after the assistant has started.
+    // If this optional context update fails, keep the live AI call running.
     if (briefing) {
       try {
         await telnyxRequest(
@@ -2024,8 +2033,6 @@ export function createTelnyxAIAgentService({
                   content: briefing,
                 },
               ],
-              client_state: clientState,
-              command_id: crypto.randomUUID(),
             },
           }
         );
@@ -2042,31 +2049,6 @@ export function createTelnyxAIAgentService({
           }
         });
       }
-    }
-
-    /*
-     * Fork both call tracks to ReachFly for a listen-only browser monitor.
-     * This does not inject browser audio into the call. Failure to start the
-     * monitor must never stop the AI conversation itself.
-     */
-    try {
-      await startLiveMonitorStream(
-        updated || call,
-        clientState
-      );
-    } catch (error) {
-      store.update((draft) => {
-        ensureStateShape(draft);
-        const target = draft.telnyxAiAgentCalls.find(
-          (item) => item.id === call.id
-        );
-        if (target) {
-          target.mediaStreamStatus = "failed";
-          target.mediaStreamError =
-            clean(error?.message || String(error)).slice(0, 2000);
-          target.updatedAt = new Date().toISOString();
-        }
-      });
     }
 
     return findCallById(call.id) || updated || call;
@@ -2150,6 +2132,95 @@ export function createTelnyxAIAgentService({
     };
   }
 
+  async function startRealtimeCallTranscription(
+    call,
+    clientState
+  ) {
+    if (
+      !envFlag(
+        "TELNYX_AI_AGENT_LIVE_TRANSCRIPT_ENABLED",
+        true
+      )
+    ) {
+      return null;
+    }
+
+    if (!call?.callControlId || !call?.id) {
+      return null;
+    }
+
+    const now = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (target) {
+        target.transcriptionStatus = "starting";
+        target.transcriptionError = "";
+        target.transcriptionRequestedAt = now;
+        target.updatedAt = now;
+      }
+    });
+
+    try {
+      await telnyxRequest(
+        `/calls/${encodeURIComponent(
+          call.callControlId
+        )}/actions/transcription_start`,
+        {
+          method: "POST",
+          body: {
+            transcription_engine: "Google",
+            transcription_engine_config: {
+              transcription_engine: "Google",
+              language:
+                clean(
+                  process.env
+                    .TELNYX_AI_AGENT_LIVE_TRANSCRIPT_LANGUAGE
+                ) || "en",
+              interim_results: true,
+              model: "phone_call",
+            },
+            transcription_tracks: "both",
+            client_state: clientState,
+            command_id: crypto.randomUUID(),
+          },
+        }
+      );
+
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentCalls.find(
+          (item) => item.id === call.id
+        );
+        if (target) {
+          target.transcriptionStatus = "requested";
+          target.updatedAt = new Date().toISOString();
+        }
+      });
+
+      return { ok: true };
+    } catch (error) {
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentCalls.find(
+          (item) => item.id === call.id
+        );
+        if (target) {
+          target.transcriptionStatus = "failed";
+          target.transcriptionError =
+            clean(error?.message || String(error)).slice(0, 2000);
+          target.updatedAt = new Date().toISOString();
+        }
+      });
+      return {
+        ok: false,
+        error: error?.message || String(error),
+      };
+    }
+  }
+
   function updateCallFromWebhook({
     callId,
     eventType,
@@ -2196,6 +2267,79 @@ export function createTelnyxAIAgentService({
         call.conversation = sanitizeProviderPayload(
           payload
         );
+      } else if (eventType === "call.transcription") {
+        const transcriptionData = safeObject(
+          payload.transcription_data ||
+            payload.transcriptionData
+        );
+        const transcriptText = clean(
+          transcriptionData.transcript ||
+            transcriptionData.text ||
+            payload.transcript
+        );
+        const isFinal =
+          transcriptionData.is_final !== false &&
+          transcriptionData.isFinal !== false;
+        const track = normalizeStatus(
+          transcriptionData.track ||
+            transcriptionData.transcription_track ||
+            payload.track ||
+            payload.transcription_track ||
+            payload.direction
+        );
+        const speaker = normalizeStatus(
+          transcriptionData.speaker ||
+            transcriptionData.role ||
+            payload.speaker ||
+            payload.role
+        );
+        const role =
+          track.includes("outbound") ||
+          speaker.includes("assistant") ||
+          speaker.includes("agent")
+            ? "assistant"
+            : track.includes("inbound") ||
+                speaker.includes("user") ||
+                speaker.includes("customer") ||
+                speaker.includes("caller")
+              ? "user"
+              : "unknown";
+
+        call.transcriptionStatus = "streaming";
+        call.transcriptionError = "";
+        call.liveTranscript = Array.isArray(
+          call.liveTranscript
+        )
+          ? call.liveTranscript
+          : [];
+
+        if (transcriptText) {
+          const entry = {
+            id: clean(body?.data?.id) || crypto.randomUUID(),
+            role,
+            track,
+            text: transcriptText,
+            isFinal,
+            confidence:
+              Number(transcriptionData.confidence || 0) || 0,
+            occurredAt,
+          };
+
+          if (isFinal) {
+            call.liveTranscriptInterim = null;
+            const duplicate = call.liveTranscript.some(
+              (item) =>
+                clean(item?.text) === transcriptText &&
+                clean(item?.occurredAt) === occurredAt
+            );
+            if (!duplicate) {
+              call.liveTranscript.push(entry);
+              call.liveTranscript = call.liveTranscript.slice(-250);
+            }
+          } else {
+            call.liveTranscriptInterim = entry;
+          }
+        }
       } else if (eventType === "streaming.started") {
         call.mediaStreamStatus = "connected";
         call.mediaStreamConnectedAt =
@@ -2259,6 +2403,36 @@ export function createTelnyxAIAgentService({
     ).find((item) => item.id === call.queueId);
     const existingOutcome = normalizeOutcome(call.outcome);
     let outcome = existingOutcome;
+
+    // If the PSTN leg connected but the AI assistant never attached, this is
+    // a technical failure — not a successful "contacted" outcome. Preserve
+    // the lead for follow-up and make the failure visible in the Calls tab.
+    if (call.aiAssistantError && !call.assistantStartedAt) {
+      const now = new Date().toISOString();
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const targetCall = draft.telnyxAiAgentCalls.find(
+          (item) => item.id === call.id
+        );
+        if (targetCall) {
+          targetCall.status = "failed";
+          targetCall.outcome = "technical_failure";
+          targetCall.endedAt =
+            targetCall.endedAt || occurredAt || now;
+          targetCall.updatedAt = now;
+        }
+        updateQueueAndLead(draft, call, {
+          queueStatus: "failed",
+          leadStatus: "follow_up",
+          outcome: "technical_failure",
+          notes: call.aiAssistantError,
+          nextActionAt: "",
+          doNotCall: false,
+          now,
+        });
+      });
+      return;
+    }
 
     if (!outcome || outcome === "contacted") {
       if (!call.answeredAt) {
@@ -2680,6 +2854,41 @@ export function createTelnyxAIAgentService({
           (item) => item.id === callId
         ) || null
     );
+  }
+
+  function markAssistantAttachFailed(callId, error) {
+    let result = null;
+    const message = clean(
+      error?.message || String(error || "Unknown Telnyx AI error")
+    ).slice(0, 2000);
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const call = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === callId
+      );
+      if (call) {
+        call.status = "assistant_failed";
+        call.error = `AI assistant could not start: ${message}`;
+        call.aiAssistantError = message;
+        call.aiAssistantErrorCode = clean(
+          error?.code || "TELNYX_AI_START_FAILED"
+        );
+        call.aiAssistantErrorDetails = sanitizeProviderPayload(
+          error?.details || null
+        );
+        call.updatedAt = new Date().toISOString();
+        result = { ...call };
+      }
+      const queueItem = draft.telnyxAiAgentAssignments.find(
+        (item) => item.id === result?.queueId
+      );
+      if (queueItem) {
+        queueItem.status = "failed";
+        queueItem.error = `AI assistant could not start: ${message}`;
+        queueItem.updatedAt = new Date().toISOString();
+      }
+    });
+    return result;
   }
 
   function markCallFailed(callId, message) {
