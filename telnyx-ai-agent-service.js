@@ -2594,6 +2594,7 @@ async function buildWebsiteIntelligenceWithClaude({
     system,
     messages: [{ role: "user", content: userPrompt }],
     maxTokens: 5000,
+    temperature: 0.1,
   });
 
   const text = (response.content || [])
@@ -2611,6 +2612,7 @@ async function callAnthropicMessage({
   system,
   messages,
   maxTokens = 4000,
+  temperature = 0.2,
 }) {
   const controller = new AbortController();
   const timeoutMs = clampInteger(
@@ -2633,6 +2635,7 @@ async function callAnthropicMessage({
         system,
         messages,
         max_tokens: maxTokens,
+        temperature,
       }),
       signal: controller.signal,
     });
@@ -3259,7 +3262,7 @@ function buildAssistantPayload({
     tools,
     tags: [
       "reachfly",
-      `workspace-${workspaceId}`.slice(0, 128),
+      `ws-${crypto.createHash("sha256").update(String(workspaceId || "workspace")).digest("hex").slice(0, 16)}`,
       "outbound-sales",
     ],
   };
