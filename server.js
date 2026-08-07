@@ -880,6 +880,7 @@ const telnyxAiAgentService =
   createTelnyxAIAgentService({
     store,
     workspaceService,
+    leadFinder,
     emit({ workspaceId, event, payload }) {
       emitToWorkspace(workspaceId, event, payload);
     },
@@ -6451,12 +6452,38 @@ app.get(
   })
 );
 
+app.post(
+  "/api/telnyx/ai-agent/website/analyze",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxAiAgentService.analyzeWebsite(
+        req.user,
+        req.body || {}
+      )
+    );
+  })
+);
+
 app.put(
   "/api/telnyx/ai-agent",
   requireAuth,
   asyncRoute(async (req, res) => {
     res.json(
       await telnyxAiAgentService.saveAgent(
+        req.user,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/leads/find",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxAiAgentService.findGoogleLeads(
         req.user,
         req.body || {}
       )
