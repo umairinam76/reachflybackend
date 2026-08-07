@@ -5,7 +5,7 @@ import net from "node:net";
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const DEFAULT_VOICE =
   process.env.TELNYX_AI_AGENT_DEFAULT_VOICE ||
-  "Telnyx.NaturalHD.astra";
+  "Telnyx.Ultra.Clara";
 const LIVE_CLAUDE_MODEL =
   process.env.TELNYX_AI_AGENT_LIVE_MODEL ||
   "anthropic/claude-haiku-4-5";
@@ -43,6 +43,8 @@ const TERMINAL_QUEUE_STATUSES = new Set([
 ]);
 
 const ACTIVE_CALL_STATUSES = new Set([
+  "creating",
+  "dialing",
   "queued",
   "initiated",
   "ringing",
@@ -778,8 +780,13 @@ export function createTelnyxAIAgentService({
     const email = clean(input.email).toLowerCase().slice(0, 320);
     const website = normalizePublicWebsiteString(input.website || input.websiteUrl);
     const location = clean(input.location || input.address).slice(0, 800);
+    const explicitTimezone = clean(
+      input.timezone || input.timeZone
+    );
     const timezone =
-      clean(input.timezone || input.timeZone || input.defaultTimezone) ||
+      explicitTimezone ||
+      inferTimezoneFromPhone(phone) ||
+      clean(input.defaultTimezone) ||
       agent.defaultLeadTimezone ||
       DEFAULT_LEAD_TIMEZONE;
     const customContext = clean(
@@ -803,6 +810,7 @@ export function createTelnyxAIAgentService({
     let campaign = null;
     let lead = null;
     let reusedExistingLead = false;
+    let reusedQueueItem = false;
     let queueItem = null;
 
     store.update((draft) => {
@@ -896,53 +904,103 @@ export function createTelnyxAIAgentService({
       }
 
       const assignmentId = stableAssignmentId(campaign, lead, true);
-      const duplicate = draft.telnyxAiAgentAssignments.find(
+      const displayName =
+        contactName || companyName || getLeadName(lead);
+      const maxAttempts = clampInteger(
+        input.maxAttempts || agent.maxAttempts,
+        3,
+        1,
+        10
+      );
+      const customLeadDetails = {
+        contactName: contactName || clean(lead.contactName),
+        companyName: companyName || clean(lead.companyName || lead.business),
+        jobTitle: jobTitle || clean(lead.jobTitle || lead.title),
+        email: email || clean(lead.email),
+        website: website || clean(lead.website),
+        location: location || clean(lead.address),
+      };
+
+      // Never create two simultaneous calls to the same number. Pending,
+      // queued and deferred custom entries are reusable so a manager can
+      // explicitly retry without being trapped behind a stale 409.
+      const activeCall = (draft.telnyxAiAgentCalls || []).find(
         (item) =>
           item.workspaceId === ctx.workspaceId &&
-          item.assignmentId === assignmentId &&
-          !TERMINAL_QUEUE_STATUSES.has(normalizeStatus(item.status))
+          normalizePhone(item.toNumber) === phone &&
+          ACTIVE_CALL_STATUSES.has(normalizeStatus(item.status))
       );
 
-      if (duplicate) {
+      if (activeCall) {
         throw httpError(
           409,
-          "This lead already has an active AI-agent queue item. Finish or cancel it before creating another custom call."
+          "A call to this phone number is already active. End the current call before starting another one."
         );
       }
 
-      queueItem = {
-        id: crypto.randomUUID(),
-        workspaceId: ctx.workspaceId,
-        agentId: agent.id,
-        telnyxAssistantId: agent.telnyxAssistantId,
-        assignmentId,
-        campaignId: campaign.id,
-        campaignName: campaign.name || "AI Voice · Custom leads",
-        leadId: lead.id,
-        leadName: getLeadName(lead),
-        phone,
-        email: clean(lead.email || email),
-        timezone,
-        status: "queued",
-        attemptCount: 0,
-        maxAttempts: clampInteger(input.maxAttempts || agent.maxAttempts, 3, 1, 10),
-        priority: normalizeStatus(input.priority || "high"),
-        source: "custom-ai-agent",
-        customContext,
-        customLeadDetails: {
-          contactName: contactName || clean(lead.contactName),
-          companyName: companyName || clean(lead.companyName || lead.business),
-          jobTitle: jobTitle || clean(lead.jobTitle || lead.title),
-          email: email || clean(lead.email),
-          website: website || clean(lead.website),
-          location: location || clean(lead.address),
-        },
-        createdBy: user.id,
-        createdAt: now,
-        updatedAt: now,
-      };
+      const reusableQueue = (draft.telnyxAiAgentAssignments || [])
+        .filter(
+          (item) =>
+            item.workspaceId === ctx.workspaceId &&
+            !TERMINAL_QUEUE_STATUSES.has(normalizeStatus(item.status)) &&
+            (item.assignmentId === assignmentId ||
+              normalizePhone(item.phone) === phone)
+        )
+        .sort(sortNewest)[0];
 
-      draft.telnyxAiAgentAssignments.unshift(queueItem);
+      if (reusableQueue) {
+        reusedQueueItem = true;
+        queueItem = reusableQueue;
+        Object.assign(queueItem, {
+          agentId: agent.id,
+          telnyxAssistantId: agent.telnyxAssistantId,
+          assignmentId,
+          campaignId: campaign.id,
+          campaignName: campaign.name || "AI Voice · Custom leads",
+          leadId: lead.id,
+          leadName: displayName,
+          phone,
+          email: clean(lead.email || email),
+          timezone,
+          status: "queued",
+          error: "",
+          nextAttemptAt: "",
+          priority: normalizeStatus(input.priority || "high"),
+          source: "custom-ai-agent",
+          customContext,
+          customLeadDetails,
+          maxAttempts,
+          updatedAt: now,
+          updatedBy: user.id,
+        });
+      } else {
+        queueItem = {
+          id: crypto.randomUUID(),
+          workspaceId: ctx.workspaceId,
+          agentId: agent.id,
+          telnyxAssistantId: agent.telnyxAssistantId,
+          assignmentId,
+          campaignId: campaign.id,
+          campaignName: campaign.name || "AI Voice · Custom leads",
+          leadId: lead.id,
+          leadName: displayName,
+          phone,
+          email: clean(lead.email || email),
+          timezone,
+          status: "queued",
+          attemptCount: 0,
+          maxAttempts,
+          priority: normalizeStatus(input.priority || "high"),
+          source: "custom-ai-agent",
+          customContext,
+          customLeadDetails,
+          createdBy: user.id,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        draft.telnyxAiAgentAssignments.unshift(queueItem);
+      }
       lead.aiAgentStatus = "queued";
       lead.queueStatus = "queued";
       lead.updatedAt = now;
@@ -960,7 +1018,7 @@ export function createTelnyxAIAgentService({
       addActivity(draft, {
         workspaceId: ctx.workspaceId,
         type: "custom_voice_lead_queued",
-        title: `Custom AI call queued for ${getLeadName(lead) || phone}`,
+        title: `${reusedQueueItem ? "Custom AI call refreshed" : "Custom AI call queued"} for ${contactName || companyName || getLeadName(lead) || phone}`,
         detail: `${phone}${companyName ? ` · ${companyName}` : ""}`,
         actorId: user.id,
         createdAt: now,
@@ -993,6 +1051,8 @@ export function createTelnyxAIAgentService({
       ok: true,
       queued: 1,
       reusedExistingLead,
+      reusedQueueItem,
+      resolvedTimezone: timezone,
       assignmentId: queueItem.assignmentId,
       queueId: queueItem.id,
       lead: {
@@ -1008,8 +1068,12 @@ export function createTelnyxAIAgentService({
       callResult,
       message:
         input.callNow === true
-          ? "The custom lead was queued and ReachFly attempted to start the AI call under the configured calling policy."
-          : "The custom lead was added to the AI-agent queue.",
+          ? reusedQueueItem
+            ? "The existing pending/deferred queue item was refreshed and ReachFly attempted the AI call now under the configured calling policy."
+            : "The custom lead was queued and ReachFly attempted to start the AI call under the configured calling policy."
+          : reusedQueueItem
+            ? "The existing pending/deferred queue item was refreshed with the latest custom lead context."
+            : "The custom lead was added to the AI-agent queue.",
     };
   }
 
@@ -1455,10 +1519,14 @@ export function createTelnyxAIAgentService({
           leadId: answeredCall.leadId,
         });
 
-      // Start monitoring and independent call transcription as soon as the
-      // phone is answered. These do not depend on Claude attaching, so a
-      // provider-side AI failure must not leave the manager blind.
-      await Promise.allSettled([
+      // Prioritize the caller experience. Dispatch Claude first and start
+      // listen-only audio/transcription in parallel so monitoring adds zero
+      // blocking Telnyx round trips before the assistant begins speaking.
+      const assistantPromise = startAssistantForCall(
+        answeredCall
+      );
+
+      void Promise.allSettled([
         startLiveMonitorStream(
           answeredCall,
           runtimeClientState
@@ -1470,9 +1538,7 @@ export function createTelnyxAIAgentService({
       ]);
 
       try {
-        updated = await startAssistantForCall(
-          answeredCall
-        );
+        updated = await assistantPromise;
       } catch (error) {
         updated = markAssistantAttachFailed(
           call.id,
@@ -1969,6 +2035,16 @@ export function createTelnyxAIAgentService({
      * failure seen when runtime message/voice/greeting overrides are attached
      * to this call.
      */
+    const runtimeClientState =
+      call.clientState ||
+      encodeClientState({
+        workspaceId: call.workspaceId,
+        callId: call.id,
+        queueId: call.queueId,
+        assignmentId: call.assignmentId,
+        leadId: call.leadId,
+      });
+
     const response = await telnyxRequest(
       `/calls/${encodeURIComponent(
         call.callControlId
@@ -1979,10 +2055,12 @@ export function createTelnyxAIAgentService({
           assistant: {
             id: agent.telnyxAssistantId,
           },
+          send_message_history_updates: true,
+          client_state: runtimeClientState,
+          command_id: crypto.randomUUID(),
         },
       }
     );
-
     const result = response?.data || response || {};
     const now = new Date().toISOString();
     let updated = null;
@@ -2570,9 +2648,9 @@ export function createTelnyxAIAgentService({
 
     const timezone =
       clean(
-        lead.timezone ||
+        queueItem.timezone ||
+          lead.timezone ||
           lead.timeZone ||
-          queueItem.timezone ||
           agent.defaultLeadTimezone
       ) || DEFAULT_LEAD_TIMEZONE;
     const allowedStart = clampInteger(
@@ -3466,6 +3544,28 @@ function buildAssistantPayload({
   toolSecret,
   workspaceId,
 }) {
+  const eagerEotThreshold = clampNumber(
+    process.env.TELNYX_AI_AGENT_FLUX_EAGER_EOT_THRESHOLD,
+    0.3,
+    0.3,
+    0.9
+  );
+  const eotThreshold = Math.max(
+    eagerEotThreshold,
+    clampNumber(
+      process.env.TELNYX_AI_AGENT_FLUX_EOT_THRESHOLD,
+      0.65,
+      0.5,
+      0.9
+    )
+  );
+  const eotTimeoutMs = clampInteger(
+    process.env.TELNYX_AI_AGENT_FLUX_EOT_TIMEOUT_MS,
+    1200,
+    500,
+    10000
+  );
+  const ultraVoice = isTelnyxUltraVoice(config.voice);
   const tools = [
     {
       type: "webhook",
@@ -3601,23 +3701,59 @@ function buildAssistantPayload({
     enabled_features: ["telephony"],
     voice_settings: {
       voice: config.voice,
-      // Telnyx only permits expressive mode for Ultra / xAI voices.
-      // NaturalHD remains supported, but expressive_mode must be false.
       expressive_mode: supportsTelnyxExpressiveMode(config.voice),
-      language_boost: "auto",
+      ...(ultraVoice
+        ? {
+            voice_speed: clampNumber(
+              process.env.TELNYX_AI_AGENT_VOICE_SPEED,
+              1.03,
+              0.85,
+              1.2
+            ),
+            language_boost: "English",
+          }
+        : { language_boost: "auto" }),
     },
     transcription: {
       language: "en",
       model: "deepgram/flux",
       settings: {
-        smart_format: true,
-        numerals: true,
-        interim_results: true,
+        eager_eot_threshold: eagerEotThreshold,
+        eot_threshold: eotThreshold,
+        eot_timeout_ms: eotTimeoutMs,
       },
     },
     interruption_settings: {
       enable: true,
       disable_greeting_interruption: false,
+      start_speaking_plan: {
+        wait_seconds: clampNumber(
+          process.env.TELNYX_AI_AGENT_SPEAK_WAIT_SECONDS,
+          0.1,
+          0,
+          2
+        ),
+        transcription_endpointing_plan: {
+          on_punctuation_seconds: clampNumber(
+            process.env.TELNYX_AI_AGENT_SPEAK_PUNCTUATION_SECONDS,
+            0.1,
+            0,
+            2
+          ),
+          on_no_punctuation_seconds: clampNumber(
+            process.env.TELNYX_AI_AGENT_SPEAK_NO_PUNCTUATION_SECONDS,
+            0.6,
+            0.1,
+            3
+          ),
+          on_number_seconds: clampNumber(
+            process.env.TELNYX_AI_AGENT_SPEAK_NUMBER_SECONDS,
+            0.8,
+            0.1,
+            3
+          ),
+        },
+      },
     },
     telephony_settings: {
       noise_suppression: "krisp",
@@ -3678,6 +3814,9 @@ function buildAssistantInstructions(config) {
     `Live reasoning model: ${config.model || LIVE_CLAUDE_MODEL}. Treat the live transcript as an actual two-way conversation and adapt to what the lead says rather than following a rigid script.`,
     "Conversation rules:",
     "- Be natural, warm and concise. Ask one question at a time and allow the lead to finish.",
+    "- Keep most turns to one or two short spoken sentences before the next question. Use contractions and everyday wording.",
+    "- Do not repeat or summarize what the caller just said unless clarification is genuinely needed. Avoid filler such as 'Absolutely', 'Great question', or long preambles.",
+    "- Once the caller's intent is clear, answer directly and keep momentum. Do not narrate your reasoning or mention internal tools.",
     "- Never claim to be a human. Do not use deceptive identities or fabricated personal experiences.",
     "- Do not pressure, threaten, misrepresent, or promise results that are not supported.",
     "- Respect a request to stop immediately. Call update_lead_outcome with do_not_call=true, apologize once, and end the call.",
@@ -4371,12 +4510,15 @@ function stableAssignmentId(campaign, lead, create = false) {
   return id;
 }
 
+function isTelnyxUltraVoice(voiceValue) {
+  return clean(voiceValue)
+    .toLowerCase()
+    .startsWith("telnyx.ultra.");
+}
+
 function supportsTelnyxExpressiveMode(voiceValue) {
   const voice = clean(voiceValue).toLowerCase();
-  return (
-    voice.startsWith("telnyx.ultra.") ||
-    voice.startsWith("xai.")
-  );
+  return isTelnyxUltraVoice(voice) || voice.startsWith("xai.");
 }
 
 function configuredFromNumbers() {
@@ -4709,6 +4851,28 @@ function decodeClientState(value) {
   }
 }
 
+function inferTimezoneFromPhone(phoneValue) {
+  const phone = normalizePhone(phoneValue);
+  if (!phone) return "";
+
+  // Only infer stable single-timezone regions. Multi-timezone countries such
+  // as the US/Canada/Australia fall back to the workspace or explicit input.
+  const rules = [
+    ["+92", "Asia/Karachi"],
+    ["+91", "Asia/Kolkata"],
+    ["+971", "Asia/Dubai"],
+    ["+974", "Asia/Qatar"],
+    ["+965", "Asia/Kuwait"],
+    ["+968", "Asia/Muscat"],
+    ["+966", "Asia/Riyadh"],
+    ["+65", "Asia/Singapore"],
+    ["+64", "Pacific/Auckland"],
+    ["+44", "Europe/London"],
+  ];
+
+  return rules.find(([prefix]) => phone.startsWith(prefix))?.[1] || "";
+}
+
 function normalizePhone(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -4806,6 +4970,12 @@ function clampInteger(value, fallback, min, max) {
   const resolved = Number.isFinite(number)
     ? Math.round(number)
     : fallback;
+  return Math.max(min, Math.min(max, resolved));
+}
+
+function clampNumber(value, fallback, min, max) {
+  const number = Number(value);
+  const resolved = Number.isFinite(number) ? number : fallback;
   return Math.max(min, Math.min(max, resolved));
 }
 
