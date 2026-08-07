@@ -1943,6 +1943,17 @@ export function createTelnyxAIAgentService({
         leadId: call.leadId,
       });
 
+    /*
+     * IMPORTANT:
+     * Do not seed the assistant with message_history here.
+     *
+     * Telnyx accepted the PSTN call but returned "Invalid message format"
+     * when the prior implementation started the assistant with a developer
+     * message in message_history. Start the already-configured assistant with
+     * the provider's minimal supported payload, then inject the per-lead
+     * briefing with ai_assistant_add_messages. This keeps custom lead context
+     * while allowing the greeting/voice assistant to start reliably.
+     */
     const response = await telnyxRequest(
       `/calls/${encodeURIComponent(
         call.callControlId
@@ -1955,18 +1966,13 @@ export function createTelnyxAIAgentService({
           },
           voice: agent.voice || DEFAULT_VOICE,
           greeting: resolveGreeting(agent, found?.lead || {}),
-          message_history: [
-            {
-              role: "developer",
-              content: briefing,
-            },
-          ],
           send_message_history_updates: true,
           client_state: clientState,
           command_id: crypto.randomUUID(),
         },
       }
     );
+
     const result = response?.data || response || {};
     const now = new Date().toISOString();
     let updated = null;
@@ -1982,19 +1988,166 @@ export function createTelnyxAIAgentService({
         target.conversationId = clean(
           result.conversation_id || result.conversationId
         );
+        target.aiAssistantError = "";
         target.updatedAt = now;
         updated = { ...target };
       }
-      const queueItem = draft.telnyxAiAgentAssignments.find(
+
+      const targetQueue = draft.telnyxAiAgentAssignments.find(
         (item) => item.id === call.queueId
       );
-      if (queueItem) {
-        queueItem.status = "in_progress";
-        queueItem.updatedAt = now;
+      if (targetQueue) {
+        targetQueue.status = "in_progress";
+        targetQueue.updatedAt = now;
       }
     });
 
-    return updated || call;
+    /*
+     * Inject the private lead briefing after the assistant is live. Telnyx
+     * documents system messages for runtime context injection via
+     * ai_assistant_add_messages. A context-injection failure should not make a
+     * working phone call silent, so it is recorded as a warning rather than
+     * failing the call.
+     */
+    if (briefing) {
+      try {
+        await telnyxRequest(
+          `/calls/${encodeURIComponent(
+            call.callControlId
+          )}/actions/ai_assistant_add_messages`,
+          {
+            method: "POST",
+            body: {
+              messages: [
+                {
+                  role: "system",
+                  content: briefing,
+                },
+              ],
+              client_state: clientState,
+              command_id: crypto.randomUUID(),
+            },
+          }
+        );
+      } catch (error) {
+        store.update((draft) => {
+          ensureStateShape(draft);
+          const target = draft.telnyxAiAgentCalls.find(
+            (item) => item.id === call.id
+          );
+          if (target) {
+            target.contextInjectionWarning =
+              clean(error?.message || String(error)).slice(0, 2000);
+            target.updatedAt = new Date().toISOString();
+          }
+        });
+      }
+    }
+
+    /*
+     * Fork both call tracks to ReachFly for a listen-only browser monitor.
+     * This does not inject browser audio into the call. Failure to start the
+     * monitor must never stop the AI conversation itself.
+     */
+    try {
+      await startLiveMonitorStream(
+        updated || call,
+        clientState
+      );
+    } catch (error) {
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentCalls.find(
+          (item) => item.id === call.id
+        );
+        if (target) {
+          target.mediaStreamStatus = "failed";
+          target.mediaStreamError =
+            clean(error?.message || String(error)).slice(0, 2000);
+          target.updatedAt = new Date().toISOString();
+        }
+      });
+    }
+
+    return findCallById(call.id) || updated || call;
+  }
+
+  async function startLiveMonitorStream(
+    call,
+    clientState
+  ) {
+    if (
+      !envFlag(
+        "TELNYX_AI_AGENT_LIVE_MONITOR_ENABLED",
+        true
+      )
+    ) {
+      return null;
+    }
+
+    if (!call?.callControlId || !call?.id || !call?.workspaceId) {
+      return null;
+    }
+
+    const streamUrl = buildSignedMediaStreamUrl({
+      callId: call.id,
+      workspaceId: call.workspaceId,
+    });
+
+    const now = new Date().toISOString();
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (target) {
+        target.mediaStreamStatus = "starting";
+        target.mediaStreamCodec = "PCMU";
+        target.mediaStreamSampleRate = 8000;
+        target.mediaStreamRequestedAt = now;
+        target.mediaStreamError = "";
+        target.updatedAt = now;
+      }
+    });
+
+    await telnyxRequest(
+      `/calls/${encodeURIComponent(
+        call.callControlId
+      )}/actions/streaming_start`,
+      {
+        method: "POST",
+        body: {
+          stream_url: streamUrl,
+          stream_track: "both_tracks",
+          stream_codec: "PCMU",
+          client_state: clientState,
+          command_id: crypto.randomUUID(),
+        },
+      }
+    );
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentCalls.find(
+        (item) => item.id === call.id
+      );
+      if (target) {
+        if (
+          !["connected", "stopped"].includes(
+            normalizeStatus(target.mediaStreamStatus)
+          )
+        ) {
+          target.mediaStreamStatus = "requested";
+        }
+        target.updatedAt = new Date().toISOString();
+      }
+    });
+
+    return {
+      ok: true,
+      streamUrl: redactSignedMediaStreamUrl(streamUrl),
+    };
   }
 
   function updateCallFromWebhook({
@@ -2043,6 +2196,25 @@ export function createTelnyxAIAgentService({
         call.conversation = sanitizeProviderPayload(
           payload
         );
+      } else if (eventType === "streaming.started") {
+        call.mediaStreamStatus = "connected";
+        call.mediaStreamConnectedAt =
+          call.mediaStreamConnectedAt || occurredAt;
+        call.mediaStreamError = "";
+      } else if (eventType === "streaming.stopped") {
+        call.mediaStreamStatus = "stopped";
+        call.mediaStreamStoppedAt = occurredAt;
+      } else if (
+        eventType === "streaming.failed" ||
+        eventType === "call.streaming.failed"
+      ) {
+        call.mediaStreamStatus = "failed";
+        call.mediaStreamError = clean(
+          payload?.failure_reason ||
+            payload?.error ||
+            payload?.message ||
+            "Telnyx media streaming failed."
+        ).slice(0, 2000);
       } else if (
         [
           "call.conversation.insights.generated",
@@ -2594,7 +2766,6 @@ async function buildWebsiteIntelligenceWithClaude({
     system,
     messages: [{ role: "user", content: userPrompt }],
     maxTokens: 5000,
-    temperature: 0.1,
   });
 
   const text = (response.content || [])
@@ -2612,7 +2783,6 @@ async function callAnthropicMessage({
   system,
   messages,
   maxTokens = 4000,
-  temperature = 0.2,
 }) {
   const controller = new AbortController();
   const timeoutMs = clampInteger(
@@ -2635,7 +2805,6 @@ async function callAnthropicMessage({
         system,
         messages,
         max_tokens: maxTokens,
-        temperature,
       }),
       signal: controller.signal,
     });
@@ -3262,7 +3431,7 @@ function buildAssistantPayload({
     tools,
     tags: [
       "reachfly",
-      `ws-${crypto.createHash("sha256").update(String(workspaceId || "workspace")).digest("hex").slice(0, 16)}`,
+      shortWorkspaceTag(workspaceId),
       "outbound-sales",
     ],
   };
@@ -4046,6 +4215,101 @@ function resolveWebhookUrl() {
     clean(process.env.TELNYX_AI_AGENT_WEBHOOK_URL) ||
     `${resolveWebhookBaseUrl()}/api/telnyx/ai-agent/webhooks`
   );
+}
+
+function resolveMediaStreamSecret() {
+  const value = clean(
+    process.env.TELNYX_AI_AGENT_MEDIA_STREAM_SECRET ||
+      process.env.TELNYX_AI_AGENT_TOOL_SECRET
+  );
+
+  if (!value) {
+    throw httpError(
+      503,
+      "TELNYX_AI_AGENT_MEDIA_STREAM_SECRET or TELNYX_AI_AGENT_TOOL_SECRET is required for live call monitoring."
+    );
+  }
+
+  return value;
+}
+
+function resolveMediaStreamBaseUrl() {
+  const configured = clean(
+    process.env.TELNYX_AI_AGENT_MEDIA_STREAM_URL
+  );
+
+  if (configured) {
+    const explicit = new URL(configured);
+    if (!["ws:", "wss:"].includes(explicit.protocol)) {
+      throw httpError(
+        500,
+        "TELNYX_AI_AGENT_MEDIA_STREAM_URL must use ws:// or wss://."
+      );
+    }
+    return explicit;
+  }
+
+  const base = new URL(resolveWebhookBaseUrl());
+  base.protocol =
+    base.protocol === "https:"
+      ? "wss:"
+      : "ws:";
+  base.pathname = "/telnyx/ai-agent/media";
+  base.search = "";
+  base.hash = "";
+  return base;
+}
+
+function buildSignedMediaStreamUrl({
+  callId,
+  workspaceId,
+}) {
+  const secret = resolveMediaStreamSecret();
+  const url = resolveMediaStreamBaseUrl();
+  const expiresAt =
+    Math.floor(Date.now() / 1000) +
+    clampInteger(
+      process.env.TELNYX_AI_AGENT_MEDIA_STREAM_URL_TTL_SECONDS,
+      3600,
+      60,
+      7200
+    );
+
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(
+      `${clean(callId)}|${clean(workspaceId)}|${expiresAt}`
+    )
+    .digest("base64url");
+
+  url.searchParams.set("call_id", clean(callId));
+  url.searchParams.set("workspace_id", clean(workspaceId));
+  url.searchParams.set("exp", String(expiresAt));
+  url.searchParams.set("sig", signature);
+
+  return url.toString();
+}
+
+function redactSignedMediaStreamUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.searchParams.has("sig")) {
+      url.searchParams.set("sig", "[redacted]");
+    }
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function shortWorkspaceTag(workspaceId) {
+  const digest = crypto
+    .createHash("sha256")
+    .update(clean(workspaceId) || "workspace")
+    .digest("hex")
+    .slice(0, 16);
+
+  return `ws-${digest}`.slice(0, 20);
 }
 
 function requireToolSecret(throwOnMissing = true) {

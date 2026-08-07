@@ -31,6 +31,7 @@ import { createTelnyxCallService } from "./telnyx-call-service.js";
 import { createTelnyxAIAgentService } from "./telnyx-ai-agent-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
+import { WebSocketServer } from "ws";
 import fs from "node:fs";
 
 import {
@@ -7808,6 +7809,12 @@ function workspaceRoom(
   return `workspace:${workspaceId}`;
 }
 
+function aiCallMonitorRoom(
+  callId
+) {
+  return `telnyx-ai-monitor:${callId}`;
+}
+
 function userRoom(userId) {
   return `user:${userId}`;
 }
@@ -7859,6 +7866,562 @@ function emitToChannel(
     channelRoom(channelId)
   ).emit(eventName, payload);
 }
+
+
+function getAiMediaStreamSecret() {
+  return String(
+    process.env.TELNYX_AI_AGENT_MEDIA_STREAM_SECRET ||
+      process.env.TELNYX_AI_AGENT_TOOL_SECRET ||
+      ""
+  ).trim();
+}
+
+function timingSafeTextEqual(
+  left,
+  right
+) {
+  const leftBuffer = Buffer.from(
+    String(left || "")
+  );
+  const rightBuffer = Buffer.from(
+    String(right || "")
+  );
+
+  return (
+    leftBuffer.length === rightBuffer.length &&
+    leftBuffer.length > 0 &&
+    crypto.timingSafeEqual(
+      leftBuffer,
+      rightBuffer
+    )
+  );
+}
+
+function verifyAiMediaStreamUpgrade(
+  request
+) {
+  const url = new URL(
+    request.url || "/",
+    "http://127.0.0.1"
+  );
+
+  if (
+    url.pathname !==
+    "/telnyx/ai-agent/media"
+  ) {
+    return null;
+  }
+
+  const secret =
+    getAiMediaStreamSecret();
+
+  if (!secret) {
+    throw new Error(
+      "AI media-stream secret is not configured."
+    );
+  }
+
+  const callId =
+    String(
+      url.searchParams.get(
+        "call_id"
+      ) || ""
+    ).trim();
+
+  const workspaceId =
+    String(
+      url.searchParams.get(
+        "workspace_id"
+      ) || ""
+    ).trim();
+
+  const expiresAt =
+    Number(
+      url.searchParams.get(
+        "exp"
+      ) || 0
+    );
+
+  const signature =
+    String(
+      url.searchParams.get(
+        "sig"
+      ) || ""
+    ).trim();
+
+  const nowSeconds =
+    Math.floor(Date.now() / 1000);
+
+  if (
+    !callId ||
+    !workspaceId ||
+    !Number.isFinite(expiresAt) ||
+    expiresAt < nowSeconds - 30 ||
+    expiresAt > nowSeconds + 7200 ||
+    !signature
+  ) {
+    throw new Error(
+      "Invalid or expired AI media-stream URL."
+    );
+  }
+
+  const expected = crypto
+    .createHmac(
+      "sha256",
+      secret
+    )
+    .update(
+      `${callId}|${workspaceId}|${expiresAt}`
+    )
+    .digest(
+      "base64url"
+    );
+
+  if (
+    !timingSafeTextEqual(
+      signature,
+      expected
+    )
+  ) {
+    throw new Error(
+      "Invalid AI media-stream signature."
+    );
+  }
+
+  const state =
+    store.read();
+
+  const call =
+    (
+      state.telnyxAiAgentCalls ||
+      []
+    ).find(
+      (item) =>
+        item.id === callId &&
+        item.workspaceId ===
+          workspaceId
+    );
+
+  if (!call) {
+    throw new Error(
+      "AI-agent call does not exist."
+    );
+  }
+
+  return {
+    callId,
+    workspaceId,
+    callControlId:
+      call.callControlId || "",
+  };
+}
+
+function updateAiMediaStreamCall(
+  callId,
+  patch
+) {
+  store.update((draft) => {
+    draft.telnyxAiAgentCalls =
+      Array.isArray(
+        draft.telnyxAiAgentCalls
+      )
+        ? draft.telnyxAiAgentCalls
+        : [];
+
+    const call =
+      draft.telnyxAiAgentCalls.find(
+        (item) =>
+          item.id === callId
+      );
+
+    if (!call) {
+      return;
+    }
+
+    Object.assign(
+      call,
+      patch,
+      {
+        updatedAt:
+          new Date().toISOString(),
+      }
+    );
+  });
+}
+
+const telnyxAiMediaWss =
+  new WebSocketServer({
+    noServer: true,
+    perMessageDeflate: false,
+    maxPayload: 1024 * 1024,
+  });
+
+httpServer.on(
+  "upgrade",
+  (
+    request,
+    socket,
+    head
+  ) => {
+    let auth = null;
+
+    try {
+      auth =
+        verifyAiMediaStreamUpgrade(
+          request
+        );
+    } catch (error) {
+      socket.write(
+        "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"
+      );
+      socket.destroy();
+      return;
+    }
+
+    /*
+     * Not our WebSocket path. Leave it untouched so Socket.IO can process
+     * /socket.io/ upgrades through its own listener.
+     */
+    if (!auth) {
+      return;
+    }
+
+    telnyxAiMediaWss.handleUpgrade(
+      request,
+      socket,
+      head,
+      (websocket) => {
+        telnyxAiMediaWss.emit(
+          "connection",
+          websocket,
+          request,
+          auth
+        );
+      }
+    );
+  }
+);
+
+telnyxAiMediaWss.on(
+  "connection",
+  (
+    websocket,
+    _request,
+    auth
+  ) => {
+    const callId =
+      auth.callId;
+
+    const workspaceId =
+      auth.workspaceId;
+
+    let streamId = "";
+    let started = false;
+
+    websocket.on(
+      "message",
+      (raw) => {
+        let event = null;
+
+        try {
+          event = JSON.parse(
+            Buffer.isBuffer(raw)
+              ? raw.toString("utf8")
+              : String(raw)
+          );
+        } catch {
+          return;
+        }
+
+        const eventName =
+          String(
+            event?.event || ""
+          ).toLowerCase();
+
+        if (
+          eventName ===
+          "connected"
+        ) {
+          return;
+        }
+
+        if (
+          eventName === "start"
+        ) {
+          const providerCallControlId =
+            String(
+              event?.start
+                ?.call_control_id ||
+                ""
+            );
+
+          if (
+            auth.callControlId &&
+            providerCallControlId &&
+            providerCallControlId !==
+              auth.callControlId
+          ) {
+            websocket.close(
+              1008,
+              "Call mismatch"
+            );
+            return;
+          }
+
+          streamId =
+            String(
+              event?.stream_id ||
+                ""
+            );
+
+          started = true;
+
+          const now =
+            new Date().toISOString();
+
+          updateAiMediaStreamCall(
+            callId,
+            {
+              mediaStreamStatus:
+                "connected",
+              mediaStreamId:
+                streamId,
+              mediaStreamConnectedAt:
+                now,
+              mediaStreamCodec:
+                String(
+                  event?.start
+                    ?.media_format
+                    ?.encoding ||
+                    "PCMU"
+                ),
+              mediaStreamSampleRate:
+                Number(
+                  event?.start
+                    ?.media_format
+                    ?.sample_rate ||
+                    8000
+                ),
+              mediaStreamError: "",
+            }
+          );
+
+          io.to(
+            aiCallMonitorRoom(
+              callId
+            )
+          ).emit(
+            "telnyx-ai-agent:media-status",
+            {
+              callId,
+              status: "connected",
+              streamId,
+              encoding:
+                event?.start
+                  ?.media_format
+                  ?.encoding ||
+                "PCMU",
+              sampleRate:
+                Number(
+                  event?.start
+                    ?.media_format
+                    ?.sample_rate ||
+                    8000
+                ),
+            }
+          );
+
+          return;
+        }
+
+        if (
+          eventName === "media"
+        ) {
+          if (!started) {
+            return;
+          }
+
+          const payload =
+            String(
+              event?.media
+                ?.payload ||
+                ""
+            );
+
+          if (
+            !payload ||
+            payload.length >
+              256 * 1024
+          ) {
+            return;
+          }
+
+          const track =
+            String(
+              event?.media
+                ?.track ||
+                ""
+            ).toLowerCase();
+
+          io.to(
+            aiCallMonitorRoom(
+              callId
+            )
+          ).emit(
+            "telnyx-ai-agent:media",
+            {
+              callId,
+              streamId:
+                event?.stream_id ||
+                streamId,
+              track:
+                track.includes(
+                  "outbound"
+                )
+                  ? "outbound"
+                  : "inbound",
+              payload,
+              sequenceNumber:
+                Number(
+                  event
+                    ?.sequence_number ||
+                    0
+                ),
+              chunk:
+                Number(
+                  event?.media
+                    ?.chunk ||
+                    0
+                ),
+              timestamp:
+                Number(
+                  event?.media
+                    ?.timestamp ||
+                    0
+                ),
+              encoding: "PCMU",
+              sampleRate: 8000,
+            }
+          );
+
+          return;
+        }
+
+        if (
+          eventName === "stop"
+        ) {
+          started = false;
+
+          const now =
+            new Date().toISOString();
+
+          updateAiMediaStreamCall(
+            callId,
+            {
+              mediaStreamStatus:
+                "stopped",
+              mediaStreamStoppedAt:
+                now,
+            }
+          );
+
+          io.to(
+            aiCallMonitorRoom(
+              callId
+            )
+          ).emit(
+            "telnyx-ai-agent:media-status",
+            {
+              callId,
+              status: "stopped",
+              streamId:
+                event?.stream_id ||
+                streamId,
+            }
+          );
+        }
+      }
+    );
+
+    websocket.on(
+      "close",
+      () => {
+        const state =
+          store.read();
+
+        const call =
+          (
+            state
+              .telnyxAiAgentCalls ||
+            []
+          ).find(
+            (item) =>
+              item.id === callId
+          );
+
+        if (
+          call &&
+          [
+            "creating",
+            "initiated",
+            "ringing",
+            "answered",
+            "assistant_active",
+            "active",
+          ].includes(
+            String(
+              call.status || ""
+            ).toLowerCase()
+          )
+        ) {
+          updateAiMediaStreamCall(
+            callId,
+            {
+              mediaStreamStatus:
+                "disconnected",
+            }
+          );
+        }
+
+        io.to(
+          aiCallMonitorRoom(
+            callId
+          )
+        ).emit(
+          "telnyx-ai-agent:media-status",
+          {
+            callId,
+            status:
+              "disconnected",
+            streamId,
+          }
+        );
+      }
+    );
+
+    websocket.on(
+      "error",
+      (error) => {
+        updateAiMediaStreamCall(
+          callId,
+          {
+            mediaStreamStatus:
+              "failed",
+            mediaStreamError:
+              String(
+                error?.message ||
+                  error ||
+                  "Media stream error."
+              ).slice(
+                0,
+                2000
+              ),
+          }
+        );
+      }
+    );
+  }
+);
 
 function emitChannelEvent(
   channel,
@@ -8039,6 +8602,145 @@ io.on("connection", (socket) => {
             error.message,
         });
       }
+    }
+  );
+
+  socket.on(
+    "telnyx-ai-agent:monitor:join",
+    (
+      payload = {},
+      acknowledge
+    ) => {
+      try {
+        const access =
+          telnyxAiAgentService.getAccess(
+            user
+          );
+
+        if (
+          !access?.available
+        ) {
+          throw Object.assign(
+            new Error(
+              access?.reason ||
+                "Voice-agent monitoring is not available."
+            ),
+            {
+              statusCode:
+                access?.hidden
+                  ? 404
+                  : 403,
+            }
+          );
+        }
+
+        const callId =
+          String(
+            payload.callId ||
+              ""
+          ).trim();
+
+        if (!callId) {
+          throw Object.assign(
+            new Error(
+              "A call ID is required."
+            ),
+            {
+              statusCode: 422,
+            }
+          );
+        }
+
+        const state =
+          store.read();
+
+        const call =
+          (
+            state
+              .telnyxAiAgentCalls ||
+            []
+          ).find(
+            (item) =>
+              item.id === callId &&
+              item.workspaceId ===
+                workspaceId
+          );
+
+        if (!call) {
+          throw Object.assign(
+            new Error(
+              "AI-agent call not found."
+            ),
+            {
+              statusCode: 404,
+            }
+          );
+        }
+
+        socket.join(
+          aiCallMonitorRoom(
+            callId
+          )
+        );
+
+        acknowledge?.({
+          ok: true,
+          data: {
+            callId,
+            status:
+              call.mediaStreamStatus ||
+              "waiting",
+            sampleRate:
+              Number(
+                call
+                  .mediaStreamSampleRate ||
+                  8000
+              ),
+            encoding:
+              call.mediaStreamCodec ||
+              "PCMU",
+          },
+        });
+      } catch (error) {
+        acknowledge?.({
+          ok: false,
+          error:
+            error?.message ||
+            "Unable to join live call monitor.",
+          code:
+            error?.code ||
+            "AI_CALL_MONITOR_JOIN_FAILED",
+        });
+      }
+    }
+  );
+
+  socket.on(
+    "telnyx-ai-agent:monitor:leave",
+    (
+      payload = {},
+      acknowledge
+    ) => {
+      const callId =
+        String(
+          payload.callId ||
+            ""
+        ).trim();
+
+      if (callId) {
+        socket.leave(
+          aiCallMonitorRoom(
+            callId
+          )
+        );
+      }
+
+      acknowledge?.({
+        ok: true,
+        data: {
+          callId,
+        },
+      });
     }
   );
 
