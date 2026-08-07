@@ -753,6 +753,266 @@ export function createTelnyxAIAgentService({
     };
   }
 
+  async function createCustomLead(user, input = {}) {
+    const state = store.read();
+    const ctx = requireAccess(user, state);
+    const agent = requireConfiguredAgent(state, ctx.workspaceId);
+
+    if (agent.enabled === false) {
+      throw httpError(409, "Enable the voice agent before adding custom calls.");
+    }
+
+    const phone = normalizePhone(
+      input.phone || input.phoneNumber || input.to
+    );
+    if (!phone) {
+      throw httpError(422, "Enter a valid phone number for the custom lead.");
+    }
+
+    const leadName = clean(
+      input.name || input.contactName || input.companyName || "Custom lead"
+    ).slice(0, 240);
+    const companyName = clean(input.companyName || input.business).slice(0, 240);
+    const contactName = clean(input.contactName || input.name).slice(0, 240);
+    const jobTitle = clean(input.jobTitle || input.title).slice(0, 240);
+    const email = clean(input.email).toLowerCase().slice(0, 320);
+    const website = normalizePublicWebsiteString(input.website || input.websiteUrl);
+    const location = clean(input.location || input.address).slice(0, 800);
+    const timezone =
+      clean(input.timezone || input.timeZone || input.defaultTimezone) ||
+      agent.defaultLeadTimezone ||
+      DEFAULT_LEAD_TIMEZONE;
+    const customContext = clean(
+      input.context || input.leadContext || input.notes
+    ).slice(0, 12_000);
+
+    const leadProbe = {
+      id: "custom-probe",
+      phone,
+      phoneNumber: phone,
+      status: "new",
+    };
+    if (isSuppressed(state, ctx.workspaceId, leadProbe)) {
+      throw httpError(
+        409,
+        "This phone number is on the workspace do-not-call or suppression list."
+      );
+    }
+
+    const now = new Date().toISOString();
+    let campaign = null;
+    let lead = null;
+    let reusedExistingLead = false;
+    let queueItem = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.campaigns = Array.isArray(draft.campaigns) ? draft.campaigns : [];
+
+      const existing = findLeadByPhone(draft, ctx.workspaceId, phone);
+      if (existing) {
+        campaign = existing.campaign;
+        lead = existing.lead;
+        reusedExistingLead = true;
+      } else {
+        campaign = draft.campaigns.find(
+          (item) =>
+            item.workspaceId === ctx.workspaceId &&
+            item.source === "custom-ai-agent"
+        );
+
+        if (!campaign) {
+          campaign = {
+            id: `ai-custom-${crypto.randomUUID()}`,
+            workspaceId: ctx.workspaceId,
+            userId: user.id,
+            ownerId:
+              ctx.workspace?.ownerId ||
+              ctx.workspace?.ownerUserId ||
+              user.id,
+            createdBy: user.id,
+            ownerName: clean(user.name),
+            ownerEmail: clean(user.email),
+            accountType:
+              user.accountType || ctx.workspace?.accountType || "company",
+            companyName:
+              ctx.workspace?.name ||
+              ctx.workspace?.companyName ||
+              user.companyName ||
+              "",
+            name: "AI Voice · Custom leads",
+            source: "custom-ai-agent",
+            externalImport: true,
+            niche: "Custom AI calls",
+            category: "custom-ai-call",
+            location: "Custom",
+            goal: "voice-agent",
+            status: "active",
+            pipelineStatus: "ready",
+            leadCount: 0,
+            leads: [],
+            createdAt: now,
+            updatedAt: now,
+          };
+          draft.campaigns.unshift(campaign);
+        }
+
+        lead = {
+          id: crypto.randomUUID(),
+          name: companyName || leadName,
+          business: companyName || leadName,
+          companyName,
+          contactName,
+          jobTitle,
+          phone,
+          phoneNumber: phone,
+          email,
+          website,
+          address: location,
+          timezone,
+          status: "new",
+          priority: normalizeStatus(input.priority || "high"),
+          source: "custom-ai-agent",
+          notes: "",
+          customFields: {
+            contactName,
+            companyName,
+            jobTitle,
+          },
+          createdAt: now,
+          updatedAt: now,
+        };
+        stableAssignmentId(campaign, lead, true);
+        campaign.leads.push(lead);
+        campaign.leadCount = campaign.leads.length;
+        campaign.updatedAt = now;
+      }
+
+      if (isSuppressed(draft, ctx.workspaceId, lead)) {
+        throw httpError(
+          409,
+          "This lead is on the workspace do-not-call or suppression list."
+        );
+      }
+
+      const assignmentId = stableAssignmentId(campaign, lead, true);
+      const duplicate = draft.telnyxAiAgentAssignments.find(
+        (item) =>
+          item.workspaceId === ctx.workspaceId &&
+          item.assignmentId === assignmentId &&
+          !TERMINAL_QUEUE_STATUSES.has(normalizeStatus(item.status))
+      );
+
+      if (duplicate) {
+        throw httpError(
+          409,
+          "This lead already has an active AI-agent queue item. Finish or cancel it before creating another custom call."
+        );
+      }
+
+      queueItem = {
+        id: crypto.randomUUID(),
+        workspaceId: ctx.workspaceId,
+        agentId: agent.id,
+        telnyxAssistantId: agent.telnyxAssistantId,
+        assignmentId,
+        campaignId: campaign.id,
+        campaignName: campaign.name || "AI Voice · Custom leads",
+        leadId: lead.id,
+        leadName: getLeadName(lead),
+        phone,
+        email: clean(lead.email || email),
+        timezone,
+        status: "queued",
+        attemptCount: 0,
+        maxAttempts: clampInteger(input.maxAttempts || agent.maxAttempts, 3, 1, 10),
+        priority: normalizeStatus(input.priority || "high"),
+        source: "custom-ai-agent",
+        customContext,
+        customLeadDetails: {
+          contactName: contactName || clean(lead.contactName),
+          companyName: companyName || clean(lead.companyName || lead.business),
+          jobTitle: jobTitle || clean(lead.jobTitle || lead.title),
+          email: email || clean(lead.email),
+          website: website || clean(lead.website),
+          location: location || clean(lead.address),
+        },
+        createdBy: user.id,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      draft.telnyxAiAgentAssignments.unshift(queueItem);
+      lead.aiAgentStatus = "queued";
+      lead.queueStatus = "queued";
+      lead.updatedAt = now;
+      campaign.updatedAt = now;
+
+      appendTimeline(lead, {
+        type: "ai_agent_custom_call_queued",
+        queueId: queueItem.id,
+        notes: customContext
+          ? `Custom call context added (${customContext.length} characters).`
+          : "Custom AI call queued.",
+        createdAt: now,
+      });
+
+      addActivity(draft, {
+        workspaceId: ctx.workspaceId,
+        type: "custom_voice_lead_queued",
+        title: `Custom AI call queued for ${getLeadName(lead) || phone}`,
+        detail: `${phone}${companyName ? ` · ${companyName}` : ""}`,
+        actorId: user.id,
+        createdAt: now,
+      });
+    });
+
+    emitEvent(ctx.workspaceId, "telnyx-ai-agent:updated", {
+      type: "custom_lead_queued",
+      queueId: queueItem.id,
+      assignmentId: queueItem.assignmentId,
+    });
+    emitEvent(ctx.workspaceId, "lead:updated", {
+      type: "custom_voice_lead_queued",
+      assignmentId: queueItem.assignmentId,
+      leadId: queueItem.leadId,
+    });
+
+    let callResult = null;
+    if (input.callNow === true) {
+      callResult = await startCampaign(user, {
+        queueIds: [queueItem.id],
+        limit: 1,
+        concurrency: 1,
+        dailyCallLimit: input.dailyCallLimit || agent.dailyCallLimit,
+        fromNumber: input.fromNumber || agent.fromNumber,
+      });
+    }
+
+    return {
+      ok: true,
+      queued: 1,
+      reusedExistingLead,
+      assignmentId: queueItem.assignmentId,
+      queueId: queueItem.id,
+      lead: {
+        id: lead.id,
+        name: getLeadName(lead),
+        contactName: contactName || clean(lead.contactName),
+        companyName: companyName || clean(lead.companyName || lead.business),
+        phone,
+        email: email || clean(lead.email),
+      },
+      queueItem: publicQueueItem(queueItem, store.read()),
+      callNow: Boolean(input.callNow),
+      callResult,
+      message:
+        input.callNow === true
+          ? "The custom lead was queued and ReachFly attempted to start the AI call under the configured calling policy."
+          : "The custom lead was added to the AI-agent queue.",
+    };
+  }
+
   function assignLeads(user, input = {}) {
     const state = store.read();
     const ctx = requireAccess(user, state);
@@ -1527,6 +1787,8 @@ export function createTelnyxAIAgentService({
       campaignName: latestQueue.campaignName,
       leadId: latestQueue.leadId,
       leadName: latestQueue.leadName,
+      customContext: clean(latestQueue.customContext).slice(0, 12_000),
+      customLeadDetails: safeObject(latestQueue.customLeadDetails),
       leadTimezone:
         latestQueue.timezone ||
         agent.defaultLeadTimezone ||
@@ -1661,11 +1923,15 @@ export function createTelnyxAIAgentService({
       call.workspaceId,
       call.assignmentId || call.leadId
     );
+    const queueItem = (state.telnyxAiAgentAssignments || []).find(
+      (item) => item.id === call.queueId
+    );
     const briefing = buildLeadBriefing({
       agent,
       call,
       lead: found?.lead || {},
       campaign: found?.campaign || {},
+      queueItem: queueItem || {},
     });
     const clientState =
       call.clientState ||
@@ -2213,6 +2479,7 @@ export function createTelnyxAIAgentService({
     analyzeWebsite,
     saveAgent,
     findGoogleLeads,
+    createCustomLead,
     assignLeads,
     startCampaign,
     cancelCall,
@@ -2956,7 +3223,9 @@ function buildAssistantPayload({
     enabled_features: ["telephony"],
     voice_settings: {
       voice: config.voice,
-      expressive_mode: true,
+      // Telnyx only permits expressive mode for Ultra / xAI voices.
+      // NaturalHD remains supported, but expressive_mode must be false.
+      expressive_mode: supportsTelnyxExpressiveMode(config.voice),
       language_boost: "auto",
     },
     transcription: {
@@ -3141,12 +3410,34 @@ function buildLeadBriefing({
   call,
   lead,
   campaign,
+  queueItem = {},
 }) {
   const customFields = safeObject(lead.customFields);
+  const customLeadDetails = safeObject(
+    queueItem.customLeadDetails || call.customLeadDetails
+  );
+  const customContext = clean(
+    queueItem.customContext || call.customContext
+  ).slice(0, 12_000);
   return [
     "Use this private ReachFly context for this call. Do not read it as a list unless naturally relevant.",
     `ReachFly call ID: ${call.id}`,
     `Lead name/business: ${getLeadName(lead) || call.leadName || "Unknown"}`,
+    customLeadDetails.contactName
+      ? `Contact name: ${clean(customLeadDetails.contactName)}`
+      : lead.contactName
+        ? `Contact name: ${clean(lead.contactName)}`
+        : "",
+    customLeadDetails.companyName
+      ? `Company: ${clean(customLeadDetails.companyName)}`
+      : lead.companyName
+        ? `Company: ${clean(lead.companyName)}`
+        : "",
+    customLeadDetails.jobTitle
+      ? `Role/title: ${clean(customLeadDetails.jobTitle)}`
+      : lead.jobTitle
+        ? `Role/title: ${clean(lead.jobTitle)}`
+        : "",
     `Phone: ${call.toNumber}`,
     lead.email ? `Email: ${lead.email}` : "",
     lead.website ? `Website: ${lead.website}` : "",
@@ -3159,7 +3450,13 @@ function buildLeadBriefing({
       ? `Audit summary: ${lead.miniAudit.summary}`
       : "",
     Object.keys(customFields).length
-      ? `Custom context: ${JSON.stringify(customFields).slice(0, 3000)}`
+      ? `Lead record custom fields: ${JSON.stringify(customFields).slice(0, 3000)}`
+      : "",
+    customContext
+      ? `Manager-provided private lead context: ${customContext}`
+      : "",
+    customContext
+      ? "Use the manager-provided lead context to personalize the conversation, but do not read it verbatim and do not invent facts beyond it."
       : "",
     agent.websiteIntelligence?.oneLinePitch
       ? `Company positioning: ${agent.websiteIntelligence.oneLinePitch}`
@@ -3359,6 +3656,22 @@ function collectLeads(state, workspaceId) {
     }
   }
   return output;
+}
+
+function findLeadByPhone(state, workspaceId, phoneValue) {
+  const phone = normalizePhone(phoneValue);
+  if (!phone) return null;
+  for (const campaign of state.campaigns || []) {
+    if (campaign.workspaceId !== workspaceId) continue;
+    for (const lead of campaign.leads || []) {
+      if (
+        normalizePhone(lead.phone || lead.phoneNumber) === phone
+      ) {
+        return { campaign, lead };
+      }
+    }
+  }
+  return null;
 }
 
 function findLead(state, workspaceId, requestedId) {
@@ -3678,6 +3991,14 @@ function stableAssignmentId(campaign, lead, create = false) {
   const id = `${campaign.id}:${lead.id}`;
   if (create) lead.assignmentId = id;
   return id;
+}
+
+function supportsTelnyxExpressiveMode(voiceValue) {
+  const voice = clean(voiceValue).toLowerCase();
+  return (
+    voice.startsWith("telnyx.ultra.") ||
+    voice.startsWith("xai.")
+  );
 }
 
 function configuredFromNumbers() {

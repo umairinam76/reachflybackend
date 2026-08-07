@@ -6492,6 +6492,19 @@ app.post(
 );
 
 app.post(
+  "/api/telnyx/ai-agent/leads/custom",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.status(201).json(
+      await telnyxAiAgentService.createCustomLead(
+        req.user,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.post(
   "/api/telnyx/ai-agent/leads/assign",
   requireAuth,
   asyncRoute(async (req, res) => {
