@@ -145,9 +145,109 @@ export function createTelnyxAIAgentService({
     };
   }
 
+  function findActiveCallByPhone(state, workspaceId, phoneValue) {
+    const phone = normalizePhone(phoneValue);
+    if (!phone) return null;
+    return (state.telnyxAiAgentCalls || []).find(
+      (item) =>
+        item.workspaceId === workspaceId &&
+        normalizePhone(item.toNumber) === phone &&
+        ACTIVE_CALL_STATUSES.has(normalizeStatus(item.status))
+    ) || null;
+  }
+
+  function cleanupStaleActiveCalls(workspaceId, agentValue) {
+    const snapshot = store.read();
+    ensureStateShape(snapshot);
+
+    const maxCallSeconds = clampInteger(
+      agentValue?.maxCallSeconds,
+      600,
+      30,
+      7200
+    );
+    const ringTimeoutSeconds = clampInteger(
+      agentValue?.ringTimeoutSeconds,
+      45,
+      15,
+      120
+    );
+    const nowMs = Date.now();
+    const staleIds = (snapshot.telnyxAiAgentCalls || [])
+      .filter((call) => {
+        if (call.workspaceId !== workspaceId) return false;
+        if (!ACTIVE_CALL_STATUSES.has(normalizeStatus(call.status))) {
+          return false;
+        }
+
+        const answered = Boolean(
+          call.answeredAt || call.assistantStartedAt
+        );
+        const startedAt = Date.parse(
+          call.answeredAt ||
+            call.assistantStartedAt ||
+            call.initiatedAt ||
+            call.createdAt ||
+            0
+        );
+        if (!Number.isFinite(startedAt) || startedAt <= 0) {
+          return false;
+        }
+
+        // Give provider webhooks a grace period, but never keep a local call
+        // active indefinitely. Answered calls use maxCallSeconds; calls that
+        // never answered use the configured ring timeout.
+        const allowedMs = answered
+          ? (maxCallSeconds + 120) * 1000
+          : (ringTimeoutSeconds + 120) * 1000;
+        return nowMs - startedAt > allowedMs;
+      })
+      .map((call) => call.id);
+
+    if (!staleIds.length) return 0;
+
+    const staleSet = new Set(staleIds);
+    const now = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      for (const call of draft.telnyxAiAgentCalls || []) {
+        if (!staleSet.has(call.id)) continue;
+        call.status = "cancelled";
+        call.endedAt = call.endedAt || now;
+        call.updatedAt = now;
+        call.staleRecoveredAt = now;
+        call.staleRecoveredReason =
+          "Local active-call state exceeded the configured provider call window.";
+
+        const queueItem = (draft.telnyxAiAgentAssignments || []).find(
+          (item) => item.id === call.queueId
+        );
+        if (
+          queueItem &&
+          !TERMINAL_QUEUE_STATUSES.has(normalizeStatus(queueItem.status))
+        ) {
+          queueItem.status = "cancelled";
+          queueItem.error = "";
+          queueItem.updatedAt = now;
+        }
+      }
+    });
+
+    return staleIds.length;
+  }
+
   function getDashboard(user) {
-    const state = store.read();
+    let state = store.read();
     const ctx = requireAccess(user, state);
+
+    // A missed provider hangup webhook must never leave the workspace trapped
+    // behind a permanently active local call. Close records that are clearly
+    // older than the configured ring/call limit before building the dashboard.
+    cleanupStaleActiveCalls(
+      ctx.workspaceId,
+      findWorkspaceAgent(state, ctx.workspaceId)
+    );
+    state = store.read();
     ensureStateShape(state);
 
     const agent = findWorkspaceAgent(
@@ -817,7 +917,7 @@ export function createTelnyxAIAgentService({
   }
 
   async function createCustomLead(user, input = {}) {
-    const state = store.read();
+    let state = store.read();
     const ctx = requireAccess(user, state);
     const agent = requireConfiguredAgent(state, ctx.workspaceId);
 
@@ -873,6 +973,12 @@ export function createTelnyxAIAgentService({
       input.context || input.leadContext || input.notes
     ).slice(0, 12_000);
 
+    // Heal stale local call records before deciding that this number is busy.
+    // This covers cases where Telnyx ended the call but the final webhook was
+    // delayed or never reached ReachFly.
+    cleanupStaleActiveCalls(ctx.workspaceId, agent);
+    state = store.read();
+
     const leadProbe = {
       id: "custom-probe",
       phone,
@@ -884,6 +990,24 @@ export function createTelnyxAIAgentService({
         409,
         "This phone number is on the workspace do-not-call or suppression list."
       );
+    }
+
+    // A real active call is a normal UI state, not an exceptional failure.
+    // Return the existing call so the frontend can offer Monitor / End call
+    // instead of showing a red 409 error banner.
+    const existingActiveCall = findActiveCallByPhone(
+      state,
+      ctx.workspaceId,
+      phone
+    );
+    if (existingActiveCall) {
+      return {
+        ok: true,
+        alreadyActive: true,
+        activeCall: publicCall(existingActiveCall),
+        message:
+          "This number already has an active AI call. Monitor or end the current call before dialing again.",
+      };
     }
 
     const now = new Date().toISOString();
@@ -1501,21 +1625,44 @@ export function createTelnyxAIAgentService({
       throw httpError(404, "AI-agent call not found.");
     }
 
+    let providerWarning = "";
     if (
       call.callControlId &&
       ACTIVE_CALL_STATUSES.has(normalizeStatus(call.status))
     ) {
-      await telnyxRequest(
-        `/calls/${encodeURIComponent(
-          call.callControlId
-        )}/actions/hangup`,
-        {
-          method: "POST",
-          body: {
-            command_id: crypto.randomUUID(),
-          },
+      try {
+        await telnyxRequest(
+          `/calls/${encodeURIComponent(
+            call.callControlId
+          )}/actions/hangup`,
+          {
+            method: "POST",
+            body: {
+              command_id: crypto.randomUUID(),
+            },
+          }
+        );
+      } catch (error) {
+        const status = Number(
+          error?.status || error?.statusCode || 0
+        );
+        const message = clean(
+          error?.message || ""
+        );
+        const providerAlreadyEnded =
+          [400, 404, 409, 422].includes(status) &&
+          /(already|ended|not active|not found|no longer|invalid call control)/i.test(
+            message
+          );
+
+        // If Telnyx says the call is already gone, clear ReachFly's stale
+        // local state instead of trapping the manager behind an active-call
+        // error. Real provider/network failures are still surfaced.
+        if (!providerAlreadyEnded) {
+          throw error;
         }
-      );
+        providerWarning = message;
+      }
     }
 
     const now = new Date().toISOString();
@@ -1549,6 +1696,7 @@ export function createTelnyxAIAgentService({
     return {
       ok: true,
       call: publicCall(updated || call),
+      providerWarning,
     };
   }
 
