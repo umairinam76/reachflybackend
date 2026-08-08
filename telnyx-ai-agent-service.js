@@ -468,6 +468,10 @@ export function createTelnyxAIAgentService({
 
     const voiceResolution = await resolveAssistantVoice(config.voice);
     config.voice = voiceResolution.voice.id;
+    config.greeting = resolveAssistantGreetingTemplate(
+      config.greeting,
+      config
+    );
 
     const toolSecret = requireToolSecret();
     const webhookBaseUrl = resolveWebhookBaseUrl();
@@ -1632,26 +1636,23 @@ export function createTelnyxAIAgentService({
           leadId: answeredCall.leadId,
         });
 
-      // Prioritize the caller experience. Dispatch Claude first and start
-      // listen-only audio/transcription in parallel so monitoring adds zero
-      // blocking Telnyx round trips before the assistant begins speaking.
-      const assistantPromise = startAssistantForCall(
-        answeredCall
-      );
-
-      void Promise.allSettled([
-        startLiveMonitorStream(
-          answeredCall,
-          runtimeClientState
-        ),
-        startRealtimeCallTranscription(
-          answeredCall,
-          runtimeClientState
-        ),
-      ]);
-
+      // Give the live assistant first priority on the answered call. Only
+      // start the listen-only monitor and secondary transcript after Telnyx
+      // confirms the assistant attach, avoiding competing control requests at
+      // the exact moment the caller expects the greeting.
       try {
-        updated = await assistantPromise;
+        updated = await startAssistantForCall(answeredCall);
+
+        void Promise.allSettled([
+          startLiveMonitorStream(
+            updated || answeredCall,
+            runtimeClientState
+          ),
+          startRealtimeCallTranscription(
+            updated || answeredCall,
+            runtimeClientState
+          ),
+        ]);
       } catch (error) {
         updated = markAssistantAttachFailed(
           call.id,
@@ -3536,13 +3537,13 @@ function normalizeAgentInput({
       ),
     greeting:
       clean(input.greeting || existing?.greeting) ||
-      "Hi, this is Lisa, the AI assistant with {{company_name}}. Hey—did I catch you at an okay time for one quick question?",
+      "Hey, Lisa here from {{company_name}} — I’m their AI assistant. Did I catch you at a bad time?",
     disclosure:
       clean(input.disclosure || existing?.disclosure) ||
       "Clearly identify yourself as an automated AI sales assistant and identify the company at the beginning of the call.",
     persona:
       clean(input.persona || existing?.persona) ||
-      "Warm, quick, perceptive, lightly playful, and conversational. Sound present rather than scripted. Use contractions, short sentences, natural backchannels, subtle emotion, and occasional light humor. Never claim to be human.",
+      "Quick, warm, perceptive, relaxed, and naturally conversational. Use contractions, short fragments, varied rhythm, tiny human reactions, and context-appropriate warmth or humor. Never sound like a script and never claim to be human.",
     offer: clean(
       input.offer ||
         existing?.offer ||
@@ -3694,18 +3695,18 @@ function buildAssistantPayload({
           clampNumber(
             process.env.TELNYX_AI_AGENT_FLUX_EOT_THRESHOLD,
             0.65,
-            0.3,
+            0.5,
             0.9
           )
         );
   const eotTimeoutMs = fastLatency
-    ? 700
+    ? 500
     : balancedLatency
       ? 1000
       : clampInteger(
           process.env.TELNYX_AI_AGENT_FLUX_EOT_TIMEOUT_MS,
           1200,
-          300,
+          500,
           10000
         );
   const ultraVoice = isTelnyxUltraVoice(config.voice);
@@ -3850,13 +3851,12 @@ function buildAssistantPayload({
         ? {
             voice_speed: clampNumber(
               process.env.TELNYX_AI_AGENT_VOICE_SPEED,
-              1.02,
+              1.0,
               0.85,
               1.2
             ),
-            language_boost: "English",
           }
-        : { language_boost: "auto" }),
+        : {}),
     },
     transcription: {
       language: "en",
@@ -3874,7 +3874,7 @@ function buildAssistantPayload({
       disable_greeting_interruption: false,
       start_speaking_plan: {
         wait_seconds: fastLatency
-          ? 0.05
+          ? 0.0
           : balancedLatency
             ? 0.1
             : clampNumber(
@@ -3885,7 +3885,7 @@ function buildAssistantPayload({
               ),
         transcription_endpointing_plan: {
           on_punctuation_seconds: fastLatency
-            ? 0.05
+            ? 0.02
             : balancedLatency
               ? 0.1
               : clampNumber(
@@ -3895,7 +3895,7 @@ function buildAssistantPayload({
                   2
                 ),
           on_no_punctuation_seconds: fastLatency
-            ? 0.35
+            ? 0.22
             : balancedLatency
               ? 0.6
               : clampNumber(
@@ -3905,7 +3905,7 @@ function buildAssistantPayload({
                   3
                 ),
           on_number_seconds: fastLatency
-            ? 0.5
+            ? 0.35
             : balancedLatency
               ? 0.8
               : clampNumber(
@@ -3953,49 +3953,39 @@ function buildAssistantInstructions(config) {
   const hasWebsiteKnowledge = Boolean(
     safeObject(config.websiteIntelligence).analyzedAt
   );
+
   return [
-    `You are ${config.name}, the outbound AI sales assistant for ${config.companyName}.`,
+    `You are ${config.name}, the outbound AI assistant for ${config.companyName}.`,
     config.disclosure,
-    `Persona: ${compactPromptText(config.persona, 1000)}`,
+    `Style: ${compactPromptText(config.persona, 520)}`,
     buildWebsiteKnowledgeBlock(config.websiteIntelligence),
     !hasWebsiteKnowledge && config.offer
-      ? `Offer: ${compactPromptText(config.offer, 500)}`
+      ? `Offer: ${compactPromptText(config.offer, 300)}`
       : "",
     !hasWebsiteKnowledge && config.idealCustomer
-      ? `Ideal customer: ${compactPromptText(config.idealCustomer, 800)}`
+      ? `Best fit: ${compactPromptText(config.idealCustomer, 420)}`
       : "",
-    !hasWebsiteKnowledge && config.qualificationQuestions
-      ? `Qualification requirements: ${compactPromptText(config.qualificationQuestions, 900)}`
-      : "",
-    !hasWebsiteKnowledge && config.objectionHandling
-      ? `Objection guidance: ${compactPromptText(config.objectionHandling, 900)}`
-      : "",
-    `Meeting objective: ${config.meetingGoal}`,
+    `Meeting goal: ${compactPromptText(config.meetingGoal, 260)}`,
     config.bookingInstructions
-      ? `Booking rules: ${config.bookingInstructions}`
+      ? `Booking rules: ${compactPromptText(config.bookingInstructions, 420)}`
       : "",
-    `Default booking timezone: ${config.bookingTimezone}. Default duration: ${config.meetingDurationMinutes} minutes.`,
-    config.calendarOwnerEmail
-      ? `Meeting owner: ${config.calendarOwnerEmail}.`
-      : "",
-    `Live reasoning model: ${config.model || LIVE_CLAUDE_MODEL}. Treat the live transcript as an actual two-way conversation and adapt to what the lead says rather than following a rigid script.`,
-    "Conversation rules — FAST HUMAN MODE:",
-    "- Respond quickly. Lead with a short natural first sentence, usually 4–12 words, then continue only if needed. Put punctuation early so speech can start quickly.",
-    "- Keep most turns under about 25 spoken words. Ask one question at a time and let the lead finish.",
-    "- Sound like a sharp person on a real phone call, not a script. Use contractions and rotate natural micro-reactions such as 'yeah', 'right', 'gotcha', 'mm-hm', 'I see', 'fair enough', 'hmm', or 'well' only when they genuinely fit. Never stack fillers.",
-    "- Match the lead's energy. If they are upbeat, sound brighter; if frustrated, sound calm and empathetic; if skeptical, sound grounded and confident; if curious, sound curious back.",
-    "- With a Telnyx Ultra voice and expressive mode, use supported emotion delivery sparingly. Prefer natural emotional subtext; when useful, one cue such as <emotion value=\"curious\" />, <emotion value=\"confident\" />, <emotion value=\"grateful\" />, <emotion value=\"apologetic\" />, or <emotion value=\"excited\" /> may lead a short response. Never read the tag aloud.",
-    "- [laughter] is allowed only for a genuinely funny, warm, or playful moment. Never laugh at objections, confusion, money concerns, complaints, rejection, or sensitive topics. Do not force laughter into every call.",
-    "- Small human acknowledgements are good; fake personal stories are not. Never claim to be human or imply you have a body, childhood, personal memories, or real-world experiences.",
-    "- Do not repeat or summarize what the caller just said unless clarification is genuinely needed. Avoid corporate filler, long preambles, and speeches.",
-    "- Once the caller's intent is clear, answer directly and keep momentum. Do not narrate your reasoning or mention internal tools.",
-    "- Do not pressure, threaten, misrepresent, or promise results that are not supported.",
-    "- Respect a request to stop immediately. Call update_lead_outcome with do_not_call=true, apologize once, and end the call.",
-    "- Only call book_meeting after the lead explicitly confirms the exact date, time, timezone and duration.",
-    "- Repeat the confirmed meeting details before ending the call.",
-    "- Use update_lead_outcome once a meaningful outcome is known.",
-    "- Do not collect payment-card, government-ID, health, password, authentication-code or similarly sensitive information.",
-    "- If the lead asks for a human, record that request in the notes and offer a human follow-up.",
+    `Booking timezone: ${config.bookingTimezone}; duration: ${config.meetingDurationMinutes} minutes.`,
+    "LIVE CALL RULES — TURBO NATURAL MODE:",
+    "- Speed matters. Start answering as soon as the caller's intent is clear. Do not wait to compose a perfect paragraph.",
+    "- Most replies are ONE short sentence plus ONE short question. Usually 6–18 spoken words total.",
+    "- If the caller gives a tiny answer like yes, no, maybe, sure, or kind of, move straight to the next useful question. Do not summarize their answer.",
+    "- Sound spontaneous, not polished. Use contractions, sentence fragments, and small reactions when they fit: 'ah, gotcha', 'yeah, fair', 'oh, nice', 'hmm, okay', 'right', 'makes sense'. Rotate them; do not use one every turn.",
+    "- A tiny hesitation or self-correction is okay occasionally: 'well—', 'actually', 'hmm'. Maximum one per turn and not on every turn.",
+    "- Never use canned call-center filler such as 'Absolutely', 'Certainly', 'Great question', 'Thank you for sharing', or 'I completely understand' unless the words genuinely fit.",
+    "- Match the caller's energy. Warm when they are warm, calm when they are skeptical, lighter when they joke. A brief natural chuckle is okay only when the caller creates a genuinely playful moment. Never announce 'laughing' or read an emotion tag aloud.",
+    "- Telnyx Expressive Mode controls prosody. Give it natural punctuation and short conversational wording; do not output XML/SSML markup yourself.",
+    "- Do not repeat the caller's sentence back to them. Do not give mini-summaries between every turn.",
+    "- Ask one question at a time. Prefer the next best question over a long explanation.",
+    "- If a useful answer needs detail, speak the first short sentence immediately, then add at most one more sentence.",
+    "- Never pretend to be human. Keep the required AI disclosure natural and brief.",
+    "- Respect stop or do-not-call requests immediately and end politely.",
+    "- Only book a meeting after exact date/time/timezone confirmation. Use tools only when needed; never narrate tool use.",
+    "- Do not collect payment-card, government-ID, health, password, authentication-code, or similarly sensitive information.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -4006,28 +3996,26 @@ function buildWebsiteKnowledgeBlock(profileValue) {
   if (!profile.analyzedAt) return "";
 
   const sections = [
-    profile.companySummary
-      ? `Website-derived company summary: ${compactPromptText(profile.companySummary, 700)}`
-      : "",
     profile.oneLinePitch
-      ? `Website-derived sales positioning: ${compactPromptText(profile.oneLinePitch, 320)}`
-      : "",
-    arrayLine("Services/products", profile.services),
-    arrayLine("Target customers", profile.targetCustomers),
-    arrayLine("Customer pains", profile.painPoints),
-    arrayLine("Value propositions", profile.valuePropositions),
-    arrayLine("Verified proof points", profile.proofPoints),
-    arrayLine("Suggested discovery angles", profile.discoveryAngles),
-    arrayLine("Website-derived qualification questions", profile.qualificationQuestions),
-    objectionLine(profile.objectionResponses),
-    arrayLine("Relevant FAQs", profile.faqs),
-    arrayLine("Claims you must not invent", profile.prohibitedClaims),
+      ? `Positioning: ${compactPromptText(profile.oneLinePitch, 220)}`
+      : profile.companySummary
+        ? `Company: ${compactPromptText(profile.companySummary, 320)}`
+        : "",
+    compactArrayLine("Services", profile.services, 4, 90),
+    compactArrayLine("Best-fit customers", profile.targetCustomers, 3, 105),
+    compactArrayLine("Pain points", profile.painPoints, 3, 105),
+    compactArrayLine("Why us", profile.valuePropositions, 3, 105),
+    compactArrayLine("Discovery angles", profile.discoveryAngles, 3, 105),
+    compactObjectionLine(profile.objectionResponses, 2, 150),
+    compactArrayLine("Do not invent", profile.prohibitedClaims, 3, 105),
   ].filter(Boolean);
 
   return [
-    "Claude analyzed the company website. Use the following source-grounded knowledge as your sales context. Do not invent pricing, guarantees, customers, certifications, case studies, features, or claims that are not supported here.",
+    "Website-grounded sales context. Use only what is relevant to the current turn; do not recite this block.",
     ...sections,
-  ].join("\n");
+  ]
+    .join("\n")
+    .slice(0, 2_200);
 }
 
 function websiteProfilePitch(profileValue) {
@@ -4071,6 +4059,41 @@ function compactPromptText(value, maxLength = 180) {
     : text;
 }
 
+function compactArrayLine(
+  label,
+  value,
+  maxItems = 3,
+  maxItemLength = 110
+) {
+  const items = Array.isArray(value)
+    ? value
+        .map((item) => compactPromptText(item, maxItemLength))
+        .filter(Boolean)
+        .slice(0, maxItems)
+    : [];
+  return items.length ? `${label}: ${items.join(" | ")}` : "";
+}
+
+function compactObjectionLine(
+  value,
+  maxItems = 2,
+  maxItemLength = 160
+) {
+  const items = Array.isArray(value) ? value : [];
+  const text = items
+    .map((item) => {
+      if (typeof item === "string") return clean(item);
+      const obj = safeObject(item);
+      return [clean(obj.objection), clean(obj.response)]
+        .filter(Boolean)
+        .join(" => ");
+    })
+    .filter(Boolean)
+    .map((item) => compactPromptText(item, maxItemLength))
+    .slice(0, maxItems);
+  return text.length ? `Objections: ${text.join(" | ")}` : "";
+}
+
 function arrayLine(label, value) {
   const items = Array.isArray(value)
     ? value
@@ -4097,6 +4120,15 @@ function objectionLine(value) {
   return text.length ? `Objection guidance: ${text.join(" | ")}` : "";
 }
 
+function resolveAssistantGreetingTemplate(value, config = {}) {
+  return String(value || "")
+    .replace(/\{\{company_name\}\}/gi, clean(config.companyName) || "our company")
+    .replace(/\{\{agent_name\}\}/gi, clean(config.name) || "the AI assistant")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+}
+
 function resolveGreeting(agent, lead) {
   return String(agent.greeting || "")
     .replace(/\{\{company_name\}\}/gi, agent.companyName || "our company")
@@ -4112,59 +4144,42 @@ function buildLeadBriefing({
   campaign,
   queueItem = {},
 }) {
-  const customFields = safeObject(lead.customFields);
   const customLeadDetails = safeObject(
     queueItem.customLeadDetails || call.customLeadDetails
   );
-  const customContext = clean(
-    queueItem.customContext || call.customContext
-  ).slice(0, 4_000);
+  const customContext = compactPromptText(
+    queueItem.customContext || call.customContext,
+    850
+  );
+  const contactName = clean(
+    customLeadDetails.contactName ||
+      lead.contactName ||
+      getLeadName(lead) ||
+      call.leadName
+  );
+  const companyName = clean(
+    customLeadDetails.companyName || lead.companyName
+  );
+
   return [
-    "Use this private ReachFly context for this call. Do not read it as a list unless naturally relevant.",
-    `Lead name/business: ${getLeadName(lead) || call.leadName || "Unknown"}`,
-    customLeadDetails.contactName
-      ? `Contact name: ${clean(customLeadDetails.contactName)}`
-      : lead.contactName
-        ? `Contact name: ${clean(lead.contactName)}`
-        : "",
-    customLeadDetails.companyName
-      ? `Company: ${clean(customLeadDetails.companyName)}`
-      : lead.companyName
-        ? `Company: ${clean(lead.companyName)}`
-        : "",
+    "PRIVATE CALL CONTEXT. The greeting has already been delivered; never repeat it. Do not read this block aloud.",
+    contactName ? `Contact: ${contactName}` : "",
+    companyName ? `Company: ${companyName}` : "",
     customLeadDetails.jobTitle
-      ? `Role/title: ${clean(customLeadDetails.jobTitle)}`
-      : lead.jobTitle
-        ? `Role/title: ${clean(lead.jobTitle)}`
-        : "",
-    `Phone: ${call.toNumber}`,
-    lead.email ? `Email: ${lead.email}` : "",
-    lead.website ? `Website: ${lead.website}` : "",
-    lead.address ? `Location: ${lead.address}` : "",
-    campaign?.name || campaign?.title
-      ? `Campaign: ${campaign.name || campaign.title}`
-      : "",
-    lead.notes ? `Existing notes: ${compactPromptText(lead.notes, 600)}` : "",
-    lead.miniAudit?.summary
-      ? `Audit summary: ${compactPromptText(lead.miniAudit.summary, 600)}`
-      : "",
-    Object.keys(customFields).length
-      ? `Lead record custom fields: ${JSON.stringify(customFields).slice(0, 900)}`
+      ? `Role: ${clean(customLeadDetails.jobTitle)}`
       : "",
     customContext
-      ? `Manager-provided private lead context: ${customContext}`
-      : "",
-    customContext
-      ? "Use the manager-provided lead context to personalize the conversation, but do not read it verbatim and do not invent facts beyond it."
+      ? `Manager note: ${customContext}`
       : "",
     agent.websiteIntelligence?.oneLinePitch
-      ? `Company positioning: ${compactPromptText(agent.websiteIntelligence.oneLinePitch, 400)}`
+      ? `Our positioning: ${compactPromptText(agent.websiteIntelligence.oneLinePitch, 260)}`
       : "",
-    `The lead's working timezone is ${call.leadTimezone || agent.defaultLeadTimezone || DEFAULT_LEAD_TIMEZONE}.`,
-    "Start with the configured greeting. Qualify fit, understand the problem, and book a meeting only with explicit confirmation.",
+    `Timezone: ${call.leadTimezone || agent.defaultLeadTimezone || DEFAULT_LEAD_TIMEZONE}`,
+    "Use these facts subtly. If a note conflicts with what the caller says, trust the caller and ask a short clarifying question rather than assuming.",
   ]
     .filter(Boolean)
-    .join("\n");
+    .join("\n")
+    .slice(0, 1_500);
 }
 
 function normalizeGoogleLeadForVoiceAgent(rawValue, {
@@ -4871,56 +4886,52 @@ function chooseRecommendedTelnyxVoice(voicesValue) {
     const name = clean(voice.name).toLowerCase();
     const model = clean(voice.model).toLowerCase();
     const language = clean(voice.language).toLowerCase();
+    const gender = clean(voice.gender).toLowerCase();
     let value = 0;
 
-    if (model === "ultra" || id.startsWith("telnyx.ultra.")) {
-      value += 1000;
-    }
+    const ultra = model === "ultra" || id.startsWith("telnyx.ultra.");
+    if (ultra) value += 1500;
 
-    if (name.includes("clara")) value += 120;
-    else if (name.includes("callie")) value += 110;
-    else if (name.includes("molly")) value += 100;
-    else if (name.includes("madison")) value += 90;
-    else if (name.includes("skyler")) value += 80;
+    // Telnyx Ultra Allie is explicitly designed as a natural conversationalist.
+    if (id === "telnyx.ultra.2747b6cf-fa34-460c-97db-267566918881") value += 800;
+    if (name.includes("allie")) value += 700;
+    if (name.includes("natural conversationalist")) value += 650;
+    if (name.includes("conversational")) value += 300;
+    if (name.includes("approachable")) value += 220;
+    if (name.includes("warm")) value += 210;
+    if (name.includes("friendly")) value += 200;
+    if (name.includes("encourager")) value += 180;
+    if (name.includes("service specialist")) value += 150;
+    if (name.includes("callie")) value += 140;
+    if (name.includes("mia")) value += 130;
+    if (name.includes("clara")) value += 90;
 
     if (
       language === "en-us" ||
       language.includes("american english")
     ) {
-      value += 70;
+      value += 100;
     } else if (
       language.startsWith("en") ||
       language.includes("english")
     ) {
-      value += 50;
+      value += 80;
     }
 
-    if (
-      model === "kokorotts" ||
-      id.startsWith("telnyx.kokorotts.")
-    ) {
-      value += 400;
-    }
+    // The UI persona is Lisa, so prefer a female conversational Ultra voice
+    // when two otherwise similar voices are available.
+    if (gender.includes("female")) value += 40;
 
-    if (
-      model === "naturalhd" ||
-      id.startsWith("telnyx.naturalhd.")
-    ) {
-      value += 300;
-    }
-
-    if (id === "telnyx.naturalhd.astra") {
-      value += 60;
+    if (!ultra && (model === "naturalhd" || id.startsWith("telnyx.naturalhd."))) {
+      value += 350;
     }
 
     return value;
   };
 
-  return (
-    [...voices].sort(
-      (left, right) => score(right) - score(left)
-    )[0] || null
-  );
+  return [...voices].sort(
+    (left, right) => score(right) - score(left)
+  )[0] || null;
 }
 
 function resolveFriendlyVoiceAlias(voicesValue, requestedValue) {
