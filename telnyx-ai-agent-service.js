@@ -5,7 +5,9 @@ import WebSocket from "ws";
 
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io";
-const DEFAULT_VOICE = process.env.ELEVENLABS_VOICE_ID || "";
+const DEFAULT_VOICE =
+  process.env.ELEVENLABS_VOICE_ID ||
+  "fNZkPhLHNXqE8oMjamg6";
 const LIVE_CLAUDE_MODEL =
   process.env.TELNYX_AI_AGENT_LIVE_MODEL ||
   "anthropic/claude-haiku-4-5";
@@ -83,6 +85,14 @@ export function createTelnyxAIAgentService({
   }
 
   const voiceCache = {
+    expiresAt: 0,
+    value: [],
+  };
+  const elevenLabsVoiceCache = {
+    expiresAt: 0,
+    value: [],
+  };
+  const elevenLabsAgentCache = {
     expiresAt: 0,
     value: [],
   };
@@ -376,40 +386,216 @@ export function createTelnyxAIAgentService({
     const state = store.read();
     requireAccess(user, state);
 
-    const agentId = requireElevenLabsAgentId(false);
-    if (!agentId || !clean(process.env.ELEVENLABS_API_KEY)) {
+    if (!clean(process.env.ELEVENLABS_API_KEY)) {
       return {
         ok: true,
         voices: [],
-        recommendedVoiceId: "",
+        recommendedVoiceId: DEFAULT_VOICE,
         recommendedVoice: null,
         cached: false,
       };
     }
 
-    const providerAgent = await elevenLabsRequest(
-      `/v1/convai/agents/${encodeURIComponent(agentId)}`
-    );
-    const tts = safeObject(providerAgent?.conversation_config?.tts);
-    const voiceId = clean(tts.voice_id || process.env.ELEVENLABS_VOICE_ID);
-    const voice = voiceId
-      ? {
-          id: voiceId,
-          name: "ElevenLabs agent voice",
-          label: `ElevenLabs · ${voiceId}`,
+    if (
+      !force &&
+      elevenLabsVoiceCache.value.length &&
+      elevenLabsVoiceCache.expiresAt > Date.now()
+    ) {
+      const recommended =
+        elevenLabsVoiceCache.value.find((voice) => voice.id === DEFAULT_VOICE) ||
+        elevenLabsVoiceCache.value[0] ||
+        null;
+      return {
+        ok: true,
+        voices: elevenLabsVoiceCache.value,
+        recommendedVoiceId: recommended?.id || DEFAULT_VOICE,
+        recommendedVoice: recommended,
+        cached: true,
+      };
+    }
+
+    const voices = [];
+    let nextPageToken = "";
+    let pages = 0;
+    do {
+      const params = new URLSearchParams({
+        page_size: "100",
+        sort: "name",
+        sort_direction: "asc",
+        include_total_count: "false",
+      });
+      if (nextPageToken) params.set("next_page_token", nextPageToken);
+      const response = await elevenLabsRequest(`/v2/voices?${params.toString()}`);
+      const pageVoices = Array.isArray(response?.voices) ? response.voices : [];
+      for (const voice of pageVoices) {
+        const id = clean(voice.voice_id || voice.id);
+        if (!id || voices.some((item) => item.id === id)) continue;
+        const labels = safeObject(voice.labels);
+        voices.push({
+          id,
+          name: clean(voice.name) || id,
+          label: `${clean(voice.name) || "ElevenLabs voice"} · ${id}`,
           provider: "elevenlabs",
-          model: clean(tts.model_id) || "eleven_flash_v2_5",
-          language: clean(providerAgent?.conversation_config?.agent?.language) || "en",
-        }
-      : null;
+          category: clean(voice.category),
+          language: clean(labels.language || labels.locale),
+          accent: clean(labels.accent),
+          gender: clean(labels.gender),
+          previewUrl: clean(voice.preview_url),
+        });
+      }
+      nextPageToken = response?.has_more ? clean(response?.next_page_token) : "";
+      pages += 1;
+    } while (nextPageToken && pages < 10);
+
+    // Keep the requested ReachFly voice selectable even if it is not returned
+    // in the first provider pages. A direct lookup also gives us its real name.
+    if (DEFAULT_VOICE && !voices.some((voice) => voice.id === DEFAULT_VOICE)) {
+      try {
+        const requested = await elevenLabsRequest(
+          `/v1/voices/${encodeURIComponent(DEFAULT_VOICE)}`
+        );
+        voices.unshift({
+          id: DEFAULT_VOICE,
+          name: clean(requested?.name) || DEFAULT_VOICE,
+          label: `${clean(requested?.name) || "ElevenLabs voice"} · ${DEFAULT_VOICE}`,
+          provider: "elevenlabs",
+          category: clean(requested?.category),
+          language: clean(safeObject(requested?.labels).language),
+          accent: clean(safeObject(requested?.labels).accent),
+          gender: clean(safeObject(requested?.labels).gender),
+          previewUrl: clean(requested?.preview_url),
+        });
+      } catch {
+        voices.unshift({
+          id: DEFAULT_VOICE,
+          name: "ReachFly preferred voice",
+          label: `ReachFly preferred voice · ${DEFAULT_VOICE}`,
+          provider: "elevenlabs",
+          category: "",
+          language: "",
+          accent: "",
+          gender: "",
+          previewUrl: "",
+        });
+      }
+    }
+
+    elevenLabsVoiceCache.value = voices;
+    elevenLabsVoiceCache.expiresAt = Date.now() + 5 * 60_000;
+    const recommended =
+      voices.find((voice) => voice.id === DEFAULT_VOICE) || voices[0] || null;
 
     return {
       ok: true,
-      voices: voice ? [voice] : [],
-      recommendedVoiceId: voice?.id || "",
-      recommendedVoice: voice,
+      voices,
+      recommendedVoiceId: recommended?.id || DEFAULT_VOICE,
+      recommendedVoice: recommended,
       cached: false,
     };
+  }
+
+  async function listAgents(user, { force = false } = {}) {
+    const state = store.read();
+    requireAccess(user, state);
+
+    if (!clean(process.env.ELEVENLABS_API_KEY)) {
+      return { ok: true, agents: [], cached: false };
+    }
+
+    if (
+      !force &&
+      elevenLabsAgentCache.value.length &&
+      elevenLabsAgentCache.expiresAt > Date.now()
+    ) {
+      return { ok: true, agents: elevenLabsAgentCache.value, cached: true };
+    }
+
+    const summaries = [];
+    let cursor = "";
+    let pages = 0;
+    do {
+      const params = new URLSearchParams({
+        page_size: "100",
+        archived: "false",
+        sort_by: "name",
+        sort_direction: "asc",
+      });
+      if (cursor) params.set("cursor", cursor);
+      const response = await elevenLabsRequest(
+        `/v1/convai/agents?${params.toString()}`
+      );
+      summaries.push(...(Array.isArray(response?.agents) ? response.agents : []));
+      cursor = response?.has_more ? clean(response?.next_cursor) : "";
+      pages += 1;
+    } while (cursor && pages < 5);
+
+    const details = [];
+    for (let index = 0; index < summaries.length; index += 8) {
+      const batch = summaries.slice(index, index + 8);
+      const results = await Promise.all(
+        batch.map(async (summary) => {
+          const agentId = clean(summary?.agent_id);
+          if (!agentId) return null;
+          try {
+            const providerAgent = await elevenLabsRequest(
+              `/v1/convai/agents/${encodeURIComponent(agentId)}`
+            );
+            const tts = safeObject(providerAgent?.conversation_config?.tts);
+            return {
+              id: agentId,
+              agentId,
+              name: clean(providerAgent?.name || summary?.name) || agentId,
+              voiceId: clean(tts.voice_id),
+              ttsModel: clean(tts.model_id),
+              branchId: clean(providerAgent?.branch_id),
+              versionId: clean(providerAgent?.version_id),
+              archived: summary?.archived === true,
+            };
+          } catch (error) {
+            return {
+              id: agentId,
+              agentId,
+              name: clean(summary?.name) || agentId,
+              voiceId: "",
+              ttsModel: "",
+              branchId: "",
+              versionId: "",
+              archived: summary?.archived === true,
+              warning: error.message,
+            };
+          }
+        })
+      );
+      details.push(...results.filter(Boolean));
+    }
+
+    const voiceIds = [...new Set(details.map((item) => item.voiceId).filter(Boolean))];
+    const voiceNames = new Map();
+    if (voiceIds.length) {
+      try {
+        const params = new URLSearchParams({ page_size: "100", include_total_count: "false" });
+        for (const voiceId of voiceIds.slice(0, 100)) params.append("voice_ids", voiceId);
+        const response = await elevenLabsRequest(`/v2/voices?${params.toString()}`);
+        for (const voice of Array.isArray(response?.voices) ? response.voices : []) {
+          const id = clean(voice.voice_id || voice.id);
+          if (id) voiceNames.set(id, clean(voice.name) || id);
+        }
+      } catch {
+        // Voice IDs are still useful even when voice metadata lookup is unavailable.
+      }
+    }
+
+    const agents = details.map((item) => ({
+      ...item,
+      voiceName: item.voiceId ? voiceNames.get(item.voiceId) || item.voiceId : "No voice configured",
+      voiceLabel: item.voiceId
+        ? `${voiceNames.get(item.voiceId) || "ElevenLabs voice"} · ${item.voiceId}`
+        : "No voice configured",
+    }));
+
+    elevenLabsAgentCache.value = agents;
+    elevenLabsAgentCache.expiresAt = Date.now() + 60_000;
+    return { ok: true, agents, cached: false };
   }
 
   async function resolveAssistantVoice(requestedVoice) {
@@ -635,9 +821,10 @@ export function createTelnyxAIAgentService({
               turn_model: "turn_v3",
             },
             tts: {
-              ...(clean(currentTts.voice_id)
-                ? { voice_id: clean(currentTts.voice_id) }
-                : {}),
+              voice_id:
+                clean(config.voice) ||
+                clean(currentTts.voice_id) ||
+                DEFAULT_VOICE,
               model_id:
                 clean(process.env.ELEVENLABS_TTS_MODEL_ID) ||
                 "eleven_flash_v2_5",
@@ -3855,6 +4042,7 @@ export function createTelnyxAIAgentService({
     getAccess,
     getDashboard,
     listVoices,
+    listAgents,
     analyzeWebsite,
     saveAgent,
     findGoogleLeads,
