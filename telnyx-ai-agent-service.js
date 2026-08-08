@@ -12,6 +12,9 @@ const LIVE_CLAUDE_MODEL =
 const WEBSITE_CLAUDE_MODEL =
   process.env.ANTHROPIC_VOICE_AGENT_PROFILE_MODEL ||
   "claude-sonnet-5";
+const SALES_HEAD_CLAUDE_MODEL =
+  process.env.ANTHROPIC_VOICE_AGENT_SALES_HEAD_MODEL ||
+  "claude-sonnet-5";
 const ANTHROPIC_API_URL =
   "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -1791,16 +1794,20 @@ export function createTelnyxAIAgentService({
       try {
         updated = await startAssistantForCall(answeredCall);
 
-        void Promise.allSettled([
-          startLiveMonitorStream(
-            updated || answeredCall,
-            runtimeClientState
-          ),
-          startRealtimeCallTranscription(
-            updated || answeredCall,
-            runtimeClientState
-          ),
-        ]);
+        // Give the greeting a tiny head start before secondary control
+        // commands. This reduces contention on the exact post-answer moment.
+        setTimeout(() => {
+          void Promise.allSettled([
+            startLiveMonitorStream(
+              updated || answeredCall,
+              runtimeClientState
+            ),
+            startRealtimeCallTranscription(
+              updated || answeredCall,
+              runtimeClientState
+            ),
+          ]);
+        }, 180);
       } catch (error) {
         updated = markAssistantAttachFailed(
           call.id,
@@ -1966,7 +1973,7 @@ export function createTelnyxAIAgentService({
       booked: true,
       meeting: publicMeeting(meeting),
       message:
-        "The meeting is confirmed and saved in ReachFly. Repeat the date, time and timezone to the lead.",
+        "Booking succeeded. Confirm it in a warm, casual voice. Example pattern: 'And... it's booked. You're set for Tuesday at two.' Vary naturally and repeat the exact confirmed date/time/timezone once.",
     };
   }
 
@@ -2052,6 +2059,146 @@ export function createTelnyxAIAgentService({
     };
   }
 
+  async function warmSalesHeadPlaybook({
+    workspaceId,
+    agent,
+    lead,
+    campaign,
+    queueItem,
+  }) {
+    if (!envFlag("TELNYX_AI_AGENT_SALES_HEAD_ENABLED", true)) {
+      return null;
+    }
+    const apiKey = clean(process.env.ANTHROPIC_API_KEY);
+    if (!apiKey || !queueItem?.id) return null;
+
+    const fingerprint = crypto
+      .createHash("sha256")
+      .update(
+        [
+          queueItem.id,
+          clean(queueItem.customContext),
+          clean(queueItem.leadName),
+          clean(queueItem.phone),
+          clean(agent?.websiteIntelligence?.oneLinePitch),
+          clean(agent?.updatedAt),
+        ].join("|")
+      )
+      .digest("hex")
+      .slice(0, 24);
+
+    const current = (store.read().telnyxAiAgentAssignments || []).find(
+      (item) => item.id === queueItem.id
+    );
+    if (
+      current?.salesHeadFingerprint === fingerprint &&
+      clean(current.salesHeadPlaybook)
+    ) {
+      return current.salesHeadPlaybook;
+    }
+    if (
+      current?.salesHeadWarmupStatus === "warming" &&
+      current?.salesHeadFingerprint === fingerprint
+    ) {
+      return null;
+    }
+
+    const startedAt = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentAssignments.find(
+        (item) => item.id === queueItem.id
+      );
+      if (target) {
+        target.salesHeadWarmupStatus = "warming";
+        target.salesHeadFingerprint = fingerprint;
+        target.salesHeadWarmupStartedAt = startedAt;
+        target.salesHeadWarmupError = "";
+      }
+    });
+
+    try {
+      const playbook = await buildSalesHeadPlaybookWithClaude({
+        apiKey,
+        agent,
+        lead,
+        campaign,
+        queueItem,
+      });
+      if (!playbook) return null;
+
+      const readyAt = new Date().toISOString();
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentAssignments.find(
+          (item) => item.id === queueItem.id
+        );
+        if (target) {
+          target.salesHeadPlaybook = playbook;
+          target.salesHeadWarmupStatus = "ready";
+          target.salesHeadFingerprint = fingerprint;
+          target.salesHeadGeneratedAt = readyAt;
+          target.salesHeadModel = SALES_HEAD_CLAUDE_MODEL;
+          target.salesHeadWarmupError = "";
+        }
+        const callTarget = [...(draft.telnyxAiAgentCalls || [])]
+          .reverse()
+          .find((item) => item.queueId === queueItem.id);
+        if (callTarget) {
+          callTarget.salesHeadPlaybook = playbook;
+          callTarget.salesHeadModel = SALES_HEAD_CLAUDE_MODEL;
+          callTarget.updatedAt = readyAt;
+        }
+      });
+
+      // If the assistant already started before Sonnet finished, inject the
+      // playbook silently for the next turn. Never wait for it on the live path.
+      const activeCall = [...(store.read().telnyxAiAgentCalls || [])]
+        .reverse()
+        .find(
+          (item) =>
+            item.queueId === queueItem.id &&
+            item.callControlId &&
+            ["assistant_active", "active", "answered"].includes(
+              normalizeStatus(item.status)
+            )
+        );
+      if (activeCall?.callControlId) {
+        void telnyxRequest(
+          `/calls/${encodeURIComponent(
+            activeCall.callControlId
+          )}/actions/ai_assistant_add_messages`,
+          {
+            method: "POST",
+            body: {
+              messages: [
+                {
+                  role: "system",
+                  content: `SALES HEAD PLAYBOOK. Use silently from the next turn; do not recite it: ${playbook}`,
+                },
+              ],
+            },
+          }
+        ).catch(() => {});
+      }
+      return playbook;
+    } catch (error) {
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentAssignments.find(
+          (item) => item.id === queueItem.id
+        );
+        if (target) {
+          target.salesHeadWarmupStatus = "skipped";
+          target.salesHeadWarmupError = clean(
+            error?.message || String(error)
+          ).slice(0, 500);
+        }
+      });
+      return null;
+    }
+  }
+
   async function startOneCall({
     user,
     ctx,
@@ -2112,6 +2259,17 @@ export function createTelnyxAIAgentService({
         nextAttemptAt: policy.nextAttemptAt || "",
       };
     }
+
+    // Warm a tiny lead-specific sales playbook with the latest Claude Sonnet
+    // while Telnyx is dialing. This never blocks the call or the live voice
+    // turn. The fast Haiku voice model gets the playbook when it is ready.
+    void warmSalesHeadPlaybook({
+      workspaceId: ctx.workspaceId,
+      agent,
+      lead: found.lead,
+      campaign: found.campaign,
+      queueItem: latestQueue,
+    });
 
     const applicationId = requireCallControlApplicationId();
     const fromNumber = normalizePhone(
@@ -2281,24 +2439,7 @@ export function createTelnyxAIAgentService({
     const queueItem = (state.telnyxAiAgentAssignments || []).find(
       (item) => item.id === call.queueId
     );
-    const briefing = buildLeadBriefing({
-      agent,
-      call,
-      lead: found?.lead || {},
-      campaign: found?.campaign || {},
-      queueItem: queueItem || {},
-    });
 
-    /*
-     * IMPORTANT — use the exact minimal Telnyx start payload.
-     *
-     * The linked assistant already stores its model, instructions, greeting,
-     * voice and transcription settings. Telnyx documents that omitted fields
-     * fall back to that stored assistant configuration. Keeping this command
-     * to only the assistant id avoids the provider's "Invalid message format"
-     * failure seen when runtime message/voice/greeting overrides are attached
-     * to this call.
-     */
     const runtimeClientState =
       call.clientState ||
       encodeClientState({
@@ -2309,6 +2450,16 @@ export function createTelnyxAIAgentService({
         leadId: call.leadId,
       });
 
+    // Telnyx explicitly supports a per-call greeting override. Use it to say
+    // the lead's name immediately without asking the LLM to generate the first
+    // sentence. This removes one generation step from the beginning of a call.
+    const runtimeGreeting = buildRuntimeGreeting({
+      agent,
+      lead: found?.lead || {},
+      queueItem: queueItem || {},
+      call,
+    });
+
     const response = await telnyxRequest(
       `/calls/${encodeURIComponent(
         call.callControlId
@@ -2318,8 +2469,17 @@ export function createTelnyxAIAgentService({
         body: {
           assistant: {
             id: agent.telnyxAssistantId,
+            ...(runtimeGreeting
+              ? { greeting: runtimeGreeting }
+              : {}),
           },
-          send_message_history_updates: true,
+          // The independent call.transcription stream already powers the live
+          // monitor. Avoid extra message-history webhook fanout on the hottest
+          // startup path unless an operator explicitly opts back in.
+          send_message_history_updates: envFlag(
+            "TELNYX_AI_AGENT_MESSAGE_HISTORY_UPDATES",
+            false
+          ),
           client_state: runtimeClientState,
           command_id: crypto.randomUUID(),
         },
@@ -2337,6 +2497,7 @@ export function createTelnyxAIAgentService({
       if (target) {
         target.status = "assistant_active";
         target.assistantStartedAt = now;
+        target.runtimeGreeting = runtimeGreeting || "";
         target.conversationId = clean(
           result.conversation_id || result.conversationId
         );
@@ -2358,12 +2519,17 @@ export function createTelnyxAIAgentService({
       }
     });
 
-    // Inject private per-lead context only after the assistant has started.
-    // If this optional context update fails, keep the live AI call running.
+    // Build and inject private CRM context only after Telnyx has begun the
+    // greeting. Nothing below is allowed to delay the first spoken audio.
+    const briefing = buildLeadBriefing({
+      agent,
+      call,
+      lead: found?.lead || {},
+      campaign: found?.campaign || {},
+      queueItem: queueItem || {},
+    });
+
     if (briefing) {
-      // Do not hold the answered-call webhook open while ReachFly injects CRM
-      // context. The greeting can begin immediately; the private briefing is
-      // delivered in parallel before the lead normally finishes responding.
       void telnyxRequest(
         `/calls/${encodeURIComponent(
           call.callControlId
@@ -3288,6 +3454,67 @@ export function createTelnyxAIAgentService({
   }
 }
 
+async function buildSalesHeadPlaybookWithClaude({
+  apiKey,
+  agent,
+  lead,
+  campaign,
+  queueItem,
+}) {
+  const details = safeObject(queueItem?.customLeadDetails);
+  const profile = safeObject(agent?.websiteIntelligence);
+  const leadName = clean(
+    details.contactName || lead?.contactName || getLeadName(lead) || queueItem?.leadName
+  );
+  const leadCompany = clean(
+    details.companyName || lead?.companyName || lead?.business
+  );
+  const managerNote = compactPromptText(queueItem?.customContext, 900);
+
+  const system = [
+    "You are the senior sales head coaching a live outbound caller.",
+    "Create a tiny, natural call strategy before the person answers.",
+    "No corporate wording, no AI filler, no paragraphs, no generic motivation.",
+    "Use only the facts supplied. Never invent company or lead facts.",
+    "The live caller must sound relaxed, concise, curious and sharp.",
+    "Return exactly four short lines labelled ANGLE, QUESTION, OBJECTION, MEETING. Keep the whole answer under 110 words.",
+  ].join(" ");
+
+  const userPrompt = [
+    leadName ? `Lead: ${leadName}` : "",
+    leadCompany ? `Lead company: ${leadCompany}` : "",
+    campaign?.name ? `Campaign: ${clean(campaign.name)}` : "",
+    managerNote ? `Manager note: ${managerNote}` : "",
+    profile.oneLinePitch
+      ? `Our positioning: ${compactPromptText(profile.oneLinePitch, 260)}`
+      : "",
+    Array.isArray(profile.services) && profile.services.length
+      ? `Relevant services: ${profile.services.slice(0, 4).map((v) => compactPromptText(v, 80)).join(" | ")}`
+      : "",
+    "Write the most natural opening angle, one first discovery question, one likely objection response, and one low-pressure meeting transition. Do not script the whole call.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const response = await callAnthropicMessage({
+    apiKey,
+    model: SALES_HEAD_CLAUDE_MODEL,
+    system,
+    messages: [{ role: "user", content: userPrompt }],
+    maxTokens: 260,
+    timeoutMsOverride: 4_500,
+    disableThinking: true,
+  });
+
+  return (response.content || [])
+    .filter((block) => block?.type === "text")
+    .map((block) => clean(block.text))
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .slice(0, 1_000);
+}
+
 async function buildWebsiteIntelligenceWithClaude({
   companyName,
   websiteUrl,
@@ -3344,14 +3571,18 @@ async function callAnthropicMessage({
   system,
   messages,
   maxTokens = 4000,
+  timeoutMsOverride = null,
+  disableThinking = false,
 }) {
   const controller = new AbortController();
-  const timeoutMs = clampInteger(
-    process.env.ANTHROPIC_VOICE_AGENT_TIMEOUT_MS,
-    90_000,
-    5_000,
-    180_000
-  );
+  const timeoutMs = timeoutMsOverride == null
+    ? clampInteger(
+        process.env.ANTHROPIC_VOICE_AGENT_TIMEOUT_MS,
+        90_000,
+        5_000,
+        180_000
+      )
+    : clampInteger(timeoutMsOverride, 4_500, 1_000, 30_000);
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(ANTHROPIC_API_URL, {
@@ -3366,6 +3597,9 @@ async function callAnthropicMessage({
         system,
         messages,
         max_tokens: maxTokens,
+        ...(disableThinking
+          ? { thinking: { type: "disabled" } }
+          : {}),
       }),
       signal: controller.signal,
     });
@@ -3379,9 +3613,9 @@ async function callAnthropicMessage({
     return payload || {};
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw httpError(504, `Claude website analysis timed out after ${timeoutMs}ms.`);
+      throw httpError(504, `Claude request timed out after ${timeoutMs}ms.`);
     }
-    throw httpError(502, error?.message || "Claude website analysis failed.");
+    throw httpError(502, error?.message || "Claude request failed.");
   } finally {
     clearTimeout(timer);
   }
@@ -3821,7 +4055,7 @@ function buildAssistantPayload({
   const latencyProfile = clean(
     process.env.TELNYX_AI_AGENT_LATENCY_PROFILE || "fast"
   ).toLowerCase();
-  const fastLatency = latencyProfile === "fast";
+  const fastLatency = ["fast", "instant", "ultra", "turbo"].includes(latencyProfile);
   const balancedLatency = latencyProfile === "balanced";
 
   const eagerEotThreshold = fastLatency
@@ -3864,7 +4098,7 @@ function buildAssistantPayload({
       webhook: {
         name: "book_meeting",
         description:
-          "Create a ReachFly meeting only after the lead explicitly confirms a proposed date, time and timezone. Never call this tool without explicit confirmation.",
+          "Create a ReachFly meeting only after exact date/time/timezone confirmation. Before calling, use a brief natural bridge such as 'Hmm—yep, that works. Give me a sec...' After success, confirm naturally: 'And... it's booked.' Never claim success before the tool returns.",
         url: `${webhookBaseUrl}/api/telnyx/ai-agent/tools/book-meeting`,
         method: "POST",
         headers: [
@@ -4013,8 +4247,6 @@ function buildAssistantPayload({
         eager_eot_threshold: eagerEotThreshold,
         eot_threshold: eotThreshold,
         eot_timeout_ms: eotTimeoutMs,
-        smart_format: true,
-        numerals: true,
       },
     },
     interruption_settings: {
@@ -4103,36 +4335,36 @@ function buildAssistantInstructions(config) {
   );
 
   return [
-    `You are ${config.name}, the outbound AI assistant for ${config.companyName}.`,
+    `You are ${config.name}, the outbound AI sales assistant for ${config.companyName}.`,
     config.disclosure,
-    `Style: ${compactPromptText(config.persona, 520)}`,
+    `Style: ${compactPromptText(config.persona, 360)}`,
     buildWebsiteKnowledgeBlock(config.websiteIntelligence),
     !hasWebsiteKnowledge && config.offer
-      ? `Offer: ${compactPromptText(config.offer, 300)}`
+      ? `Offer: ${compactPromptText(config.offer, 220)}`
       : "",
     !hasWebsiteKnowledge && config.idealCustomer
-      ? `Best fit: ${compactPromptText(config.idealCustomer, 420)}`
+      ? `Best fit: ${compactPromptText(config.idealCustomer, 260)}`
       : "",
-    `Meeting goal: ${compactPromptText(config.meetingGoal, 260)}`,
-    config.bookingInstructions
-      ? `Booking rules: ${compactPromptText(config.bookingInstructions, 420)}`
-      : "",
+    `Meeting goal: ${compactPromptText(config.meetingGoal, 180)}`,
     `Booking timezone: ${config.bookingTimezone}; duration: ${config.meetingDurationMinutes} minutes.`,
-    "LIVE CALL RULES — TURBO NATURAL MODE:",
-    "- Speed matters. Start answering as soon as the caller's intent is clear. Do not wait to compose a perfect paragraph.",
-    "- Most replies are ONE short sentence plus ONE short question. Usually 6–18 spoken words total.",
-    "- If the caller gives a tiny answer like yes, no, maybe, sure, or kind of, move straight to the next useful question. Do not summarize their answer.",
-    "- Sound spontaneous, not polished. Use contractions, sentence fragments, and small reactions when they fit: 'ah, gotcha', 'yeah, fair', 'oh, nice', 'hmm, okay', 'right', 'makes sense'. Rotate them; do not use one every turn.",
-    "- A tiny hesitation or self-correction is okay occasionally: 'well—', 'actually', 'hmm'. Maximum one per turn and not on every turn.",
-    "- Never use canned call-center filler such as 'Absolutely', 'Certainly', 'Great question', 'Thank you for sharing', or 'I completely understand' unless the words genuinely fit.",
-    "- Match the caller's energy. Warm when they are warm, calm when they are skeptical, lighter when they joke. A brief natural chuckle is okay only when the caller creates a genuinely playful moment. Never announce 'laughing' or read an emotion tag aloud.",
-    "- Telnyx Expressive Mode controls prosody. Give it natural punctuation and short conversational wording; do not output XML/SSML markup yourself.",
-    "- Do not repeat the caller's sentence back to them. Do not give mini-summaries between every turn.",
-    "- Ask one question at a time. Prefer the next best question over a long explanation.",
-    "- If a useful answer needs detail, speak the first short sentence immediately, then add at most one more sentence.",
-    "- Never pretend to be human. Keep the required AI disclosure natural and brief.",
+    "LIVE VOICE RULES — INSTANT, HUMAN, SALES-HEAD MODE:",
+    "- Be fast. Once intent is clear, answer immediately. Do not wait to craft a polished response.",
+    "- Default turn length is 4–14 spoken words. One thought, then one question. Only go longer when the caller explicitly asks for detail.",
+    "- Speak like a sharp person on a real phone call, not a chatbot: contractions, fragments, varied rhythm, plain words, occasional tiny pauses.",
+    "- Do NOT sound professionally polished. Avoid brochure language and AI filler. Never say: 'Absolutely', 'Certainly', 'Great question', 'Thank you for sharing', 'I completely understand', 'Based on what you told me', 'I'd be happy to', or 'Let me explain'.",
+    "- Often skip acknowledgements entirely and go straight to the useful response or next question.",
+    "- When a reaction helps, keep it tiny and natural: 'yeah', 'right', 'gotcha', 'hmm', 'mm-hm', 'fair', 'oh, okay', 'nice'. Use at most one in a turn and never mechanically every turn.",
+    "- Mirror the caller's vocabulary. If they say 'website', say 'website', not 'digital presence'. If they say 'too expensive', say 'price', not 'budget constraints'.",
+    "- Never repeat or summarize what the caller just said unless you genuinely need to confirm a detail.",
+    "- Ask one question at a time. Do not stack questions.",
+    "- Use the private SALES HEAD PLAYBOOK when present as silent strategy, not as a script. Adapt it to what the caller actually says.",
+    "- For a playful moment, one short [laughter] cue is allowed in the entire call, only when the caller genuinely jokes or laughs. Never force laughter during objections, complaints, rejection, money concerns, or confusion.",
+    "- Booking should sound human. After the lead explicitly confirms the exact slot, a natural bridge is: 'Hmm—yep, that works. Give me a sec...' Then use the booking tool. After a successful tool result say something like: 'And... it's booked. You're set for Tuesday at two.' Vary the wording naturally.",
+    "- Never claim a meeting is booked until the booking tool succeeds. If it fails, say so plainly rather than pretending.",
+    "- Use the lead's first name naturally in the opening. After that, use their name sparingly—usually no more than once again in the call.",
+    "- Never pretend to be human. Keep the AI disclosure brief and natural.",
     "- Respect stop or do-not-call requests immediately and end politely.",
-    "- Only book a meeting after exact date/time/timezone confirmation. Use tools only when needed; never narrate tool use.",
+    "- Only book after exact date/time/timezone confirmation. Use tools only when needed; never narrate internal reasoning or tool mechanics.",
     "- Do not collect payment-card, government-ID, health, password, authentication-code, or similarly sensitive information.",
   ]
     .filter(Boolean)
@@ -4163,7 +4395,7 @@ function buildWebsiteKnowledgeBlock(profileValue) {
     ...sections,
   ]
     .join("\n")
-    .slice(0, 2_200);
+    .slice(0, 1_250);
 }
 
 function websiteProfilePitch(profileValue) {
@@ -4285,6 +4517,37 @@ function resolveGreeting(agent, lead) {
     .slice(0, 3000);
 }
 
+function firstSpokenName(value) {
+  const text = clean(value)
+    .replace(/[^\p{L}\p{M}\p{N}' -]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const first = text.split(" ")[0] || "";
+  return first.length >= 2 ? first.slice(0, 48) : text.slice(0, 48);
+}
+
+function buildRuntimeGreeting({ agent, lead, queueItem, call }) {
+  const details = safeObject(
+    queueItem?.customLeadDetails || call?.customLeadDetails
+  );
+  const fullName = clean(
+    details.contactName ||
+      lead?.contactName ||
+      getLeadName(lead) ||
+      call?.leadName
+  );
+  const firstName = firstSpokenName(fullName);
+  const company = clean(agent?.companyName || "our team");
+  const agentName = clean(agent?.name || "Lisa");
+  const speakerName = firstSpokenName(agentName) || "Lisa";
+
+  if (firstName) {
+    return `Hi ${firstName} — ${speakerName} here, the AI assistant from ${company}. Did I catch you for one quick question?`;
+  }
+  return `Hi — ${speakerName} here, the AI assistant from ${company}. Did I catch you for one quick question?`;
+}
+
 function buildLeadBriefing({
   agent,
   call,
@@ -4297,7 +4560,11 @@ function buildLeadBriefing({
   );
   const customContext = compactPromptText(
     queueItem.customContext || call.customContext,
-    850
+    520
+  );
+  const salesHeadPlaybook = compactPromptText(
+    queueItem.salesHeadPlaybook || call.salesHeadPlaybook,
+    900
   );
   const contactName = clean(
     customLeadDetails.contactName ||
@@ -4319,6 +4586,9 @@ function buildLeadBriefing({
     customContext
       ? `Manager note: ${customContext}`
       : "",
+    salesHeadPlaybook
+      ? `SALES HEAD PLAYBOOK: ${salesHeadPlaybook}`
+      : "",
     agent.websiteIntelligence?.oneLinePitch
       ? `Our positioning: ${compactPromptText(agent.websiteIntelligence.oneLinePitch, 260)}`
       : "",
@@ -4327,7 +4597,7 @@ function buildLeadBriefing({
   ]
     .filter(Boolean)
     .join("\n")
-    .slice(0, 1_500);
+    .slice(0, 1_650);
 }
 
 function normalizeGoogleLeadForVoiceAgent(rawValue, {
