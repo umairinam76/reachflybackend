@@ -1,11 +1,11 @@
 import crypto from "node:crypto";
 import dns from "node:dns/promises";
 import net from "node:net";
+import WebSocket from "ws";
 
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
-const DEFAULT_VOICE =
-  process.env.TELNYX_AI_AGENT_DEFAULT_VOICE ||
-  "Telnyx.NaturalHD.astra";
+const ELEVENLABS_API_BASE = "https://api.elevenlabs.io";
+const DEFAULT_VOICE = process.env.ELEVENLABS_VOICE_ID || "";
 const LIVE_CLAUDE_MODEL =
   process.env.TELNYX_AI_AGENT_LIVE_MODEL ||
   "anthropic/claude-haiku-4-5";
@@ -60,13 +60,13 @@ const ACTIVE_CALL_STATUSES = new Set([
  * Workspace-scoped Telnyx AI voice-agent integration.
  *
  * Design goals:
- * - reuse the current Telnyx API key, public key and Call Control application;
+ * - keep Telnyx as the PSTN/SIP telephony carrier and preserve existing numbers;
  * - never expose the feature to AH Growth, in either the UI or API;
  * - keep every assistant, queue item, call, meeting and suppression decision
  *   scoped to one ReachFly workspace;
- * - attach a Telnyx AI Assistant after the outbound PSTN call is answered;
- * - allow the assistant to update lead outcomes and create a confirmed meeting
- *   through secret-protected webhook tools;
+ * - use ElevenLabs ElevenAgents as the realtime conversation/voice layer over Telnyx SIP;
+ * - inject lead context before dialing, keep media off the CRM backend, and expose
+ *   only the small set of secret-protected realtime tools that can truly need live data;
  * - prevent blind auto-dialing through DNC, quiet-hours, daily-limit and
  *   concurrency checks.
  */
@@ -184,7 +184,9 @@ export function createTelnyxAIAgentService({
         }
 
         const answered = Boolean(
-          call.answeredAt || call.assistantStartedAt
+          call.answeredAt ||
+            call.assistantStartedAt ||
+            normalizeStatus(call.provider) === "elevenlabs_telnyx_sip"
         );
         const startedAt = Date.parse(
           call.answeredAt ||
@@ -374,15 +376,39 @@ export function createTelnyxAIAgentService({
     const state = store.read();
     requireAccess(user, state);
 
-    const result = await loadTelnyxVoices({ force });
-    const recommended = chooseRecommendedTelnyxVoice(result.voices);
+    const agentId = requireElevenLabsAgentId(false);
+    if (!agentId || !clean(process.env.ELEVENLABS_API_KEY)) {
+      return {
+        ok: true,
+        voices: [],
+        recommendedVoiceId: "",
+        recommendedVoice: null,
+        cached: false,
+      };
+    }
+
+    const providerAgent = await elevenLabsRequest(
+      `/v1/convai/agents/${encodeURIComponent(agentId)}`
+    );
+    const tts = safeObject(providerAgent?.conversation_config?.tts);
+    const voiceId = clean(tts.voice_id || process.env.ELEVENLABS_VOICE_ID);
+    const voice = voiceId
+      ? {
+          id: voiceId,
+          name: "ElevenLabs agent voice",
+          label: `ElevenLabs · ${voiceId}`,
+          provider: "elevenlabs",
+          model: clean(tts.model_id) || "eleven_flash_v2_5",
+          language: clean(providerAgent?.conversation_config?.agent?.language) || "en",
+        }
+      : null;
 
     return {
       ok: true,
-      voices: result.voices,
-      recommendedVoiceId: recommended?.id || "",
-      recommendedVoice: recommended || null,
-      cached: result.cached,
+      voices: voice ? [voice] : [],
+      recommendedVoiceId: voice?.id || "",
+      recommendedVoice: voice,
+      cached: false,
     };
   }
 
@@ -534,17 +560,14 @@ export function createTelnyxAIAgentService({
       pagesAnalyzed: crawl.pages.length,
       intelligence: saved.websiteIntelligence,
       agent: publicAgent(saved),
-      liveConversationModel: LIVE_CLAUDE_MODEL,
+      liveConversationModel: "elevenlabs-managed-llm",
     };
   }
 
   async function saveAgent(user, input = {}) {
     const state = store.read();
     const ctx = requireAccess(user, state);
-    const existing = findWorkspaceAgent(
-      state,
-      ctx.workspaceId
-    );
+    const existing = findWorkspaceAgent(state, ctx.workspaceId);
     const config = normalizeAgentInput({
       input,
       existing,
@@ -561,7 +584,6 @@ export function createTelnyxAIAgentService({
         "Analyze the website with Claude before saving the voice agent."
       );
     }
-
     if (!config.complianceConfirmed) {
       throw httpError(
         422,
@@ -569,62 +591,116 @@ export function createTelnyxAIAgentService({
       );
     }
 
-    const voiceResolution = await resolveAssistantVoice(config.voice);
-    config.voice = voiceResolution.voice.id;
-    config.greeting = resolveAssistantGreetingTemplate(
-      config.greeting,
-      config
+    const elevenLabsAgentId = clean(
+      input.elevenLabsAgentId ||
+        existing?.elevenLabsAgentId ||
+        requireElevenLabsAgentId()
     );
-
-    const toolSecret = requireToolSecret();
-    const webhookBaseUrl = resolveWebhookBaseUrl();
-    const assistantPayload = buildAssistantPayload({
-      config,
-      webhookBaseUrl,
-      toolSecret,
-      workspaceId: ctx.workspaceId,
+    const selectedFromNumber = normalizePhone(
+      config.fromNumber || configuredFromNumbers()[0]
+    );
+    const elevenLabsPhoneNumberId = resolveElevenLabsPhoneNumberId({
+      fromNumber: selectedFromNumber,
+      input,
+      existing,
+      required: true,
     });
 
-    const providerResponse = existing?.telnyxAssistantId
-      ? await telnyxRequest(
-          `/ai/assistants/${encodeURIComponent(
-            existing.telnyxAssistantId
-          )}`,
-          {
-            method: "POST",
-            body: assistantPayload,
-          }
-        )
-      : await telnyxRequest("/ai/assistants", {
-          method: "POST",
-          body: assistantPayload,
-        });
-
-    const providerAgent =
-      providerResponse?.data || providerResponse || {};
-    const telnyxAssistantId = clean(
-      providerAgent.id ||
-        providerAgent.assistant_id ||
-        existing?.telnyxAssistantId
+    // Fetch first so we can deep-preserve every existing tool, built-in tool,
+    // language, voice and unrelated ElevenLabs setting. Only the latency and
+    // conversational fields below are changed.
+    const currentProviderAgent = await elevenLabsRequest(
+      `/v1/convai/agents/${encodeURIComponent(elevenLabsAgentId)}`
+    );
+    const currentConversation = safeObject(
+      currentProviderAgent?.conversation_config
+    );
+    const currentTts = safeObject(currentConversation.tts);
+    const currentPrompt = safeObject(
+      safeObject(currentConversation.agent).prompt
     );
 
-    if (!telnyxAssistantId) {
-      throw httpError(
-        502,
-        "Telnyx did not return an AI Assistant ID."
-      );
-    }
+    const providerResponse = await elevenLabsRequest(
+      `/v1/convai/agents/${encodeURIComponent(elevenLabsAgentId)}`,
+      {
+        method: "PATCH",
+        body: {
+          name: config.name,
+          conversation_config: {
+            // Send only writable fields we intentionally manage. PATCH is
+            // nested/partial; avoiding a blind spread of the GET response also
+            // avoids echoing provider-only/read-only fields back to ElevenLabs.
+            turn: {
+              turn_eagerness: "eager",
+              turn_model: "turn_v3",
+            },
+            tts: {
+              ...(clean(currentTts.voice_id)
+                ? { voice_id: clean(currentTts.voice_id) }
+                : {}),
+              model_id:
+                clean(process.env.ELEVENLABS_TTS_MODEL_ID) ||
+                "eleven_flash_v2_5",
+              optimize_streaming_latency: 3,
+              speed: 1,
+            },
+            conversation: {
+              max_duration_seconds: clampInteger(
+                config.maxCallSeconds,
+                600,
+                60,
+                3600
+              ),
+            },
+            agent: {
+              first_message: resolveAssistantGreetingTemplate(
+                config.greeting,
+                config
+              ),
+              disable_first_message_interruptions: false,
+              prompt: {
+                // Preserve the user's existing ElevenAgent LLM/tool wiring while
+                // replacing only the sales instructions. These are writable
+                // prompt fields; unknown provider response fields are not echoed.
+                ...(clean(currentPrompt.llm)
+                  ? { llm: clean(currentPrompt.llm) }
+                  : {}),
+                ...(Number.isFinite(Number(currentPrompt.temperature))
+                  ? { temperature: Number(currentPrompt.temperature) }
+                  : {}),
+                ...(Number.isFinite(Number(currentPrompt.max_tokens))
+                  ? { max_tokens: Number(currentPrompt.max_tokens) }
+                  : {}),
+                ...(Array.isArray(currentPrompt.tool_ids)
+                  ? { tool_ids: currentPrompt.tool_ids }
+                  : {}),
+                ...(currentPrompt.built_in_tools &&
+                typeof currentPrompt.built_in_tools === "object"
+                  ? { built_in_tools: currentPrompt.built_in_tools }
+                  : {}),
+                ...(Array.isArray(currentPrompt.knowledge_base)
+                  ? { knowledge_base: currentPrompt.knowledge_base }
+                  : {}),
+                prompt: buildElevenLabsSalesPrompt(config),
+              },
+            },
+          },
+        },
+      }
+    );
+
+    const syncedTts = safeObject(
+      providerResponse?.conversation_config?.tts || currentTts
+    );
+    config.voice = clean(syncedTts.voice_id || config.voice);
+    config.model = "elevenlabs-managed-llm";
+    config.greeting = resolveAssistantGreetingTemplate(config.greeting, config);
 
     const now = new Date().toISOString();
     let saved = null;
-
     store.update((draft) => {
       ensureStateShape(draft);
-      let agent = findWorkspaceAgent(
-        draft,
-        ctx.workspaceId
-      );
-
+      let agent = findWorkspaceAgent(draft, ctx.workspaceId);
       if (!agent) {
         agent = {
           id: crypto.randomUUID(),
@@ -637,28 +713,26 @@ export function createTelnyxAIAgentService({
 
       Object.assign(agent, {
         ...config,
-        telnyxAssistantId,
-        telnyxVersionId:
-          providerAgent.version_id ||
-          providerAgent.versionId ||
-          agent.telnyxVersionId ||
-          "",
-        provider: "telnyx",
+        provider: "elevenlabs-telnyx-sip",
+        elevenLabsAgentId,
+        elevenLabsPhoneNumberId,
+        telnyxAssistantId: "",
+        telnyxVersionId: "",
+        elevenLabsTtsModel:
+          clean(syncedTts.model_id) || "eleven_flash_v2_5",
+        elevenLabsTurnEagerness: "eager",
+        elevenLabsStreamingLatency: 3,
         enabled: input.enabled !== false,
         updatedAt: now,
         updatedBy: user.id,
       });
 
-      setWorkspaceFeature(
-        draft,
-        ctx.workspaceId,
-        true
-      );
+      setWorkspaceFeature(draft, ctx.workspaceId, true);
       addActivity(draft, {
         workspaceId: ctx.workspaceId,
         type: "agent_saved",
         title: "Voice agent configuration saved",
-        detail: `${agent.name} is linked to Telnyx assistant ${telnyxAssistantId}.`,
+        detail: `${agent.name} is linked to ElevenAgent ${elevenLabsAgentId} over Telnyx SIP.`,
         actorId: user.id,
         createdAt: now,
       });
@@ -673,17 +747,17 @@ export function createTelnyxAIAgentService({
       ok: true,
       agent: publicAgent(saved),
       provider: {
-        id: telnyxAssistantId,
-        versionId: saved.telnyxVersionId || "",
+        id: elevenLabsAgentId,
+        phoneNumberId: elevenLabsPhoneNumberId,
+        type: "elevenlabs-telnyx-sip",
       },
       voiceResolution: {
-        requested: voiceResolution.requested || "",
-        selected: voiceResolution.voice.id,
-        selectedLabel:
-          voiceResolution.voice.label ||
-          voiceResolution.voice.name ||
-          voiceResolution.voice.id,
-        changed: voiceResolution.changed === true,
+        requested: clean(input.voice),
+        selected: config.voice,
+        selectedLabel: config.voice
+          ? `ElevenLabs · ${config.voice}`
+          : "Managed by ElevenLabs",
+        changed: false,
       },
     };
   }
@@ -1160,7 +1234,9 @@ export function createTelnyxAIAgentService({
         queueItem = reusableQueue;
         Object.assign(queueItem, {
           agentId: agent.id,
-          telnyxAssistantId: agent.telnyxAssistantId,
+          telnyxAssistantId: "",
+          elevenLabsAgentId: agent.elevenLabsAgentId,
+          elevenLabsPhoneNumberId: agent.elevenLabsPhoneNumberId,
           assignmentId,
           campaignId: campaign.id,
           campaignName: campaign.name || "AI Voice · Custom leads",
@@ -1185,7 +1261,9 @@ export function createTelnyxAIAgentService({
           id: crypto.randomUUID(),
           workspaceId: ctx.workspaceId,
           agentId: agent.id,
-          telnyxAssistantId: agent.telnyxAssistantId,
+          telnyxAssistantId: "",
+          elevenLabsAgentId: agent.elevenLabsAgentId,
+          elevenLabsPhoneNumberId: agent.elevenLabsPhoneNumberId,
           assignmentId,
           campaignId: campaign.id,
           campaignName: campaign.name || "AI Voice · Custom leads",
@@ -1381,7 +1459,9 @@ export function createTelnyxAIAgentService({
           id: crypto.randomUUID(),
           workspaceId: ctx.workspaceId,
           agentId: agent.id,
-          telnyxAssistantId: agent.telnyxAssistantId,
+          telnyxAssistantId: "",
+          elevenLabsAgentId: agent.elevenLabsAgentId,
+          elevenLabsPhoneNumberId: agent.elevenLabsPhoneNumberId,
           assignmentId,
           campaignId: campaign.id,
           campaignName:
@@ -1629,42 +1709,38 @@ export function createTelnyxAIAgentService({
     }
 
     let providerWarning = "";
-    if (
-      call.callControlId &&
-      ACTIVE_CALL_STATUSES.has(normalizeStatus(call.status))
-    ) {
-      try {
-        await telnyxRequest(
-          `/calls/${encodeURIComponent(
-            call.callControlId
-          )}/actions/hangup`,
-          {
-            method: "POST",
-            body: {
-              command_id: crypto.randomUUID(),
-            },
-          }
-        );
-      } catch (error) {
-        const status = Number(
-          error?.status || error?.statusCode || 0
-        );
-        const message = clean(
-          error?.message || ""
-        );
-        const providerAlreadyEnded =
-          [400, 404, 409, 422].includes(status) &&
-          /(already|ended|not active|not found|no longer|invalid call control)/i.test(
-            message
-          );
-
-        // If Telnyx says the call is already gone, clear ReachFly's stale
-        // local state instead of trapping the manager behind an active-call
-        // error. Real provider/network failures are still surfaced.
-        if (!providerAlreadyEnded) {
-          throw error;
+    const active = ACTIVE_CALL_STATUSES.has(normalizeStatus(call.status));
+    if (active) {
+      if (
+        normalizeStatus(call.provider) === "elevenlabs_telnyx_sip" &&
+        call.conversationId
+      ) {
+        try {
+          await endElevenLabsConversation(call.conversationId);
+        } catch (error) {
+          const message = clean(error?.message || String(error));
+          const alreadyEnded = /(already|ended|done|not active|not found|closed)/i.test(message);
+          if (!alreadyEnded) throw error;
+          providerWarning = message;
         }
-        providerWarning = message;
+      } else if (call.callControlId) {
+        try {
+          await telnyxRequest(
+            `/calls/${encodeURIComponent(call.callControlId)}/actions/hangup`,
+            {
+              method: "POST",
+              body: { command_id: crypto.randomUUID() },
+            }
+          );
+        } catch (error) {
+          const status = Number(error?.status || error?.statusCode || 0);
+          const message = clean(error?.message || "");
+          const providerAlreadyEnded =
+            [400, 404, 409, 422].includes(status) &&
+            /(already|ended|not active|not found|no longer|invalid call control)/i.test(message);
+          if (!providerAlreadyEnded) throw error;
+          providerWarning = message;
+        }
       }
     }
 
@@ -1672,9 +1748,7 @@ export function createTelnyxAIAgentService({
     let updated = null;
     store.update((draft) => {
       ensureStateShape(draft);
-      const target = draft.telnyxAiAgentCalls.find(
-        (item) => item.id === call.id
-      );
+      const target = draft.telnyxAiAgentCalls.find((item) => item.id === call.id);
       if (target) {
         target.status = "cancelled";
         target.endedAt = target.endedAt || now;
@@ -1690,11 +1764,9 @@ export function createTelnyxAIAgentService({
       }
     });
 
-    emitEvent(
-      ctx.workspaceId,
-      "telnyx-ai-agent:call-updated",
-      { call: publicCall(updated || call) }
-    );
+    emitEvent(ctx.workspaceId, "telnyx-ai-agent:call-updated", {
+      call: publicCall(updated || call),
+    });
 
     return {
       ok: true,
@@ -1918,7 +1990,7 @@ export function createTelnyxAIAgentService({
         DEFAULT_LEAD_TIMEZONE,
       notes: clean(body.notes).slice(0, 2000),
       status: "confirmed",
-      source: "telnyx-ai-agent",
+      source: "elevenlabs-telnyx-sip",
       createdAt: now,
       updatedAt: now,
     };
@@ -2028,7 +2100,7 @@ export function createTelnyxAIAgentService({
           phone: call.toNumber,
           leadId: call.leadId,
           reason: notes || "Lead requested no further calls.",
-          source: "telnyx-ai-agent",
+          source: "elevenlabs-telnyx-sip",
           createdAt: now,
         });
       }
@@ -2057,6 +2129,146 @@ export function createTelnyxAIAgentService({
         ? "The lead has been suppressed from future AI-agent calls."
         : "The ReachFly lead outcome has been updated.",
     };
+  }
+
+  function checkCalendar({ headers = {}, body = {} } = {}) {
+    verifyToolRequest(headers);
+    const call = resolveToolCall(headers, body);
+    const slots = Array.isArray(call.availableMeetingSlots)
+      ? call.availableMeetingSlots
+      : [];
+    return {
+      ok: true,
+      timezone: call.leadTimezone || DEFAULT_LEAD_TIMEZONE,
+      availableSlots: slots.slice(0, 20),
+      source: "preloaded_call_context",
+      message: slots.length
+        ? "Use these preloaded slots. Ask the lead to choose one, then explicitly confirm it before booking."
+        : "No preloaded slots are available. Do not invent availability; ask for a preferred time and follow the configured booking workflow.",
+    };
+  }
+
+  function getCriticalLiveData({ headers = {}, body = {} } = {}) {
+    verifyToolRequest(headers);
+    const call = resolveToolCall(headers, body);
+    const requested = uniqueStrings(
+      Array.isArray(body.keys)
+        ? body.keys
+        : String(body.key || body.keys || "")
+            .split(",")
+            .map((value) => value.trim())
+    );
+    const allowed = {
+      call_status: call.status || "",
+      lead_timezone: call.leadTimezone || "",
+      meeting_id: call.meetingId || "",
+      outcome: call.outcome || "",
+      callback_at: call.callbackAt || "",
+      phone: call.toNumber || "",
+    };
+    const keys = requested.length ? requested : Object.keys(allowed);
+    const data = Object.fromEntries(
+      keys.filter((key) => key in allowed).map((key) => [key, allowed[key]])
+    );
+    return {
+      ok: true,
+      data,
+      message: "Critical live ReachFly state returned. Do not call this tool for information already present in dynamic variables.",
+    };
+  }
+
+  async function handleElevenLabsWebhook({
+    rawBody,
+    headers = {},
+    body = {},
+  } = {}) {
+    verifyElevenLabsWebhook(rawBody, headers);
+    const type = clean(body.type);
+    const data = safeObject(body.data);
+    const conversationId = clean(data.conversation_id || data.conversationId);
+    const dynamicVariables = safeObject(
+      data.conversation_initiation_client_data?.dynamic_variables
+    );
+    const reachflyCallId = clean(
+      dynamicVariables.reachfly_call_id || dynamicVariables.call_id
+    );
+    const state = store.read();
+    const call = (state.telnyxAiAgentCalls || []).find(
+      (item) =>
+        (conversationId && item.conversationId === conversationId) ||
+        (reachflyCallId && item.id === reachflyCallId)
+    );
+
+    if (!call) {
+      return { ok: true, unmatched: true, type, conversationId };
+    }
+
+    const dedupeKey = `${type}:${conversationId || call.id}:${body.event_timestamp || ""}`;
+    if (
+      (state.elevenLabsAiAgentWebhookEvents || []).some(
+        (event) => event.id === dedupeKey
+      )
+    ) {
+      return { ok: true, duplicate: true, type, callId: call.id };
+    }
+
+    const now = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.elevenLabsAiAgentWebhookEvents = Array.isArray(
+        draft.elevenLabsAiAgentWebhookEvents
+      )
+        ? draft.elevenLabsAiAgentWebhookEvents
+        : [];
+      draft.elevenLabsAiAgentWebhookEvents.unshift({
+        id: dedupeKey,
+        type,
+        conversationId,
+        callId: call.id,
+        workspaceId: call.workspaceId,
+        receivedAt: now,
+      });
+      draft.elevenLabsAiAgentWebhookEvents =
+        draft.elevenLabsAiAgentWebhookEvents.slice(0, 5000);
+    });
+
+    if (type === "call_initiation_failure") {
+      const reason = normalizeStatus(data.failure_reason || "unknown");
+      const outcome = reason.includes("busy")
+        ? "busy"
+        : reason.includes("no-answer") || reason.includes("no_answer")
+          ? "no_answer"
+          : "technical_failure";
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.telnyxAiAgentCalls.find((item) => item.id === call.id);
+        if (target) {
+          target.status = "failed";
+          target.outcome = outcome;
+          target.endedAt = target.endedAt || now;
+          target.elevenLabsFailureReason = reason;
+          target.updatedAt = now;
+        }
+        updateQueueAndLead(draft, call, {
+          queueStatus: outcome === "technical_failure" ? "failed" : "queued",
+          leadStatus: "follow_up",
+          outcome,
+          notes: reason,
+          nextActionAt: "",
+          doNotCall: false,
+          now,
+        });
+      });
+    } else if (type === "post_call_transcription") {
+      persistElevenLabsPostCall(call, data, now);
+    }
+
+    const updated = findCallById(call.id) || call;
+    emitEvent(call.workspaceId, "telnyx-ai-agent:call-updated", {
+      call: publicCall(updated),
+      eventType: `elevenlabs.${type}`,
+    });
+    return { ok: true, type, callId: call.id, conversationId };
   }
 
   async function warmSalesHeadPlaybook({
@@ -2207,14 +2419,10 @@ export function createTelnyxAIAgentService({
     input,
   }) {
     const latestState = store.read();
-    const latestQueue = (
-      latestState.telnyxAiAgentAssignments || []
-    ).find((item) => item.id === queueItem.id);
-
-    if (
-      !latestQueue ||
-      normalizeStatus(latestQueue.status) !== "queued"
-    ) {
+    const latestQueue = (latestState.telnyxAiAgentAssignments || []).find(
+      (item) => item.id === queueItem.id
+    );
+    if (!latestQueue || normalizeStatus(latestQueue.status) !== "queued") {
       return {
         ok: false,
         queueId: queueItem.id,
@@ -2227,13 +2435,7 @@ export function createTelnyxAIAgentService({
       ctx.workspaceId,
       latestQueue.assignmentId || latestQueue.leadId
     );
-
-    if (!found) {
-      return failQueueItem(
-        queueItem.id,
-        "Lead not found."
-      );
-    }
+    if (!found) return failQueueItem(queueItem.id, "Lead not found.");
 
     const policy = checkCallPolicy({
       state: latestState,
@@ -2243,7 +2445,6 @@ export function createTelnyxAIAgentService({
       agent,
       input,
     });
-
     if (!policy.allowed) {
       const deferred = policy.deferred === true;
       updateQueueStatus(queueItem.id, {
@@ -2260,25 +2461,12 @@ export function createTelnyxAIAgentService({
       };
     }
 
-    // Warm a tiny lead-specific sales playbook with the latest Claude Sonnet
-    // while Telnyx is dialing. This never blocks the call or the live voice
-    // turn. The fast Haiku voice model gets the playbook when it is ready.
-    void warmSalesHeadPlaybook({
-      workspaceId: ctx.workspaceId,
-      agent,
-      lead: found.lead,
-      campaign: found.campaign,
-      queueItem: latestQueue,
-    });
-
-    const applicationId = requireCallControlApplicationId();
     const fromNumber = normalizePhone(
       input.fromNumber ||
         agent.fromNumber ||
         process.env.TELNYX_AI_AGENT_FROM_NUMBER ||
         configuredFromNumbers()[0]
     );
-
     if (!fromNumber) {
       return failQueueItem(
         queueItem.id,
@@ -2286,12 +2474,36 @@ export function createTelnyxAIAgentService({
       );
     }
 
+    const phoneNumberId = resolveElevenLabsPhoneNumberId({
+      fromNumber,
+      existing: agent,
+      required: true,
+    });
+    const elevenLabsAgentId = clean(
+      agent.elevenLabsAgentId || requireElevenLabsAgentId()
+    );
+    const contextSnapshot = buildLeadContextSnapshot({
+      state: latestState,
+      agent,
+      lead: found.lead,
+      campaign: found.campaign,
+      queueItem: latestQueue,
+    });
+    const availableMeetingSlots = Array.isArray(
+      contextSnapshot.availableMeetingSlots
+    )
+      ? contextSnapshot.availableMeetingSlots
+      : [];
+
     const now = new Date().toISOString();
     const call = {
       id: crypto.randomUUID(),
+      provider: "elevenlabs-telnyx-sip",
       workspaceId: ctx.workspaceId,
       agentId: agent.id,
-      telnyxAssistantId: agent.telnyxAssistantId,
+      elevenLabsAgentId,
+      elevenLabsPhoneNumberId: phoneNumberId,
+      telnyxAssistantId: "",
       queueId: latestQueue.id,
       assignmentId: latestQueue.assignmentId,
       campaignId: latestQueue.campaignId,
@@ -2300,6 +2512,8 @@ export function createTelnyxAIAgentService({
       leadName: latestQueue.leadName,
       customContext: clean(latestQueue.customContext).slice(0, 12_000),
       customLeadDetails: safeObject(latestQueue.customLeadDetails),
+      contextSnapshot,
+      availableMeetingSlots,
       leadTimezone:
         latestQueue.timezone ||
         agent.defaultLeadTimezone ||
@@ -2318,89 +2532,70 @@ export function createTelnyxAIAgentService({
     store.update((draft) => {
       ensureStateShape(draft);
       draft.telnyxAiAgentCalls.push(call);
-      const targetQueue =
-        draft.telnyxAiAgentAssignments.find(
-          (item) => item.id === latestQueue.id
-        );
+      const targetQueue = draft.telnyxAiAgentAssignments.find(
+        (item) => item.id === latestQueue.id
+      );
       if (targetQueue) {
         targetQueue.status = "dialing";
         targetQueue.callId = call.id;
-        targetQueue.attemptCount =
-          Number(targetQueue.attemptCount || 0) + 1;
+        targetQueue.attemptCount = Number(targetQueue.attemptCount || 0) + 1;
         targetQueue.lastAttemptAt = now;
         targetQueue.updatedAt = now;
       }
     });
 
-    const clientState = encodeClientState({
-      workspaceId: ctx.workspaceId,
-      callId: call.id,
-      queueId: call.queueId,
-      assignmentId: call.assignmentId,
-      leadId: call.leadId,
+    const dynamicVariables = buildElevenLabsDynamicVariables({
+      call,
+      contextSnapshot,
     });
-    const webhookUrl = resolveWebhookUrl();
 
     try {
-      const response = await telnyxRequest("/calls", {
-        method: "POST",
-        body: {
-          connection_id: applicationId,
-          to: call.toNumber,
-          from: call.fromNumber,
-          webhook_url: webhookUrl,
-          webhook_url_method: "POST",
-          client_state: clientState,
-          command_id: crypto.randomUUID(),
-          timeout_secs: clampInteger(
-            agent.ringTimeoutSeconds,
-            45,
-            15,
-            120
-          ),
-        },
-        idempotencyKey: call.id,
-      });
-      const providerCall = response?.data || response || {};
+      const response = await elevenLabsRequest(
+        "/v1/convai/sip-trunk/outbound-call",
+        {
+          method: "POST",
+          body: {
+            agent_id: elevenLabsAgentId,
+            agent_phone_number_id: phoneNumberId,
+            to_number: call.toNumber,
+            conversation_initiation_client_data: {
+              dynamic_variables: dynamicVariables,
+            },
+          },
+        }
+      );
+      if (response?.success === false) {
+        throw httpError(502, clean(response.message) || "ElevenLabs could not initiate the SIP call.");
+      }
+      const conversationId = clean(response?.conversation_id);
+      const sipCallId = clean(response?.sip_call_id);
       let updated = null;
-
       store.update((draft) => {
         ensureStateShape(draft);
-        const target = draft.telnyxAiAgentCalls.find(
-          (item) => item.id === call.id
-        );
+        const target = draft.telnyxAiAgentCalls.find((item) => item.id === call.id);
         if (target) {
           target.status = "initiated";
-          target.providerCallId = clean(
-            providerCall.call_leg_id || providerCall.id
-          );
-          target.callControlId = clean(
-            providerCall.call_control_id
-          );
-          target.callSessionId = clean(
-            providerCall.call_session_id
-          );
-          target.clientState = clientState;
+          target.conversationId = conversationId;
+          target.sipCallId = sipCallId;
+          target.providerCallId = sipCallId;
           target.initiatedAt = now;
+          target.dynamicVariables = dynamicVariables;
+          target.mediaPath = "elevenlabs-direct-telnyx-sip";
           target.updatedAt = new Date().toISOString();
           updated = { ...target };
         }
-        const targetQueue =
-          draft.telnyxAiAgentAssignments.find(
-            (item) => item.id === latestQueue.id
-          );
+        const targetQueue = draft.telnyxAiAgentAssignments.find(
+          (item) => item.id === latestQueue.id
+        );
         if (targetQueue) {
           targetQueue.status = "initiated";
           targetQueue.updatedAt = new Date().toISOString();
         }
       });
 
-      emitEvent(
-        ctx.workspaceId,
-        "telnyx-ai-agent:call-updated",
-        { call: publicCall(updated || call) }
-      );
-
+      emitEvent(ctx.workspaceId, "telnyx-ai-agent:call-updated", {
+        call: publicCall(updated || call),
+      });
       return {
         ok: true,
         queueId: latestQueue.id,
@@ -3242,6 +3437,326 @@ export function createTelnyxAIAgentService({
     }
   }
 
+  function requireElevenLabsAgentId(required = true) {
+    const value = clean(process.env.ELEVENLABS_AGENT_ID);
+    if (!value && required) {
+      throw httpError(503, "ELEVENLABS_AGENT_ID is required for ElevenAgents calling.");
+    }
+    return value;
+  }
+
+  function resolveElevenLabsPhoneNumberId({
+    fromNumber,
+    input = {},
+    existing = {},
+    required = true,
+  } = {}) {
+    const normalized = normalizePhone(fromNumber);
+    let mapped = "";
+    const mappingRaw = clean(process.env.ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON);
+    if (mappingRaw) {
+      try {
+        const mapping = JSON.parse(mappingRaw);
+        mapped = clean(mapping?.[normalized] || mapping?.[fromNumber]);
+      } catch {
+        throw httpError(500, "ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON must be valid JSON.");
+      }
+    }
+    const value = clean(
+      input.elevenLabsPhoneNumberId ||
+        mapped ||
+        existing?.elevenLabsPhoneNumberId ||
+        process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID
+    );
+    if (!value && required) {
+      throw httpError(
+        503,
+        "Configure ELEVENLABS_AGENT_PHONE_NUMBER_ID (or ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON for multiple Telnyx caller IDs)."
+      );
+    }
+    return value;
+  }
+
+  async function elevenLabsRequest(endpoint, { method = "GET", body } = {}) {
+    const apiKey = clean(process.env.ELEVENLABS_API_KEY);
+    if (!apiKey) {
+      throw httpError(503, "ELEVENLABS_API_KEY is not configured.");
+    }
+    const response = await fetch(`${ELEVENLABS_API_BASE}${endpoint}`, {
+      method,
+      headers: {
+        "xi-api-key": apiKey,
+        Accept: "application/json",
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
+    }
+    if (!response.ok) {
+      const detail =
+        payload?.detail?.message ||
+        payload?.detail ||
+        payload?.message ||
+        payload?.error ||
+        `ElevenLabs request failed (${response.status}).`;
+      const message = typeof detail === "string" ? detail : JSON.stringify(detail);
+      const error = httpError(response.status >= 500 ? 502 : response.status, message);
+      error.code = "ELEVENLABS_ERROR";
+      error.details = payload;
+      throw error;
+    }
+    return payload;
+  }
+
+  function buildElevenLabsSalesPrompt(config) {
+    const company = clean(config.companyName) || "the company";
+    const parts = [
+      `You are the outbound AI sales assistant for ${company}.`,
+      clean(config.disclosure),
+      "Be quick, warm, perceptive and natural. Prefer short replies, contractions, fragments and varied rhythm. Never claim to be human.",
+      clean(config.persona),
+      "The lead context below is private working context. Use it silently; never recite it, never say you were given notes, and never repeat the opening greeting after the call has started.",
+      "Lead: {{first_name}} | Company: {{company}} | Job title: {{job_title}} | Source: {{lead_source}} | Campaign: {{campaign}} | Timezone: {{timezone}}.",
+      "CRM notes/history: {{crm_notes_history}}",
+      "Pain points: {{pain_points}}",
+      "Previous interactions: {{previous_interactions}}",
+      "Available meeting slots: {{available_meeting_slots}}",
+      "Private call context: {{private_context}}",
+      clean(config.offer) ? `Offer: ${clean(config.offer)}` : "",
+      clean(config.qualificationQuestions) ? `Qualification: ${clean(config.qualificationQuestions)}` : "",
+      clean(config.objectionHandling) ? `Objections: ${clean(config.objectionHandling)}` : "",
+      "Do not call tools for information already present above. Use bookMeeting only after explicit date/time confirmation. Use checkCalendar only when availability is genuinely uncertain. Use getCriticalLiveData only for critical state that could have changed. Transfer to a human only when requested or clearly necessary.",
+      "Keep latency low: answer the current point first, usually in one or two short sentences. Allow interruptions and stop speaking when the lead cuts in.",
+    ];
+    return parts.filter(Boolean).join("\n").slice(0, 12000);
+  }
+
+  function buildLeadContextSnapshot({ state, agent, lead, campaign, queueItem }) {
+    const custom = safeObject(queueItem?.customLeadDetails);
+    const history = Array.isArray(lead?.timeline)
+      ? lead.timeline.slice(0, 20).map((entry) => ({
+          type: clean(entry?.type),
+          notes: clean(entry?.notes || entry?.detail || entry?.title),
+          createdAt: clean(entry?.createdAt),
+        }))
+      : [];
+    const website = safeObject(agent?.websiteIntelligence);
+    const painPoints = uniqueStrings([
+      ...(Array.isArray(lead?.painPoints) ? lead.painPoints : []),
+      ...(Array.isArray(website?.painPoints) ? website.painPoints : []),
+      clean(lead?.painPoint),
+    ]).slice(0, 20);
+    const slots = [
+      ...(Array.isArray(lead?.availableMeetingSlots) ? lead.availableMeetingSlots : []),
+      ...(Array.isArray(lead?.meetingSlots) ? lead.meetingSlots : []),
+      ...(Array.isArray(custom?.availableMeetingSlots) ? custom.availableMeetingSlots : []),
+      ...(Array.isArray(agent?.availableMeetingSlots) ? agent.availableMeetingSlots : []),
+    ].filter(Boolean).slice(0, 20);
+    const notes = uniqueStrings([
+      clean(lead?.notes),
+      clean(lead?.crmNotes),
+      clean(queueItem?.customContext),
+    ]).filter(Boolean);
+    return {
+      firstName: firstNameOf(
+        custom.contactName || lead?.contactName || lead?.name || queueItem?.leadName
+      ),
+      company: clean(custom.companyName || lead?.companyName || lead?.business || lead?.name),
+      jobTitle: clean(custom.jobTitle || lead?.jobTitle || lead?.title || lead?.role),
+      leadSource: clean(lead?.source || queueItem?.source || campaign?.source),
+      campaign: clean(queueItem?.campaignName || campaign?.name || campaign?.title),
+      timezone: clean(queueItem?.timezone || lead?.timezone || lead?.timeZone || agent?.defaultLeadTimezone) || DEFAULT_LEAD_TIMEZONE,
+      crmNotesHistory: notes.join(" | ").slice(0, 5000),
+      painPoints,
+      previousInteractions: history,
+      availableMeetingSlots: slots,
+      privateContext: clean(queueItem?.customContext).slice(0, 8000),
+    };
+  }
+
+  function buildElevenLabsDynamicVariables({ call, contextSnapshot }) {
+    const value = contextSnapshot || {};
+    return {
+      reachfly_call_id: call.id,
+      workspace_id: call.workspaceId,
+      queue_id: call.queueId || "",
+      lead_id: call.leadId || "",
+      first_name: clean(value.firstName),
+      company: clean(value.company),
+      job_title: clean(value.jobTitle),
+      lead_source: clean(value.leadSource),
+      crm_notes_history: clean(value.crmNotesHistory),
+      campaign: clean(value.campaign),
+      pain_points: JSON.stringify(value.painPoints || []).slice(0, 4000),
+      previous_interactions: JSON.stringify(value.previousInteractions || []).slice(0, 6000),
+      timezone: clean(value.timezone) || DEFAULT_LEAD_TIMEZONE,
+      available_meeting_slots: JSON.stringify(value.availableMeetingSlots || []).slice(0, 4000),
+      private_context: clean(value.privateContext).slice(0, 8000),
+    };
+  }
+
+  function firstNameOf(value) {
+    return clean(value).split(/\s+/).filter(Boolean)[0] || "";
+  }
+
+  function verifyElevenLabsWebhook(rawBody, headers) {
+    const secret = clean(process.env.ELEVENLABS_WEBHOOK_SECRET);
+    if (!secret) {
+      throw httpError(503, "ELEVENLABS_WEBHOOK_SECRET is required for post-call webhook verification.");
+    }
+    const header = clean(
+      headers["elevenlabs-signature"] || headers["ElevenLabs-Signature"]
+    );
+    const parts = Object.fromEntries(
+      header.split(",").map((part) => {
+        const [key, ...rest] = part.trim().split("=");
+        return [key, rest.join("=")];
+      })
+    );
+    const timestamp = Number(parts.t || 0);
+    const supplied = clean(parts.v0);
+    if (!timestamp || !supplied) {
+      throw httpError(403, "Missing ElevenLabs webhook signature.");
+    }
+    if (Math.abs(Date.now() / 1000 - timestamp) > 300) {
+      throw httpError(403, "ElevenLabs webhook timestamp is outside the allowed tolerance.");
+    }
+    const expected = crypto
+      .createHmac("sha256", secret)
+      .update(`${timestamp}.${String(rawBody || "")}`)
+      .digest("hex");
+    const a = Buffer.from(expected);
+    const b = Buffer.from(supplied);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      throw httpError(403, "Invalid ElevenLabs webhook signature.");
+    }
+  }
+
+  function persistElevenLabsPostCall(call, data, now) {
+    const transcript = (Array.isArray(data.transcript) ? data.transcript : [])
+      .map((turn) => ({
+        role: normalizeStatus(turn?.role) === "agent" ? "assistant" : normalizeStatus(turn?.role) || "unknown",
+        text: clean(turn?.message || turn?.text),
+        timeInCallSeconds: Number(turn?.time_in_call_secs || 0) || 0,
+        toolCalls: Array.isArray(turn?.tool_calls) ? turn.tool_calls : [],
+        toolResults: Array.isArray(turn?.tool_results) ? turn.tool_results : [],
+      }))
+      .filter((turn) => turn.text || turn.toolCalls.length || turn.toolResults.length);
+    const analysis = safeObject(data.analysis);
+    const collected = safeObject(analysis.data_collection_results);
+    const collectedValue = (key, aliases = []) => {
+      for (const candidate of [key, ...aliases]) {
+        const entry = collected[candidate];
+        if (entry && typeof entry === "object" && "value" in entry) return entry.value;
+        if (entry !== undefined && entry !== null && typeof entry !== "object") return entry;
+      }
+      return "";
+    };
+    const summary = clean(analysis.transcript_summary);
+    const disposition = clean(
+      collectedValue("disposition", ["call_disposition", "outcome"])
+    );
+    const qualificationResult = clean(
+      collectedValue("qualification_result", ["qualification", "qualified"])
+    );
+    const objectionsRaw = collectedValue("objections", ["lead_objections"]);
+    const meetingDetailsRaw = collectedValue("meeting_details", ["meeting", "booked_meeting"]);
+    const followUpAction = clean(
+      collectedValue("follow_up_action", ["next_action", "follow_up"])
+    );
+    const success = normalizeStatus(analysis.call_successful);
+    const duration = Number(data.metadata?.call_duration_secs || 0) || 0;
+    const normalizedDisposition = normalizeOutcome(disposition || call.outcome || (success === "success" ? "contacted" : "contacted"));
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.telnyxAiAgentCalls.find((item) => item.id === call.id);
+      if (target) {
+        target.status = target.status === "cancelled" ? "cancelled" : "completed";
+        target.conversationId = clean(data.conversation_id) || target.conversationId;
+        target.transcript = transcript;
+        target.liveTranscript = transcript.map((turn, index) => ({
+          id: `${target.id}:post:${index}`,
+          role: turn.role,
+          text: turn.text,
+          isFinal: true,
+          occurredAt: now,
+        }));
+        target.summary = summary;
+        target.disposition = disposition || normalizedDisposition;
+        target.qualificationResult = qualificationResult;
+        target.objections = objectionsRaw || "";
+        target.meetingDetails = meetingDetailsRaw || "";
+        target.followUpAction = followUpAction;
+        target.elevenLabsAnalysis = analysis;
+        target.elevenLabsMetadata = safeObject(data.metadata);
+        target.durationSeconds = duration;
+        target.outcome = target.outcome || normalizedDisposition;
+        target.endedAt = target.endedAt || now;
+        target.updatedAt = now;
+      }
+      updateQueueAndLead(draft, call, {
+        queueStatus: outcomeToQueueStatus(normalizedDisposition),
+        leadStatus: outcomeToLeadStatus(normalizedDisposition),
+        outcome: normalizedDisposition,
+        notes: summary,
+        nextActionAt: "",
+        doNotCall: normalizedDisposition === "do_not_call",
+        now,
+      });
+      const found = findLead(draft, call.workspaceId, call.assignmentId || call.leadId);
+      if (found?.lead) {
+        appendTimeline(found.lead, {
+          type: "elevenlabs_voice_call_completed",
+          callId: call.id,
+          notes: summary || `ElevenLabs call completed: ${normalizedDisposition}.`,
+          createdAt: now,
+        });
+      }
+    });
+  }
+
+  async function endElevenLabsConversation(conversationId) {
+    const apiKey = clean(process.env.ELEVENLABS_API_KEY);
+    if (!apiKey) throw httpError(503, "ELEVENLABS_API_KEY is not configured.");
+    return await new Promise((resolve, reject) => {
+      const url = `wss://api.elevenlabs.io/v1/convai/conversations/${encodeURIComponent(conversationId)}/monitor`;
+      const socket = new WebSocket(url, { headers: { "xi-api-key": apiKey } });
+      const timeout = setTimeout(() => {
+        try { socket.close(); } catch {}
+        reject(httpError(504, "Timed out while ending the ElevenLabs conversation."));
+      }, 8000);
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        try { socket.close(); } catch {}
+        fn(value);
+      };
+      socket.on("open", () => {
+        socket.send(JSON.stringify({ command_type: "end_call" }), (error) => {
+          if (error) return finish(reject, error);
+          setTimeout(() => finish(resolve, { ok: true }), 250);
+        });
+      });
+      socket.on("unexpected-response", (_request, response) => {
+        const status = Number(response?.statusCode || 0);
+        const message = status === 403
+          ? "ElevenLabs real-time monitoring is not enabled for this workspace. Operator-side End call for direct SIP requires ElevenLabs Enterprise monitoring; the agent can still use its built-in end_call tool."
+          : `ElevenLabs monitor rejected the End call request (${status || "unknown"}).`;
+        finish(reject, httpError(status === 403 ? 409 : 502, message));
+      });
+      socket.on("error", (error) => finish(reject, error));
+    });
+  }
+
   async function telnyxRequest(
     endpoint,
     {
@@ -3348,7 +3863,10 @@ export function createTelnyxAIAgentService({
     startCampaign,
     cancelCall,
     handleWebhook,
+    handleElevenLabsWebhook,
     bookMeeting,
+    checkCalendar,
+    getCriticalLiveData,
     updateLeadOutcome,
   };
 
@@ -4922,41 +5440,57 @@ function isSuppressed(state, workspaceId, lead) {
 }
 
 function diagnostics(state, workspaceId) {
-  const applicationId = clean(
-    process.env.TELNYX_AI_CALL_CONTROL_APPLICATION_ID ||
-      process.env.TELNYX_VOICE_API_APPLICATION_ID
-  );
   const fromNumbers = configuredFromNumbers();
   const agent = findWorkspaceAgent(state, workspaceId);
+  const elevenLabsAgentId = clean(
+    agent?.elevenLabsAgentId || process.env.ELEVENLABS_AGENT_ID
+  );
+  let mappedPhoneId = "";
+  try {
+    const raw = clean(process.env.ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON);
+    if (raw) {
+      const mapping = JSON.parse(raw);
+      const selected = agent?.fromNumber || normalizePhone(process.env.TELNYX_AI_AGENT_FROM_NUMBER) || fromNumbers[0] || "";
+      mappedPhoneId = clean(mapping?.[normalizePhone(selected)] || mapping?.[selected]);
+    }
+  } catch {
+    mappedPhoneId = "";
+  }
+  const phoneNumberId = clean(
+    agent?.elevenLabsPhoneNumberId ||
+      mappedPhoneId ||
+      process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID
+  );
   return {
-    provider: "telnyx",
+    provider: "elevenlabs-telnyx-sip",
     configured: Boolean(
-      process.env.TELNYX_API_KEY &&
-        process.env.TELNYX_PUBLIC_KEY &&
-        applicationId &&
+      process.env.ELEVENLABS_API_KEY &&
+        elevenLabsAgentId &&
+        phoneNumberId &&
         requireToolSecret(false)
     ),
     enabled: envFlag("TELNYX_AI_AGENT_ENABLED", true),
-    apiKeyPresent: Boolean(process.env.TELNYX_API_KEY),
+    apiKeyPresent: Boolean(process.env.ELEVENLABS_API_KEY),
+    telnyxApiKeyPresent: Boolean(process.env.TELNYX_API_KEY),
     publicKeyPresent: Boolean(process.env.TELNYX_PUBLIC_KEY),
-    callControlApplicationId: applicationId,
-    webhookUrl: resolveWebhookUrl(),
+    callControlApplicationId: clean(
+      process.env.TELNYX_AI_CALL_CONTROL_APPLICATION_ID ||
+        process.env.TELNYX_VOICE_API_APPLICATION_ID
+    ),
+    webhookUrl: `${resolveWebhookBaseUrl()}/api/telnyx/ai-agent/elevenlabs/webhooks`,
     toolsBaseUrl: resolveWebhookBaseUrl(),
     fromNumbers,
     selectedFromNumber:
       agent?.fromNumber ||
-      normalizePhone(
-        process.env.TELNYX_AI_AGENT_FROM_NUMBER
-      ) ||
+      normalizePhone(process.env.TELNYX_AI_AGENT_FROM_NUMBER) ||
       fromNumbers[0] ||
       "",
-    assistantConfigured: Boolean(
-      agent?.telnyxAssistantId
-    ),
-    assistantId: agent?.telnyxAssistantId || "",
-    maxConcurrency: Number(
-      process.env.TELNYX_AI_AGENT_MAX_CONCURRENCY || 5
-    ),
+    assistantConfigured: Boolean(elevenLabsAgentId && phoneNumberId),
+    assistantId: elevenLabsAgentId,
+    elevenLabsAgentId,
+    elevenLabsPhoneNumberId: phoneNumberId,
+    mediaPath: "ElevenLabs ↔ Telnyx SIP ↔ Prospect",
+    maxConcurrency: Number(process.env.TELNYX_AI_AGENT_MAX_CONCURRENCY || 5),
   };
 }
 
@@ -4968,10 +5502,10 @@ function findWorkspaceAgent(state, workspaceId) {
 
 function requireConfiguredAgent(state, workspaceId) {
   const agent = findWorkspaceAgent(state, workspaceId);
-  if (!agent?.telnyxAssistantId) {
+  if (!agent?.elevenLabsAgentId || !agent?.elevenLabsPhoneNumberId) {
     throw httpError(
       409,
-      "Save the voice-agent configuration before assigning or calling leads."
+      "Save the ElevenLabs + Telnyx SIP voice-agent configuration before assigning or calling leads."
     );
   }
   return agent;
