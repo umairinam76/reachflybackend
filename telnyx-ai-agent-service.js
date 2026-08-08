@@ -5,7 +5,7 @@ import net from "node:net";
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const DEFAULT_VOICE =
   process.env.TELNYX_AI_AGENT_DEFAULT_VOICE ||
-  "Telnyx.Ultra.Clara";
+  "Telnyx.NaturalHD.astra";
 const LIVE_CLAUDE_MODEL =
   process.env.TELNYX_AI_AGENT_LIVE_MODEL ||
   "anthropic/claude-haiku-4-5";
@@ -229,17 +229,13 @@ export function createTelnyxAIAgentService({
     };
   }
 
-  async function listVoices(user, { force = false } = {}) {
-    const state = store.read();
-    requireAccess(user, state);
-
+  async function loadTelnyxVoices({ force = false } = {}) {
     if (
       !force &&
       voiceCache.value.length &&
       voiceCache.expiresAt > Date.now()
     ) {
       return {
-        ok: true,
         voices: voiceCache.value,
         cached: true,
       };
@@ -262,27 +258,76 @@ export function createTelnyxAIAgentService({
         )
       );
 
-    if (
-      !voices.some((voice) => voice.id === DEFAULT_VOICE)
-    ) {
-      voices.unshift({
-        id: DEFAULT_VOICE,
-        name: "Astra",
-        provider: "telnyx",
-        model: "NaturalHD",
-        language: "en-US",
-        gender: "",
-        label: `${DEFAULT_VOICE} · recommended default`,
-      });
-    }
-
     voiceCache.value = voices;
     voiceCache.expiresAt = Date.now() + 10 * 60_000;
 
     return {
-      ok: true,
       voices,
       cached: false,
+    };
+  }
+
+  async function listVoices(user, { force = false } = {}) {
+    const state = store.read();
+    requireAccess(user, state);
+
+    const result = await loadTelnyxVoices({ force });
+    const recommended = chooseRecommendedTelnyxVoice(result.voices);
+
+    return {
+      ok: true,
+      voices: result.voices,
+      recommendedVoiceId: recommended?.id || "",
+      recommendedVoice: recommended || null,
+      cached: result.cached,
+    };
+  }
+
+  async function resolveAssistantVoice(requestedVoice) {
+    const { voices } = await loadTelnyxVoices();
+
+    if (!voices.length) {
+      throw httpError(
+        503,
+        "Telnyx returned no available TTS voices for this account."
+      );
+    }
+
+    const requested = clean(requestedVoice);
+    const exact = voices.find(
+      (voice) =>
+        clean(voice.id).toLowerCase() === requested.toLowerCase()
+    );
+
+    if (exact) {
+      return {
+        voice: exact,
+        changed: false,
+        requested,
+      };
+    }
+
+    const friendly = resolveFriendlyVoiceAlias(voices, requested);
+    if (friendly) {
+      return {
+        voice: friendly,
+        changed: true,
+        requested,
+      };
+    }
+
+    const recommended = chooseRecommendedTelnyxVoice(voices);
+    if (!recommended) {
+      throw httpError(
+        422,
+        "No compatible Telnyx voice is available for this account."
+      );
+    }
+
+    return {
+      voice: recommended,
+      changed: true,
+      requested,
     };
   }
 
@@ -421,6 +466,9 @@ export function createTelnyxAIAgentService({
       );
     }
 
+    const voiceResolution = await resolveAssistantVoice(config.voice);
+    config.voice = voiceResolution.voice.id;
+
     const toolSecret = requireToolSecret();
     const webhookBaseUrl = resolveWebhookBaseUrl();
     const assistantPayload = buildAssistantPayload({
@@ -520,6 +568,15 @@ export function createTelnyxAIAgentService({
       provider: {
         id: telnyxAssistantId,
         versionId: saved.telnyxVersionId || "",
+      },
+      voiceResolution: {
+        requested: voiceResolution.requested || "",
+        selected: voiceResolution.voice.id,
+        selectedLabel:
+          voiceResolution.voice.label ||
+          voiceResolution.voice.name ||
+          voiceResolution.voice.id,
+        changed: voiceResolution.changed === true,
       },
     };
   }
@@ -762,6 +819,25 @@ export function createTelnyxAIAgentService({
 
     if (agent.enabled === false) {
       throw httpError(409, "Enable the voice agent before adding custom calls.");
+    }
+
+    const testCall = input.testCall === true;
+    const requesterRole = normalizeRole(
+      ctx.role || user?.workspaceRole || user?.role
+    );
+    if (testCall) {
+      if (!["owner", "admin"].includes(requesterRole)) {
+        throw httpError(
+          403,
+          "Only a workspace owner or administrator can bypass the calling window for a test call."
+        );
+      }
+      if (input.testCallConfirmed !== true) {
+        throw httpError(
+          422,
+          "Confirm the controlled test call before bypassing the calling window."
+        );
+      }
     }
 
     const phone = normalizePhone(
@@ -1044,6 +1120,8 @@ export function createTelnyxAIAgentService({
         concurrency: 1,
         dailyCallLimit: input.dailyCallLimit || agent.dailyCallLimit,
         fromNumber: input.fromNumber || agent.fromNumber,
+        testCall,
+        testCallConfirmed: input.testCallConfirmed === true,
       });
     }
 
@@ -1065,12 +1143,17 @@ export function createTelnyxAIAgentService({
       },
       queueItem: publicQueueItem(queueItem, store.read()),
       callNow: Boolean(input.callNow),
+      testCall,
       callResult,
       message:
         input.callNow === true
-          ? reusedQueueItem
-            ? "The existing pending/deferred queue item was refreshed and ReachFly attempted the AI call now under the configured calling policy."
-            : "The custom lead was queued and ReachFly attempted to start the AI call under the configured calling policy."
+          ? testCall
+            ? reusedQueueItem
+              ? "The existing pending/deferred queue item was refreshed and the controlled test call bypassed only the configured calling-time window."
+              : "The controlled test call was queued and bypassed only the configured calling-time window."
+            : reusedQueueItem
+              ? "The existing pending/deferred queue item was refreshed and ReachFly attempted the AI call now under the configured calling policy."
+              : "The custom lead was queued and ReachFly attempted to start the AI call under the configured calling policy."
           : reusedQueueItem
             ? "The existing pending/deferred queue item was refreshed with the latest custom lead context."
             : "The custom lead was added to the AI-agent queue.",
@@ -1277,6 +1360,36 @@ export function createTelnyxAIAgentService({
             requestedQueueIds.includes(item.assignmentId))
       )
       .sort(sortQueuePriority);
+
+    if (input.testCall === true) {
+      const requesterRole = normalizeRole(
+        ctx.role || user?.workspaceRole || user?.role
+      );
+      if (!["owner", "admin"].includes(requesterRole)) {
+        throw httpError(
+          403,
+          "Only a workspace owner or administrator can run a calling-window bypass test."
+        );
+      }
+      if (input.testCallConfirmed !== true) {
+        throw httpError(
+          422,
+          "Confirm the controlled test call before bypassing the calling window."
+        );
+      }
+      if (requestedQueueIds.length !== 1 || queue.length !== 1) {
+        throw httpError(
+          422,
+          "A test call can target exactly one explicitly selected queue item."
+        );
+      }
+      if (normalizeStatus(queue[0]?.source) !== "custom_ai_agent") {
+        throw httpError(
+          422,
+          "Calling-window bypass is available only for a manually entered Custom AI Call."
+        );
+      }
+    }
 
     if (!queue.length) {
       throw httpError(
@@ -1888,6 +2001,8 @@ export function createTelnyxAIAgentService({
       toNumber: latestQueue.phone,
       status: "creating",
       outcome: "",
+      testCall: input.testCall === true,
+      callingWindowBypassed: input.testCall === true,
       createdBy: user.id,
       createdAt: now,
       updatedAt: now,
@@ -2665,24 +2780,33 @@ export function createTelnyxAIAgentService({
       allowedStart + 1,
       21
     );
-    const local = getZonedParts(new Date(), timezone);
 
-    if (
-      local.hour < allowedStart ||
-      local.hour >= allowedEnd
-    ) {
-      return {
-        allowed: false,
-        deferred: true,
-        reason: `Outside the configured ${allowedStart}:00–${allowedEnd}:00 calling window in ${timezone}.`,
-        nextAttemptAt: nextWindowStart(
-          timezone,
-          allowedStart
-        ),
-      };
+    // Controlled owner/admin test calls may bypass ONLY the time-window check.
+    // Suppression/DNC, valid-number, concurrency and daily-limit protections remain active.
+    if (input.testCall !== true) {
+      const local = getZonedParts(new Date(), timezone);
+
+      if (
+        local.hour < allowedStart ||
+        local.hour >= allowedEnd
+      ) {
+        return {
+          allowed: false,
+          deferred: true,
+          reason: `Outside the configured ${allowedStart}:00–${allowedEnd}:00 calling window in ${timezone}.`,
+          nextAttemptAt: nextWindowStart(
+            timezone,
+            allowedStart
+          ),
+        };
+      }
     }
 
-    return { allowed: true };
+    return {
+      allowed: true,
+      testCall: input.testCall === true,
+      callingWindowBypassed: input.testCall === true,
+    };
   }
 
   function resolveToolCall(headers, body) {
@@ -4674,6 +4798,118 @@ function requireToolSecret(throwOnMissing = true) {
     );
   }
   return value;
+}
+
+
+function chooseRecommendedTelnyxVoice(voicesValue) {
+  const voices = Array.isArray(voicesValue)
+    ? voicesValue.filter((voice) => voice?.id)
+    : [];
+
+  if (!voices.length) return null;
+
+  const score = (voice) => {
+    const id = clean(voice.id).toLowerCase();
+    const name = clean(voice.name).toLowerCase();
+    const model = clean(voice.model).toLowerCase();
+    const language = clean(voice.language).toLowerCase();
+    let value = 0;
+
+    if (model === "ultra" || id.startsWith("telnyx.ultra.")) {
+      value += 1000;
+    }
+
+    if (name.includes("clara")) value += 120;
+    else if (name.includes("callie")) value += 110;
+    else if (name.includes("molly")) value += 100;
+    else if (name.includes("madison")) value += 90;
+    else if (name.includes("skyler")) value += 80;
+
+    if (
+      language === "en-us" ||
+      language.includes("american english")
+    ) {
+      value += 70;
+    } else if (
+      language.startsWith("en") ||
+      language.includes("english")
+    ) {
+      value += 50;
+    }
+
+    if (
+      model === "kokorotts" ||
+      id.startsWith("telnyx.kokorotts.")
+    ) {
+      value += 400;
+    }
+
+    if (
+      model === "naturalhd" ||
+      id.startsWith("telnyx.naturalhd.")
+    ) {
+      value += 300;
+    }
+
+    if (id === "telnyx.naturalhd.astra") {
+      value += 60;
+    }
+
+    return value;
+  };
+
+  return (
+    [...voices].sort(
+      (left, right) => score(right) - score(left)
+    )[0] || null
+  );
+}
+
+function resolveFriendlyVoiceAlias(voicesValue, requestedValue) {
+  const voices = Array.isArray(voicesValue)
+    ? voicesValue
+    : [];
+  const requested = clean(requestedValue);
+  if (!requested) return null;
+
+  const parts = requested.split(".");
+  if (parts.length < 3) return null;
+
+  const provider = clean(parts[0]).toLowerCase();
+  const model = clean(parts[1]).toLowerCase();
+  const friendlyName = clean(
+    parts.slice(2).join(".")
+  ).toLowerCase();
+
+  if (provider !== "telnyx" || !friendlyName) {
+    return null;
+  }
+
+  return (
+    voices.find((voice) => {
+      const voiceModel = clean(
+        voice.model
+      ).toLowerCase();
+      const voiceId = clean(
+        voice.id
+      ).toLowerCase();
+      const voiceName = clean(
+        voice.name
+      ).toLowerCase();
+      const sameModel =
+        voiceModel === model ||
+        voiceId.startsWith(`telnyx.${model}.`);
+
+      return (
+        sameModel &&
+        (
+          voiceName === friendlyName ||
+          voiceName.includes(friendlyName) ||
+          friendlyName.includes(voiceName)
+        )
+      );
+    }) || null
+  );
 }
 
 function normalizeVoice(voice) {
