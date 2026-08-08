@@ -2212,24 +2212,25 @@ export function createTelnyxAIAgentService({
     // Inject private per-lead context only after the assistant has started.
     // If this optional context update fails, keep the live AI call running.
     if (briefing) {
-      try {
-        await telnyxRequest(
-          `/calls/${encodeURIComponent(
-            call.callControlId
-          )}/actions/ai_assistant_add_messages`,
-          {
-            method: "POST",
-            body: {
-              messages: [
-                {
-                  role: "system",
-                  content: briefing,
-                },
-              ],
-            },
-          }
-        );
-      } catch (error) {
+      // Do not hold the answered-call webhook open while ReachFly injects CRM
+      // context. The greeting can begin immediately; the private briefing is
+      // delivered in parallel before the lead normally finishes responding.
+      void telnyxRequest(
+        `/calls/${encodeURIComponent(
+          call.callControlId
+        )}/actions/ai_assistant_add_messages`,
+        {
+          method: "POST",
+          body: {
+            messages: [
+              {
+                role: "system",
+                content: briefing,
+              },
+            ],
+          },
+        }
+      ).catch((error) => {
         store.update((draft) => {
           ensureStateShape(draft);
           const target = draft.telnyxAiAgentCalls.find(
@@ -2241,7 +2242,7 @@ export function createTelnyxAIAgentService({
             target.updatedAt = new Date().toISOString();
           }
         });
-      }
+      });
     }
 
     return findCallById(call.id) || updated || call;
@@ -3535,13 +3536,13 @@ function normalizeAgentInput({
       ),
     greeting:
       clean(input.greeting || existing?.greeting) ||
-      "Hi, this is the automated sales assistant calling from {{company_name}}. Is now an okay time for a quick question?",
+      "Hi, this is Lisa, the AI assistant with {{company_name}}. Hey—did I catch you at an okay time for one quick question?",
     disclosure:
       clean(input.disclosure || existing?.disclosure) ||
       "Clearly identify yourself as an automated AI sales assistant and identify the company at the beginning of the call.",
     persona:
       clean(input.persona || existing?.persona) ||
-      "Warm, confident, concise, curious, respectful, and conversational. Use short sentences and natural pauses. Never claim to be human.",
+      "Warm, quick, perceptive, lightly playful, and conversational. Sound present rather than scripted. Use contractions, short sentences, natural backchannels, subtle emotion, and occasional light humor. Never claim to be human.",
     offer: clean(
       input.offer ||
         existing?.offer ||
@@ -3668,27 +3669,45 @@ function buildAssistantPayload({
   toolSecret,
   workspaceId,
 }) {
-  const eagerEotThreshold = clampNumber(
-    process.env.TELNYX_AI_AGENT_FLUX_EAGER_EOT_THRESHOLD,
-    0.3,
-    0.3,
-    0.9
-  );
-  const eotThreshold = Math.max(
-    eagerEotThreshold,
-    clampNumber(
-      process.env.TELNYX_AI_AGENT_FLUX_EOT_THRESHOLD,
-      0.65,
-      0.5,
-      0.9
-    )
-  );
-  const eotTimeoutMs = clampInteger(
-    process.env.TELNYX_AI_AGENT_FLUX_EOT_TIMEOUT_MS,
-    1200,
-    500,
-    10000
-  );
+  const latencyProfile = clean(
+    process.env.TELNYX_AI_AGENT_LATENCY_PROFILE || "fast"
+  ).toLowerCase();
+  const fastLatency = latencyProfile === "fast";
+  const balancedLatency = latencyProfile === "balanced";
+
+  const eagerEotThreshold = fastLatency
+    ? 0.3
+    : balancedLatency
+      ? 0.4
+      : clampNumber(
+          process.env.TELNYX_AI_AGENT_FLUX_EAGER_EOT_THRESHOLD,
+          0.3,
+          0.3,
+          0.9
+        );
+  const eotThreshold = fastLatency
+    ? 0.5
+    : balancedLatency
+      ? 0.65
+      : Math.max(
+          eagerEotThreshold,
+          clampNumber(
+            process.env.TELNYX_AI_AGENT_FLUX_EOT_THRESHOLD,
+            0.65,
+            0.3,
+            0.9
+          )
+        );
+  const eotTimeoutMs = fastLatency
+    ? 700
+    : balancedLatency
+      ? 1000
+      : clampInteger(
+          process.env.TELNYX_AI_AGENT_FLUX_EOT_TIMEOUT_MS,
+          1200,
+          300,
+          10000
+        );
   const ultraVoice = isTelnyxUltraVoice(config.voice);
   const tools = [
     {
@@ -3757,7 +3776,7 @@ function buildAssistantPayload({
           ],
         },
         async: false,
-        timeout_ms: 5000,
+        timeout_ms: 3000,
       },
     },
     {
@@ -3804,8 +3823,9 @@ function buildAssistantPayload({
           },
           required: ["outcome"],
         },
-        async: false,
-        timeout_ms: 5000,
+        // CRM logging must never make the lead wait in silence.
+        async: true,
+        timeout_ms: 1500,
       },
     },
     {
@@ -3830,7 +3850,7 @@ function buildAssistantPayload({
         ? {
             voice_speed: clampNumber(
               process.env.TELNYX_AI_AGENT_VOICE_SPEED,
-              1.03,
+              1.02,
               0.85,
               1.2
             ),
@@ -3845,37 +3865,55 @@ function buildAssistantPayload({
         eager_eot_threshold: eagerEotThreshold,
         eot_threshold: eotThreshold,
         eot_timeout_ms: eotTimeoutMs,
+        smart_format: true,
+        numerals: true,
       },
     },
     interruption_settings: {
       enable: true,
       disable_greeting_interruption: false,
       start_speaking_plan: {
-        wait_seconds: clampNumber(
-          process.env.TELNYX_AI_AGENT_SPEAK_WAIT_SECONDS,
-          0.1,
-          0,
-          2
-        ),
+        wait_seconds: fastLatency
+          ? 0.05
+          : balancedLatency
+            ? 0.1
+            : clampNumber(
+                process.env.TELNYX_AI_AGENT_SPEAK_WAIT_SECONDS,
+                0.1,
+                0,
+                2
+              ),
         transcription_endpointing_plan: {
-          on_punctuation_seconds: clampNumber(
-            process.env.TELNYX_AI_AGENT_SPEAK_PUNCTUATION_SECONDS,
-            0.1,
-            0,
-            2
-          ),
-          on_no_punctuation_seconds: clampNumber(
-            process.env.TELNYX_AI_AGENT_SPEAK_NO_PUNCTUATION_SECONDS,
-            0.6,
-            0.1,
-            3
-          ),
-          on_number_seconds: clampNumber(
-            process.env.TELNYX_AI_AGENT_SPEAK_NUMBER_SECONDS,
-            0.8,
-            0.1,
-            3
-          ),
+          on_punctuation_seconds: fastLatency
+            ? 0.05
+            : balancedLatency
+              ? 0.1
+              : clampNumber(
+                  process.env.TELNYX_AI_AGENT_SPEAK_PUNCTUATION_SECONDS,
+                  0.1,
+                  0,
+                  2
+                ),
+          on_no_punctuation_seconds: fastLatency
+            ? 0.35
+            : balancedLatency
+              ? 0.6
+              : clampNumber(
+                  process.env.TELNYX_AI_AGENT_SPEAK_NO_PUNCTUATION_SECONDS,
+                  0.6,
+                  0.1,
+                  3
+                ),
+          on_number_seconds: fastLatency
+            ? 0.5
+            : balancedLatency
+              ? 0.8
+              : clampNumber(
+                  process.env.TELNYX_AI_AGENT_SPEAK_NUMBER_SECONDS,
+                  0.8,
+                  0.1,
+                  3
+                ),
         },
       },
     },
@@ -3912,20 +3950,25 @@ function buildAssistantPayload({
 }
 
 function buildAssistantInstructions(config) {
+  const hasWebsiteKnowledge = Boolean(
+    safeObject(config.websiteIntelligence).analyzedAt
+  );
   return [
     `You are ${config.name}, the outbound AI sales assistant for ${config.companyName}.`,
     config.disclosure,
-    `Persona: ${config.persona}`,
+    `Persona: ${compactPromptText(config.persona, 1000)}`,
     buildWebsiteKnowledgeBlock(config.websiteIntelligence),
-    config.offer ? `Offer: ${config.offer}` : "",
-    config.idealCustomer
-      ? `Ideal customer: ${config.idealCustomer}`
+    !hasWebsiteKnowledge && config.offer
+      ? `Offer: ${compactPromptText(config.offer, 500)}`
       : "",
-    config.qualificationQuestions
-      ? `Qualification requirements: ${config.qualificationQuestions}`
+    !hasWebsiteKnowledge && config.idealCustomer
+      ? `Ideal customer: ${compactPromptText(config.idealCustomer, 800)}`
       : "",
-    config.objectionHandling
-      ? `Objection guidance: ${config.objectionHandling}`
+    !hasWebsiteKnowledge && config.qualificationQuestions
+      ? `Qualification requirements: ${compactPromptText(config.qualificationQuestions, 900)}`
+      : "",
+    !hasWebsiteKnowledge && config.objectionHandling
+      ? `Objection guidance: ${compactPromptText(config.objectionHandling, 900)}`
       : "",
     `Meeting objective: ${config.meetingGoal}`,
     config.bookingInstructions
@@ -3936,12 +3979,16 @@ function buildAssistantInstructions(config) {
       ? `Meeting owner: ${config.calendarOwnerEmail}.`
       : "",
     `Live reasoning model: ${config.model || LIVE_CLAUDE_MODEL}. Treat the live transcript as an actual two-way conversation and adapt to what the lead says rather than following a rigid script.`,
-    "Conversation rules:",
-    "- Be natural, warm and concise. Ask one question at a time and allow the lead to finish.",
-    "- Keep most turns to one or two short spoken sentences before the next question. Use contractions and everyday wording.",
-    "- Do not repeat or summarize what the caller just said unless clarification is genuinely needed. Avoid filler such as 'Absolutely', 'Great question', or long preambles.",
+    "Conversation rules — FAST HUMAN MODE:",
+    "- Respond quickly. Lead with a short natural first sentence, usually 4–12 words, then continue only if needed. Put punctuation early so speech can start quickly.",
+    "- Keep most turns under about 25 spoken words. Ask one question at a time and let the lead finish.",
+    "- Sound like a sharp person on a real phone call, not a script. Use contractions and rotate natural micro-reactions such as 'yeah', 'right', 'gotcha', 'mm-hm', 'I see', 'fair enough', 'hmm', or 'well' only when they genuinely fit. Never stack fillers.",
+    "- Match the lead's energy. If they are upbeat, sound brighter; if frustrated, sound calm and empathetic; if skeptical, sound grounded and confident; if curious, sound curious back.",
+    "- With a Telnyx Ultra voice and expressive mode, use supported emotion delivery sparingly. Prefer natural emotional subtext; when useful, one cue such as <emotion value=\"curious\" />, <emotion value=\"confident\" />, <emotion value=\"grateful\" />, <emotion value=\"apologetic\" />, or <emotion value=\"excited\" /> may lead a short response. Never read the tag aloud.",
+    "- [laughter] is allowed only for a genuinely funny, warm, or playful moment. Never laugh at objections, confusion, money concerns, complaints, rejection, or sensitive topics. Do not force laughter into every call.",
+    "- Small human acknowledgements are good; fake personal stories are not. Never claim to be human or imply you have a body, childhood, personal memories, or real-world experiences.",
+    "- Do not repeat or summarize what the caller just said unless clarification is genuinely needed. Avoid corporate filler, long preambles, and speeches.",
     "- Once the caller's intent is clear, answer directly and keep momentum. Do not narrate your reasoning or mention internal tools.",
-    "- Never claim to be a human. Do not use deceptive identities or fabricated personal experiences.",
     "- Do not pressure, threaten, misrepresent, or promise results that are not supported.",
     "- Respect a request to stop immediately. Call update_lead_outcome with do_not_call=true, apologize once, and end the call.",
     "- Only call book_meeting after the lead explicitly confirms the exact date, time, timezone and duration.",
@@ -3960,10 +4007,10 @@ function buildWebsiteKnowledgeBlock(profileValue) {
 
   const sections = [
     profile.companySummary
-      ? `Website-derived company summary: ${profile.companySummary}`
+      ? `Website-derived company summary: ${compactPromptText(profile.companySummary, 700)}`
       : "",
     profile.oneLinePitch
-      ? `Website-derived sales positioning: ${profile.oneLinePitch}`
+      ? `Website-derived sales positioning: ${compactPromptText(profile.oneLinePitch, 320)}`
       : "",
     arrayLine("Services/products", profile.services),
     arrayLine("Target customers", profile.targetCustomers),
@@ -4016,9 +4063,20 @@ function websiteProfileObjections(profileValue) {
     .join("\n");
 }
 
+function compactPromptText(value, maxLength = 180) {
+  const text = clean(value).replace(/\s+/g, " ");
+  if (!text) return "";
+  return text.length > maxLength
+    ? `${text.slice(0, Math.max(1, maxLength - 1)).trim()}…`
+    : text;
+}
+
 function arrayLine(label, value) {
   const items = Array.isArray(value)
-    ? value.map(clean).filter(Boolean).slice(0, 16)
+    ? value
+        .map((item) => compactPromptText(item, 180))
+        .filter(Boolean)
+        .slice(0, 6)
     : [];
   return items.length ? `${label}: ${items.join(" | ")}` : "";
 }
@@ -4034,7 +4092,8 @@ function objectionLine(value) {
         .join(" => ");
     })
     .filter(Boolean)
-    .slice(0, 12);
+    .map((item) => compactPromptText(item, 220))
+    .slice(0, 5);
   return text.length ? `Objection guidance: ${text.join(" | ")}` : "";
 }
 
@@ -4059,10 +4118,9 @@ function buildLeadBriefing({
   );
   const customContext = clean(
     queueItem.customContext || call.customContext
-  ).slice(0, 12_000);
+  ).slice(0, 4_000);
   return [
     "Use this private ReachFly context for this call. Do not read it as a list unless naturally relevant.",
-    `ReachFly call ID: ${call.id}`,
     `Lead name/business: ${getLeadName(lead) || call.leadName || "Unknown"}`,
     customLeadDetails.contactName
       ? `Contact name: ${clean(customLeadDetails.contactName)}`
@@ -4086,12 +4144,12 @@ function buildLeadBriefing({
     campaign?.name || campaign?.title
       ? `Campaign: ${campaign.name || campaign.title}`
       : "",
-    lead.notes ? `Existing notes: ${lead.notes}` : "",
+    lead.notes ? `Existing notes: ${compactPromptText(lead.notes, 600)}` : "",
     lead.miniAudit?.summary
-      ? `Audit summary: ${lead.miniAudit.summary}`
+      ? `Audit summary: ${compactPromptText(lead.miniAudit.summary, 600)}`
       : "",
     Object.keys(customFields).length
-      ? `Lead record custom fields: ${JSON.stringify(customFields).slice(0, 3000)}`
+      ? `Lead record custom fields: ${JSON.stringify(customFields).slice(0, 900)}`
       : "",
     customContext
       ? `Manager-provided private lead context: ${customContext}`
@@ -4100,7 +4158,7 @@ function buildLeadBriefing({
       ? "Use the manager-provided lead context to personalize the conversation, but do not read it verbatim and do not invent facts beyond it."
       : "",
     agent.websiteIntelligence?.oneLinePitch
-      ? `Company positioning: ${agent.websiteIntelligence.oneLinePitch}`
+      ? `Company positioning: ${compactPromptText(agent.websiteIntelligence.oneLinePitch, 400)}`
       : "",
     `The lead's working timezone is ${call.leadTimezone || agent.defaultLeadTimezone || DEFAULT_LEAD_TIMEZONE}.`,
     "Start with the configured greeting. Qualify fit, understand the problem, and book a meeting only with explicit confirmation.",
