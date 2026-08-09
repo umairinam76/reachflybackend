@@ -5,6 +5,7 @@ import WebSocket from "ws";
 
 const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io";
+const CALENDLY_API_BASE = "https://api.calendly.com";
 const DEFAULT_VOICE =
   process.env.ELEVENLABS_VOICE_ID ||
   "fNZkPhLHNXqE8oMjamg6";
@@ -95,6 +96,10 @@ export function createTelnyxAIAgentService({
   const elevenLabsAgentCache = {
     expiresAt: 0,
     value: [],
+  };
+  const calendlyEventTypeCache = {
+    expiresAt: 0,
+    value: null,
   };
 
   function getAccess(user) {
@@ -513,21 +518,51 @@ export function createTelnyxAIAgentService({
     const summaries = [];
     let cursor = "";
     let pages = 0;
-    do {
-      const params = new URLSearchParams({
-        page_size: "100",
-        archived: "false",
-        sort_by: "name",
-        sort_direction: "asc",
-      });
-      if (cursor) params.set("cursor", cursor);
-      const response = await elevenLabsRequest(
-        `/v1/convai/agents?${params.toString()}`
-      );
-      summaries.push(...(Array.isArray(response?.agents) ? response.agents : []));
-      cursor = response?.has_more ? clean(response?.next_cursor) : "";
-      pages += 1;
-    } while (cursor && pages < 5);
+    let listError = null;
+    try {
+      do {
+        const params = new URLSearchParams({
+          page_size: "100",
+          archived: "false",
+          sort_by: "name",
+          sort_direction: "asc",
+        });
+        if (cursor) params.set("cursor", cursor);
+        const response = await elevenLabsRequest(
+          `/v1/convai/agents?${params.toString()}`
+        );
+        summaries.push(...(Array.isArray(response?.agents) ? response.agents : []));
+        cursor = response?.has_more ? clean(response?.next_cursor) : "";
+        pages += 1;
+      } while (cursor && pages < 5);
+    } catch (error) {
+      listError = error;
+    }
+
+    // Some restricted ElevenLabs keys can read the configured agent directly
+    // while returning an empty/blocked workspace list. Keep ReachFly usable in
+    // that case instead of showing “No ElevenLabs agents loaded”.
+    if (!summaries.length) {
+      const configuredAgentId = clean(process.env.ELEVENLABS_AGENT_ID);
+      if (configuredAgentId) {
+        try {
+          const configuredAgent = await elevenLabsRequest(
+            `/v1/convai/agents/${encodeURIComponent(configuredAgentId)}`
+          );
+          summaries.push({
+            agent_id: configuredAgentId,
+            name: clean(configuredAgent?.name) || configuredAgentId,
+            archived: false,
+          });
+          listError = null;
+        } catch (directError) {
+          if (listError) throw listError;
+          throw directError;
+        }
+      } else if (listError) {
+        throw listError;
+      }
+    }
 
     const details = [];
     for (let index = 0; index < summaries.length; index += 8) {
@@ -827,9 +862,11 @@ export function createTelnyxAIAgentService({
                 DEFAULT_VOICE,
               model_id:
                 clean(process.env.ELEVENLABS_TTS_MODEL_ID) ||
-                "eleven_flash_v2_5",
+                "eleven_flash_v2",
               optimize_streaming_latency: 3,
               speed: 1,
+              stability: 0.5,
+              similarity_boost: 0.8,
             },
             conversation: {
               max_duration_seconds: clampInteger(
@@ -906,7 +943,7 @@ export function createTelnyxAIAgentService({
         telnyxAssistantId: "",
         telnyxVersionId: "",
         elevenLabsTtsModel:
-          clean(syncedTts.model_id) || "eleven_flash_v2_5",
+          clean(syncedTts.model_id) || "eleven_flash_v2",
         elevenLabsTurnEagerness: "eager",
         elevenLabsStreamingLatency: 3,
         enabled: input.enabled !== false,
@@ -2104,7 +2141,7 @@ export function createTelnyxAIAgentService({
     };
   }
 
-  function bookMeeting({ headers = {}, body = {} } = {}) {
+  async function bookMeeting({ headers = {}, body = {} } = {}) {
     verifyToolRequest(headers);
     const call = resolveToolCall(headers, body);
     const confirmed = Boolean(
@@ -2120,7 +2157,7 @@ export function createTelnyxAIAgentService({
         ok: false,
         booked: false,
         message:
-          "Do not book yet. Ask the lead to explicitly confirm the proposed date and time.",
+          "Do not book yet. Ask the lead to explicitly confirm the exact date and time first.",
       };
     }
 
@@ -2129,7 +2166,6 @@ export function createTelnyxAIAgentService({
         body.start_at ||
         body.startAt
     );
-
     if (!startAt) {
       return {
         ok: false,
@@ -2139,13 +2175,163 @@ export function createTelnyxAIAgentService({
       };
     }
 
+    // Protect against a repeated LLM tool call creating a second Calendly event.
+    const snapshot = store.read();
+    const existingMeeting = (snapshot.telnyxAiAgentMeetings || []).find(
+      (item) => item.callId === call.id && normalizeStatus(item.status) === "confirmed"
+    );
+    if (existingMeeting?.calendlyEventUri || existingMeeting?.source === "calendly") {
+      return {
+        ok: true,
+        booked: true,
+        duplicate: true,
+        meeting: publicMeeting(existingMeeting),
+        message:
+          "This meeting is already booked. Confirm the existing date and time naturally; do not book another one.",
+      };
+    }
+
+    const context = safeObject(call.contextSnapshot);
+    const attendeeName = clean(
+      body.attendee_name ||
+        body.attendeeName ||
+        context.fullName ||
+        call.leadName
+    );
+    const attendeeEmail = clean(
+      body.attendee_email || body.attendeeEmail || context.email
+    );
+    const attendeePhone =
+      normalizePhone(body.attendee_phone || body.attendeePhone) || call.toNumber;
+    const timezone =
+      clean(body.timezone) ||
+      clean(context.timezone) ||
+      call.leadTimezone ||
+      DEFAULT_LEAD_TIMEZONE;
+
+    if (!attendeeName) {
+      return {
+        ok: false,
+        booked: false,
+        requires: ["attendee_name"],
+        message:
+          "I need the lead's name before I can book Calendly. Ask for it naturally in one short question.",
+      };
+    }
+    if (!isLikelyEmail(attendeeEmail)) {
+      return {
+        ok: false,
+        booked: false,
+        requires: ["attendee_email"],
+        message:
+          "Calendly needs an email address for the invitation. Ask the lead for the best email, then call bookMeeting again after they confirm it.",
+      };
+    }
+
+    let eventType;
+    try {
+      eventType = await resolveCalendlyEventType();
+    } catch (error) {
+      return calendlyBookingFallback(error, {
+        booked: false,
+        startAt,
+        timezone,
+      });
+    }
+
+    // Re-check the exact slot immediately before creating the invitee. This keeps
+    // voice-agent booking safe if another person took the slot a few seconds ago.
+    try {
+      const exactAvailability = await getCalendlyAvailableTimes({
+        eventTypeUri: eventType.uri,
+        startAt,
+        endAt: new Date(Date.parse(startAt) + 60 * 60_000).toISOString(),
+        timezone,
+        limit: 10,
+      });
+      const exactSlotOpen = exactAvailability.some(
+        (slot) => Math.abs(Date.parse(slot.start_time) - Date.parse(startAt)) < 60_000
+      );
+      if (!exactSlotOpen) {
+        return {
+          ok: false,
+          booked: false,
+          staleSlot: true,
+          bookingUrl: calendlyEventUrl(),
+          alternatives: exactAvailability.slice(0, 3),
+          message: exactAvailability.length
+            ? "That exact Calendly slot is no longer open. Offer one of the returned alternatives and get explicit confirmation again."
+            : "That exact Calendly slot is no longer open. Call checkCalendar for fresh availability; do not claim the meeting is booked.",
+        };
+      }
+    } catch (error) {
+      return calendlyBookingFallback(error, {
+        booked: false,
+        startAt,
+        timezone,
+      });
+    }
+
+    const invitee = {
+      name: attendeeName,
+      email: attendeeEmail,
+      timezone,
+    };
+    if (envFlag("CALENDLY_INCLUDE_TEXT_REMINDER_NUMBER", false) && attendeePhone) {
+      invitee.text_reminder_number = attendeePhone;
+    }
+
+    const bookingBody = {
+      event_type: eventType.uri,
+      start_time: new Date(startAt).toISOString(),
+      invitee,
+      tracking: {
+        utm_source: "reachfly_voice_agent",
+        utm_medium: "ai_voice",
+        utm_campaign: clean(call.campaignName || "reachfly"),
+      },
+    };
+
+    const locationResolution = resolveCalendlyLocation(eventType, body);
+    if (locationResolution.requiresInput) {
+      return {
+        ok: false,
+        booked: false,
+        requires: ["meeting_location"],
+        locationKind: locationResolution.kind,
+        message:
+          "This Calendly event requires the invitee to choose or provide a meeting location. Ask one short location question, then retry booking.",
+      };
+    }
+    if (locationResolution.location) {
+      bookingBody.location = locationResolution.location;
+    }
+
+    let providerResponse;
+    try {
+      providerResponse = await calendlyRequest("/invitees", {
+        method: "POST",
+        body: bookingBody,
+      });
+    } catch (error) {
+      // A 400/404 often means the slot was taken or the event location requires
+      // extra input; 403 commonly means Scheduling API is not enabled on plan.
+      return calendlyBookingFallback(error, {
+        booked: false,
+        startAt,
+        timezone,
+      });
+    }
+
+    const bookedInvitee = safeObject(providerResponse?.resource || providerResponse);
+    const eventUri = clean(bookedInvitee.event);
+    const now = new Date().toISOString();
     const durationMinutes = clampInteger(
-      body.duration_minutes || body.durationMinutes,
+      eventType.duration || body.duration_minutes || body.durationMinutes,
       30,
       10,
       180
     );
-    const now = new Date().toISOString();
     const meeting = {
       id: crypto.randomUUID(),
       workspaceId: call.workspaceId,
@@ -2156,28 +2342,23 @@ export function createTelnyxAIAgentService({
       campaignId: call.campaignId,
       leadId: call.leadId,
       leadName: call.leadName,
-      attendeeName: clean(
-        body.attendee_name || body.attendeeName
-      ),
-      attendeeEmail: clean(
-        body.attendee_email || body.attendeeEmail
-      ),
-      attendeePhone:
-        normalizePhone(
-          body.attendee_phone || body.attendeePhone
-        ) || call.toNumber,
-      startAt,
-      endAt: new Date(
-        Date.parse(startAt) + durationMinutes * 60_000
-      ).toISOString(),
+      attendeeName,
+      attendeeEmail,
+      attendeePhone,
+      startAt: new Date(startAt).toISOString(),
+      endAt: new Date(Date.parse(startAt) + durationMinutes * 60_000).toISOString(),
       durationMinutes,
-      timezone:
-        clean(body.timezone) ||
-        call.leadTimezone ||
-        DEFAULT_LEAD_TIMEZONE,
+      timezone,
       notes: clean(body.notes).slice(0, 2000),
       status: "confirmed",
-      source: "elevenlabs-telnyx-sip",
+      source: "calendly",
+      calendlyEventTypeUri: eventType.uri,
+      calendlyEventTypeName: clean(eventType.name),
+      calendlyEventUri: eventUri,
+      calendlyInviteeUri: clean(bookedInvitee.uri),
+      calendlyCancelUrl: clean(bookedInvitee.cancel_url),
+      calendlyRescheduleUrl: clean(bookedInvitee.reschedule_url),
+      calendlyBookingUrl: calendlyEventUrl(),
       createdAt: now,
       updatedAt: now,
     };
@@ -2195,32 +2376,27 @@ export function createTelnyxAIAgentService({
         doNotCall: false,
         now,
       });
-      const targetCall = draft.telnyxAiAgentCalls.find(
-        (item) => item.id === call.id
-      );
+      const targetCall = draft.telnyxAiAgentCalls.find((item) => item.id === call.id);
       if (targetCall) {
         targetCall.outcome = "meeting_booked";
         targetCall.meetingId = meeting.id;
+        targetCall.calendlyEventUri = eventUri;
         targetCall.updatedAt = now;
       }
       addActivity(draft, {
         workspaceId: call.workspaceId,
         type: "meeting_booked",
-        title: `Meeting booked with ${call.leadName || call.toNumber}`,
+        title: `Calendly meeting booked with ${call.leadName || call.toNumber}`,
         detail: meeting.startAt,
         callId: call.id,
         createdAt: now,
       });
     });
 
-    emitEvent(
-      call.workspaceId,
-      "telnyx-ai-agent:meeting-booked",
-      {
-        meeting: publicMeeting(meeting),
-        call: publicCall(findCallById(call.id)),
-      }
-    );
+    emitEvent(call.workspaceId, "telnyx-ai-agent:meeting-booked", {
+      meeting: publicMeeting(meeting),
+      call: publicCall(findCallById(call.id)),
+    });
     emitEvent(call.workspaceId, "lead:updated", {
       assignmentId: call.assignmentId,
       leadId: call.leadId,
@@ -2230,9 +2406,10 @@ export function createTelnyxAIAgentService({
     return {
       ok: true,
       booked: true,
+      provider: "calendly",
       meeting: publicMeeting(meeting),
       message:
-        "Booking succeeded. Confirm it in a warm, casual voice. Example pattern: 'And... it's booked. You're set for Tuesday at two.' Vary naturally and repeat the exact confirmed date/time/timezone once.",
+        "Calendly booking succeeded. Confirm it casually in one short sentence, repeat the exact confirmed time once, then move toward ending the call.",
     };
   }
 
@@ -2318,21 +2495,80 @@ export function createTelnyxAIAgentService({
     };
   }
 
-  function checkCalendar({ headers = {}, body = {} } = {}) {
+  async function checkCalendar({ headers = {}, body = {} } = {}) {
     verifyToolRequest(headers);
     const call = resolveToolCall(headers, body);
-    const slots = Array.isArray(call.availableMeetingSlots)
-      ? call.availableMeetingSlots
-      : [];
-    return {
-      ok: true,
-      timezone: call.leadTimezone || DEFAULT_LEAD_TIMEZONE,
-      availableSlots: slots.slice(0, 20),
-      source: "preloaded_call_context",
-      message: slots.length
-        ? "Use these preloaded slots. Ask the lead to choose one, then explicitly confirm it before booking."
-        : "No preloaded slots are available. Do not invent availability; ask for a preferred time and follow the configured booking workflow.",
-    };
+    const timezone =
+      clean(body.timezone) ||
+      clean(safeObject(call.contextSnapshot).timezone) ||
+      call.leadTimezone ||
+      DEFAULT_LEAD_TIMEZONE;
+
+    if (!calendlyConfigured()) {
+      const slots = Array.isArray(call.availableMeetingSlots)
+        ? call.availableMeetingSlots
+        : [];
+      return {
+        ok: true,
+        timezone,
+        availableSlots: slots.slice(0, 20),
+        source: slots.length ? "preloaded_call_context" : "calendly_link_fallback",
+        bookingUrl: calendlyEventUrl(),
+        message: slots.length
+          ? "Calendly API is not configured, so use these preloaded slots and explicitly confirm one before booking."
+          : "Live Calendly availability is not configured. Do not invent times; offer the configured Calendly link or ask for a preferred time for human follow-up.",
+      };
+    }
+
+    let eventType;
+    try {
+      eventType = await resolveCalendlyEventType();
+      const nowMs = Date.now();
+      const requestedStart = normalizeDate(
+        body.start_time || body.start_at || body.startAt || body.range_start
+      );
+      const startMs = Math.max(
+        requestedStart ? Date.parse(requestedStart) : nowMs + 5 * 60_000,
+        nowMs + 60_000
+      );
+      const requestedEnd = normalizeDate(
+        body.end_time || body.end_at || body.endAt || body.range_end
+      );
+      const maxEndMs = startMs + 31 * 24 * 60 * 60_000;
+      const defaultEndMs = startMs + 7 * 24 * 60 * 60_000;
+      const endMs = Math.min(
+        requestedEnd ? Date.parse(requestedEnd) : defaultEndMs,
+        maxEndMs
+      );
+      const limit = clampInteger(body.limit, 6, 1, 20);
+      const slots = await getCalendlyAvailableTimes({
+        eventTypeUri: eventType.uri,
+        startAt: new Date(startMs).toISOString(),
+        endAt: new Date(Math.max(endMs, startMs + 30 * 60_000)).toISOString(),
+        timezone,
+        limit,
+      });
+      return {
+        ok: true,
+        timezone,
+        eventType: {
+          name: clean(eventType.name),
+          durationMinutes: Number(eventType.duration || 30),
+        },
+        bookingUrl: calendlyEventUrl(),
+        availableSlots: slots,
+        source: "calendly_live",
+        message: slots.length
+          ? "Offer at most three of these live Calendly slots naturally. Once the lead picks one, repeat the exact day/time and get explicit confirmation before calling bookMeeting."
+          : "Calendly returned no open times in that range. Ask for another day or time window; do not invent availability.",
+      };
+    } catch (error) {
+      return calendlyBookingFallback(error, {
+        booked: false,
+        timezone,
+        checkOnly: true,
+      });
+    }
   }
 
   function getCriticalLiveData({ headers = {}, body = {} } = {}) {
@@ -3664,6 +3900,262 @@ export function createTelnyxAIAgentService({
     return value;
   }
 
+  function calendlyEventUrl() {
+    return String(
+      process.env.CALENDLY_EVENT_URL || "https://calendly.com/umairinam76/30min"
+    )
+      .trim()
+      .replace(/\/+$/, "");
+  }
+
+  function calendlyConfigured() {
+    return Boolean(clean(process.env.CALENDLY_ACCESS_TOKEN) && calendlyEventUrl());
+  }
+
+  function normalizeCalendlyPublicUrl(value) {
+    try {
+      const url = new URL(String(value || ""));
+      url.search = "";
+      url.hash = "";
+      return url.toString().replace(/\/+$/, "").toLowerCase();
+    } catch {
+      return String(value || "").trim().replace(/\/+$/, "").toLowerCase();
+    }
+  }
+
+  function calendlyUuidFromUri(value) {
+    return clean(value).split("/").filter(Boolean).pop() || "";
+  }
+
+  async function calendlyRequest(endpoint, { method = "GET", body } = {}) {
+    const token = clean(process.env.CALENDLY_ACCESS_TOKEN);
+    if (!token) {
+      throw httpError(503, "CALENDLY_ACCESS_TOKEN is not configured.");
+    }
+    const response = await fetch(`${CALENDLY_API_BASE}${endpoint}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
+    }
+    if (!response.ok) {
+      const detail =
+        payload?.message ||
+        payload?.title ||
+        payload?.error ||
+        payload?.details?.[0]?.message ||
+        `Calendly request failed (${response.status}).`;
+      const error = httpError(response.status >= 500 ? 502 : response.status, String(detail));
+      error.code = "CALENDLY_ERROR";
+      error.providerStatus = response.status;
+      error.details = payload;
+      throw error;
+    }
+    return payload;
+  }
+
+  async function resolveCalendlyEventType({ force = false } = {}) {
+    if (!calendlyConfigured()) {
+      throw httpError(503, "Calendly live booking is not configured.");
+    }
+    if (
+      !force &&
+      calendlyEventTypeCache.value &&
+      calendlyEventTypeCache.expiresAt > Date.now()
+    ) {
+      return calendlyEventTypeCache.value;
+    }
+
+    const configuredUri = clean(process.env.CALENDLY_EVENT_TYPE_URI);
+    let eventType = null;
+    if (configuredUri) {
+      const uuid = calendlyUuidFromUri(configuredUri);
+      if (uuid) {
+        const response = await calendlyRequest(`/event_types/${encodeURIComponent(uuid)}`);
+        eventType = safeObject(response?.resource || response);
+      }
+      if (!clean(eventType.uri)) eventType.uri = configuredUri;
+    } else {
+      const meResponse = await calendlyRequest("/users/me");
+      const me = safeObject(meResponse?.resource || meResponse);
+      const userUri = clean(me.uri);
+      if (!userUri) {
+        throw httpError(502, "Calendly did not return the current user URI.");
+      }
+      const params = new URLSearchParams({
+        user: userUri,
+        active: "true",
+        count: "100",
+      });
+      const response = await calendlyRequest(`/event_types?${params.toString()}`);
+      const eventTypes = Array.isArray(response?.collection) ? response.collection : [];
+      const wantedUrl = normalizeCalendlyPublicUrl(calendlyEventUrl());
+      eventType = eventTypes.find(
+        (item) => normalizeCalendlyPublicUrl(item?.scheduling_url) === wantedUrl
+      );
+      if (!eventType) {
+        // Be a little forgiving about a trailing slash or URL casing, but never
+        // silently select an unrelated event type.
+        let wantedPath = "";
+        try {
+          wantedPath = new URL(calendlyEventUrl()).pathname.replace(/\/+$/, "").toLowerCase();
+        } catch {}
+        if (wantedPath) {
+          eventType = eventTypes.find((item) => {
+            try {
+              return new URL(item?.scheduling_url || "").pathname.replace(/\/+$/, "").toLowerCase() === wantedPath;
+            } catch {
+              return false;
+            }
+          });
+        }
+      }
+      if (!eventType) {
+        throw httpError(
+          404,
+          `Calendly event type was not found for ${calendlyEventUrl()}. Set CALENDLY_EVENT_TYPE_URI if this event is hidden from the event-type list.`
+        );
+      }
+      const uuid = calendlyUuidFromUri(eventType.uri);
+      if (uuid) {
+        try {
+          const detailResponse = await calendlyRequest(`/event_types/${encodeURIComponent(uuid)}`);
+          eventType = {
+            ...eventType,
+            ...safeObject(detailResponse?.resource || detailResponse),
+          };
+        } catch {
+          // The list payload is enough for availability even if detail lookup fails.
+        }
+      }
+    }
+
+    if (!clean(eventType?.uri)) {
+      throw httpError(502, "Calendly event type URI could not be resolved.");
+    }
+    calendlyEventTypeCache.value = eventType;
+    calendlyEventTypeCache.expiresAt = Date.now() + 10 * 60_000;
+    return eventType;
+  }
+
+  async function getCalendlyAvailableTimes({
+    eventTypeUri,
+    startAt,
+    endAt,
+    timezone,
+    limit = 6,
+  }) {
+    const params = new URLSearchParams({
+      event_type: eventTypeUri,
+      start_time: new Date(startAt).toISOString(),
+      end_time: new Date(endAt).toISOString(),
+    });
+    const response = await calendlyRequest(
+      `/event_type_available_times?${params.toString()}`
+    );
+    const collection = Array.isArray(response?.collection) ? response.collection : [];
+    return collection
+      .filter((item) => clean(item?.start_time))
+      .slice(0, clampInteger(limit, 6, 1, 20))
+      .map((item) => ({
+        start_time: new Date(item.start_time).toISOString(),
+        status: clean(item.status) || "available",
+        remaining_invitees: Number(item.invitees_remaining ?? item.remaining_invitees ?? 0) || undefined,
+        label: formatCalendlySlot(item.start_time, timezone),
+      }));
+  }
+
+  function formatCalendlySlot(value, timezone) {
+    try {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone || DEFAULT_LEAD_TIMEZONE,
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short",
+      }).format(new Date(value));
+    } catch {
+      return new Date(value).toISOString();
+    }
+  }
+
+  function resolveCalendlyLocation(eventType, body = {}) {
+    const requestedKind = clean(body.location_kind || body.locationKind);
+    const requestedValue = clean(body.location || body.location_value || body.locationValue);
+    if (requestedKind) {
+      return {
+        requiresInput: false,
+        kind: requestedKind,
+        location: {
+          kind: requestedKind,
+          ...(requestedValue ? { location: requestedValue } : {}),
+        },
+      };
+    }
+
+    const locations = Array.isArray(eventType?.locations) ? eventType.locations : [];
+    if (!locations.length) return { requiresInput: false, location: null, kind: "" };
+    if (locations.length > 1) {
+      return { requiresInput: true, location: null, kind: "multiple" };
+    }
+    const selected = safeObject(locations[0]);
+    const kind = clean(selected.kind);
+    if (!kind) return { requiresInput: false, location: null, kind: "" };
+    const requiresValue = ["ask_invitee", "outbound_call", "custom"].includes(
+      normalizeStatus(kind)
+    );
+    if (requiresValue && !requestedValue) {
+      return { requiresInput: true, location: null, kind };
+    }
+    return {
+      requiresInput: false,
+      kind,
+      location: {
+        kind,
+        ...(requestedValue ? { location: requestedValue } : {}),
+      },
+    };
+  }
+
+  function calendlyBookingFallback(error, context = {}) {
+    const providerStatus = Number(error?.providerStatus || error?.statusCode || error?.status || 0);
+    const bookingUrl = calendlyEventUrl();
+    const planBlocked = providerStatus === 403;
+    const slotOrValidationIssue = [400, 404, 409, 422].includes(providerStatus);
+    return {
+      ok: false,
+      booked: false,
+      provider: "calendly",
+      providerStatus: providerStatus || undefined,
+      bookingUrl,
+      retryAvailability: slotOrValidationIssue,
+      fallbackRequired: true,
+      message: planBlocked
+        ? "Calendly direct Scheduling API booking is not available for this account/token. Do not claim the meeting is booked. Offer the Calendly booking link or arrange a human follow-up."
+        : context.checkOnly
+          ? "Live Calendly availability could not be loaded. Do not invent times; ask for another time window or use the booking-link fallback."
+          : "Calendly did not confirm the booking. Do not tell the lead it is booked. Re-check availability or use the Calendly booking-link fallback.",
+      error: clean(error?.message).slice(0, 500),
+    };
+  }
+
+  function isLikelyEmail(value) {
+    const email = clean(value);
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+  }
+
   async function elevenLabsRequest(endpoint, { method = "GET", body } = {}) {
     const apiKey = clean(process.env.ELEVENLABS_API_KEY);
     if (!apiKey) {
@@ -3706,20 +4198,30 @@ export function createTelnyxAIAgentService({
     const parts = [
       `You are the outbound AI sales assistant for ${company}.`,
       clean(config.disclosure),
-      "Be quick, warm, perceptive and natural. Prefer short replies, contractions, fragments and varied rhythm. Never claim to be human.",
+      "Sound like a relaxed, sharp person on a real phone call while remaining clearly an AI assistant. Never claim or imply that you are human.",
+      "Keep most turns to 4–14 spoken words. One thought, then at most one question. Go longer only when the prospect asks for detail.",
+      "Use contractions and plain words. Natural fragments are good. Tiny reactions such as 'yeah', 'right', 'gotcha', 'hmm', 'fair', or 'oh, okay' are fine when they genuinely fit, but do not add one every turn.",
+      "Do not use call-center filler like 'Absolutely', 'Certainly', 'Great question', 'Thank you for sharing', 'I completely understand', 'I'd be happy to', or 'Let me explain'.",
+      "Do not repeat or summarize what the prospect just said unless you need to confirm a critical detail. Mirror their vocabulary and energy instead.",
+      "Allow silence. Do not fill every pause. If interrupted, stop and respond to the interruption immediately.",
+      "A tiny self-correction such as 'well—actually' is okay rarely. Never manufacture laughter, hesitation, or emotion mechanically.",
       clean(config.persona),
       "The lead context below is private working context. Use it silently; never recite it, never say you were given notes, and never repeat the opening greeting after the call has started.",
-      "Lead: {{first_name}} | Company: {{company}} | Job title: {{job_title}} | Source: {{lead_source}} | Campaign: {{campaign}} | Timezone: {{timezone}}.",
+      "Lead: {{first_name}} | Email: {{lead_email}} | Company: {{company}} | Job title: {{job_title}} | Source: {{lead_source}} | Campaign: {{campaign}} | Timezone: {{timezone}}.",
       "CRM notes/history: {{crm_notes_history}}",
       "Pain points: {{pain_points}}",
       "Previous interactions: {{previous_interactions}}",
       "Available meeting slots: {{available_meeting_slots}}",
       "Private call context: {{private_context}}",
+      "Calendly booking page: {{calendly_url}}",
       clean(config.offer) ? `Offer: ${clean(config.offer)}` : "",
       clean(config.qualificationQuestions) ? `Qualification: ${clean(config.qualificationQuestions)}` : "",
       clean(config.objectionHandling) ? `Objections: ${clean(config.objectionHandling)}` : "",
-      "Do not call tools for information already present above. Use bookMeeting only after explicit date/time confirmation. Use checkCalendar only when availability is genuinely uncertain. Use getCriticalLiveData only for critical state that could have changed. Transfer to a human only when requested or clearly necessary.",
-      "Keep latency low: answer the current point first, usually in one or two short sentences. Allow interruptions and stop speaking when the lead cuts in.",
+      "CALENDAR FLOW: when the prospect is ready to schedule, use checkCalendar for live Calendly availability. Offer no more than three choices. After they choose, repeat the exact day/time once and get an explicit yes. Then call bookMeeting. Never say it is booked until bookMeeting returns booked=true.",
+      "If bookMeeting asks for an email, ask only for the best email for the calendar invite, then retry. If a slot disappears, react briefly and offer fresh availability without making a big deal of it.",
+      "A natural booking bridge can be 'Yeah, that works — give me a sec.' After success, say something short like 'Yep, you're set for Tuesday at two.' Vary the wording; do not read tool output aloud.",
+      "Do not call tools for information already present above. Use getCriticalLiveData only for critical state that could have changed. Transfer to a human only when requested or clearly necessary.",
+      "Keep latency low: answer the current point first. Do not preamble, narrate reasoning, or explain tool mechanics.",
     ];
     return parts.filter(Boolean).join("\n").slice(0, 12000);
   }
@@ -3750,10 +4252,13 @@ export function createTelnyxAIAgentService({
       clean(lead?.crmNotes),
       clean(queueItem?.customContext),
     ]).filter(Boolean);
+    const fullName = clean(
+      custom.contactName || lead?.contactName || lead?.name || queueItem?.leadName
+    );
     return {
-      firstName: firstNameOf(
-        custom.contactName || lead?.contactName || lead?.name || queueItem?.leadName
-      ),
+      fullName,
+      firstName: firstNameOf(fullName),
+      email: clean(custom.email || lead?.email || queueItem?.email),
       company: clean(custom.companyName || lead?.companyName || lead?.business || lead?.name),
       jobTitle: clean(custom.jobTitle || lead?.jobTitle || lead?.title || lead?.role),
       leadSource: clean(lead?.source || queueItem?.source || campaign?.source),
@@ -3775,6 +4280,8 @@ export function createTelnyxAIAgentService({
       queue_id: call.queueId || "",
       lead_id: call.leadId || "",
       first_name: clean(value.firstName),
+      greeting_name: clean(value.firstName) || "there",
+      lead_email: clean(value.email),
       company: clean(value.company),
       job_title: clean(value.jobTitle),
       lead_source: clean(value.leadSource),
@@ -3785,6 +4292,7 @@ export function createTelnyxAIAgentService({
       timezone: clean(value.timezone) || DEFAULT_LEAD_TIMEZONE,
       available_meeting_slots: JSON.stringify(value.availableMeetingSlots || []).slice(0, 4000),
       private_context: clean(value.privateContext).slice(0, 8000),
+      calendly_url: calendlyEventUrl(),
     };
   }
 
