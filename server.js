@@ -6126,7 +6126,22 @@ app.get(
     }
   }
 );
-
+app.get(
+  "/api/caller-queue/:id",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        callerQueueService.getAssignment(
+          req.user,
+          req.params.id
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 app.get(
   "/api/caller-queue/:id/history",
   requireAuth,
