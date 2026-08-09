@@ -24,7 +24,13 @@ export function createTelnyxCallService({
   }
 
   const apiKey = clean(process.env.TELNYX_API_KEY);
-  const connectionId = clean(process.env.TELNYX_CONNECTION_ID);
+  // This MUST be the ID of a Telnyx Credential Connection.
+  // It is not a Call Control Application ID, Voice API Application ID,
+  // outbound voice profile ID, or telephony credential ID.
+  const connectionId = clean(
+    process.env.TELNYX_CREDENTIAL_CONNECTION_ID ||
+      process.env.TELNYX_CONNECTION_ID
+  );
   const publicKey = clean(process.env.TELNYX_PUBLIC_KEY).replace(/\\n/g, "\n");
   const webhookBaseUrl = clean(process.env.TELNYX_WEBHOOK_BASE_URL).replace(/\/$/, "");
   const recordingEnabled = envFlag("TELNYX_RECORD_CALLS", true);
@@ -213,11 +219,17 @@ export function createTelnyxCallService({
         );
         const credential = response?.data || response || {};
 
+        const credentialConnectionId =
+          getCredentialConnectionId(credential);
+
         if (
-          credential.connection_id &&
-          String(credential.connection_id) !== String(connectionId)
+          credentialConnectionId &&
+          credentialConnectionId !== connectionId
         ) {
-          throw httpError(409, "The saved Telnyx credential belongs to a different connection.");
+          throw httpError(
+            409,
+            `The saved Telnyx credential belongs to connection ${credentialConnectionId}, not ${connectionId}.`
+          );
         }
 
         if (!existing.fromNumber) {
@@ -263,18 +275,53 @@ export function createTelnyxCallService({
     if (!autoProvision) {
       throw httpError(
         409,
-        "No ReachFly Dialer is assigned to this caller. Configure TELNYX_CALLER_CREDENTIALS_JSON or enable TELNYX_AUTO_PROVISION_CALLERS."
+        "No Telnyx dialer is assigned to this caller. Configure TELNYX_CALLER_CREDENTIALS_JSON or enable TELNYX_AUTO_PROVISION_CALLERS."
       );
     }
 
-    const created = await telnyxRequest("/telephony_credentials", {
-      method: "POST",
-      body: {
-        connection_id: connectionId,
-        name: `ReachFly ${user.name || user.email || user.id}`.slice(0, 128),
-        tag: `reachfly-${ctx.workspaceId}`.slice(0, 128),
-      },
-    });
+    // Fail with a useful message before attempting to create the
+    // per-caller credential. Telnyx only accepts an active Credential
+    // Connection ID for POST /telephony_credentials.
+    const connection = await getConnectionConfiguration();
+
+    if (connection.active === false) {
+      throw httpError(
+        409,
+        `Telnyx credential connection ${connectionId} is inactive.`
+      );
+    }
+
+    let created;
+
+    try {
+      created = await telnyxRequest("/telephony_credentials", {
+        method: "POST",
+        body: {
+          connection_id: connectionId,
+          name: `ReachFly ${user.name || user.email || user.id}`.slice(
+            0,
+            128
+          ),
+          tag: sanitizeTelnyxTag(`reachfly-${ctx.workspaceId}`),
+        },
+      });
+    } catch (error) {
+      if (Number(error?.statusCode) === 422) {
+        throw httpError(
+          422,
+          [
+            `Telnyx rejected credential creation for connection ${connectionId}.`,
+            error.message,
+            "Set TELNYX_CREDENTIAL_CONNECTION_ID to the ID shown under Voice > SIP Trunking > Credential Connections.",
+            "Do not use a Call Control Application ID, Voice API Application ID, outbound voice profile ID, or telephony credential ID.",
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+      }
+
+      throw error;
+    }
 
     const credential = created?.data || created;
     if (!credential?.id) {
@@ -469,6 +516,237 @@ export function createTelnyxCallService({
     });
     emitCall(updated, "call:updated");
     return { ok: true, call: publicCall(updated) };
+  }
+
+  async function hangupCall(user, callId) {
+    const accessible =
+      findAccessibleCall(
+        user,
+        callId
+      );
+
+    const status =
+      normalizeSdkState(
+        accessible.status
+      );
+
+    if (
+      [
+        "ended",
+        "completed",
+        "destroyed",
+        "hangup",
+        "failed",
+      ].includes(status)
+    ) {
+      return {
+        ok: true,
+        alreadyEnded: true,
+        commandSent: false,
+        call:
+          publicCall(
+            accessible
+          ),
+      };
+    }
+
+    const callControlId =
+      clean(
+        accessible.callControlId
+      );
+
+    if (!callControlId) {
+      throw httpError(
+        409,
+        "The Telnyx call-control ID is not available yet. The browser hangup is still the primary termination path."
+      );
+    }
+
+    await telnyxRequest(
+      `/calls/${encodeURIComponent(
+        callControlId
+      )}/actions/hangup`,
+      {
+        method: "POST",
+        body: {
+          command_id:
+            crypto.randomUUID(),
+        },
+      }
+    );
+
+    const updated =
+      mutateAccessibleCall(
+        user,
+        callId,
+        (call) => {
+          const now =
+            new Date().toISOString();
+
+          call.status =
+            "ending";
+
+          call.hangupRequestedAt =
+            now;
+
+          call.hangupRequestedBy =
+            user.id;
+
+          call.updatedAt =
+            now;
+
+          call.lastEventAt =
+            now;
+
+          pushEvent(
+            call,
+            "server.hangup_requested",
+            {
+              callControlId:
+                call.callControlId,
+            }
+          );
+        }
+      );
+
+    emitCall(
+      updated,
+      "call:updated"
+    );
+
+    return {
+      ok: true,
+      commandSent: true,
+      call:
+        publicCall(updated),
+    };
+  }
+
+  async function sendDtmf(
+    user,
+    callId,
+    input = {}
+  ) {
+    const accessible =
+      findAccessibleCall(
+        user,
+        callId
+      );
+
+    const digits =
+      clean(
+        input.digits ||
+          input.digit
+      );
+
+    if (
+      !digits ||
+      !/^[0-9A-D*#wW]+$/.test(
+        digits
+      )
+    ) {
+      throw httpError(
+        400,
+        "DTMF digits may contain only 0-9, A-D, *, #, w, or W."
+      );
+    }
+
+    const status =
+      normalizeSdkState(
+        accessible.status
+      );
+
+    if (
+      ![
+        "active",
+        "answered",
+        "held",
+        "recording",
+      ].includes(status)
+    ) {
+      throw httpError(
+        409,
+        "DTMF can only be sent after the call is answered."
+      );
+    }
+
+    const callControlId =
+      clean(
+        accessible.callControlId
+      );
+
+    if (!callControlId) {
+      throw httpError(
+        409,
+        "The Telnyx call-control ID is not available yet."
+      );
+    }
+
+    const durationMillis =
+      Math.min(
+        500,
+        Math.max(
+          100,
+          Number(
+            input.durationMillis ||
+              input.duration_millis ||
+              250
+          ) || 250
+        )
+      );
+
+    await telnyxRequest(
+      `/calls/${encodeURIComponent(
+        callControlId
+      )}/actions/send_dtmf`,
+      {
+        method: "POST",
+        body: {
+          digits,
+          duration_millis:
+            durationMillis,
+          command_id:
+            crypto.randomUUID(),
+        },
+      }
+    );
+
+    const updated =
+      mutateAccessibleCall(
+        user,
+        callId,
+        (call) => {
+          const now =
+            new Date().toISOString();
+
+          call.updatedAt =
+            now;
+
+          call.lastEventAt =
+            now;
+
+          pushEvent(
+            call,
+            "server.dtmf_sent",
+            {
+              digits,
+              durationMillis,
+            }
+          );
+        }
+      );
+
+    emitCall(
+      updated,
+      "call:updated"
+    );
+
+    return {
+      ok: true,
+      digits,
+      call:
+        publicCall(updated),
+    };
   }
 
   function completeCall(user, callId, input = {}) {
@@ -703,22 +981,62 @@ export function createTelnyxCallService({
 
   async function telnyxRequest(endpoint, { method = "GET", body } = {}) {
     assertConfigured();
+
     const response = await fetch(`${TELNYX_API_BASE}${endpoint}`, {
       method,
       headers: {
         Authorization: `Bearer ${apiKey}`,
         Accept: "application/json",
-        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(body !== undefined
+          ? { "Content-Type": "application/json" }
+          : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+
     const text = await response.text();
     let payload = null;
-    try { payload = text ? JSON.parse(text) : null; } catch { payload = text; }
-    if (!response.ok) {
-      const message = payload?.errors?.[0]?.detail || payload?.error || payload?.message || `Telnyx request failed (${response.status}).`;
-      throw httpError(response.status >= 500 ? 502 : response.status, message);
+
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
     }
+
+    if (!response.ok) {
+      const telnyxRequestId = clean(
+        response.headers.get("x-request-id") ||
+          response.headers.get("telnyx-request-id")
+      );
+      const message = extractTelnyxErrorMessage(payload, response.status);
+      const error = httpError(
+        response.status >= 500 ? 502 : response.status,
+        telnyxRequestId
+          ? `${message} Telnyx request ID: ${telnyxRequestId}.`
+          : message
+      );
+
+      error.code = extractTelnyxErrorCode(payload);
+      error.details = {
+        provider: "telnyx",
+        method,
+        endpoint,
+        telnyxRequestId,
+        errors: normalizeTelnyxErrors(payload),
+      };
+
+      console.error("[telnyx] api:error", {
+        method,
+        endpoint,
+        status: response.status,
+        telnyxRequestId,
+        message,
+        errors: error.details.errors,
+      });
+
+      throw error;
+    }
+
     return payload;
   }
 
@@ -902,13 +1220,36 @@ export function createTelnyxCallService({
   }
 
   async function getConnectionConfiguration() {
-    const response = await telnyxRequest(
-      `/credential_connections/${encodeURIComponent(connectionId)}`
-    );
+    let response;
+
+    try {
+      response = await telnyxRequest(
+        `/credential_connections/${encodeURIComponent(connectionId)}`
+      );
+    } catch (error) {
+      if ([404, 422].includes(Number(error?.statusCode))) {
+        throw httpError(
+          422,
+          [
+            `TELNYX_CREDENTIAL_CONNECTION_ID=${connectionId} is not a usable Telnyx Credential Connection.`,
+            error.message,
+            "Copy the ID from Voice > SIP Trunking > Credential Connections in the Telnyx portal.",
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+      }
+
+      throw error;
+    }
+
     const connection = response?.data || response || {};
 
     if (!connection.id) {
-      throw httpError(502, "Telnyx did not return the configured credential connection.");
+      throw httpError(
+        502,
+        "Telnyx did not return the configured credential connection."
+      );
     }
 
     return connection;
@@ -933,8 +1274,16 @@ export function createTelnyxCallService({
   }
 
   function assertConfigured() {
-    if (!apiKey) throw httpError(503, "TELNYX_API_KEY is not configured.");
-    if (!connectionId) throw httpError(503, "TELNYX_CONNECTION_ID is not configured.");
+    if (!apiKey) {
+      throw httpError(503, "TELNYX_API_KEY is not configured.");
+    }
+
+    if (!connectionId) {
+      throw httpError(
+        503,
+        "TELNYX_CREDENTIAL_CONNECTION_ID is not configured. TELNYX_CONNECTION_ID is accepted only as a legacy fallback."
+      );
+    }
   }
 
   return {
@@ -946,6 +1295,8 @@ export function createTelnyxCallService({
     createCall,
     linkCall,
     updateClientState,
+    hangupCall,
+    sendDtmf,
     completeCall,
     listCalls,
     getCall,
@@ -1058,6 +1409,99 @@ function extractLoginToken(payload) {
     payload?.data?.login_token ||
     payload?.login_token
   );
+}
+
+function getCredentialConnectionId(credential) {
+  const direct = clean(credential?.connection_id);
+  if (direct) return direct;
+
+  const resourceId = clean(credential?.resource_id);
+  const match = /^connection:(.+)$/i.exec(resourceId);
+  return clean(match?.[1]);
+}
+
+function sanitizeTelnyxTag(value) {
+  return clean(value)
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 128) || "reachfly";
+}
+
+function normalizeTelnyxErrors(payload) {
+  if (Array.isArray(payload?.errors)) {
+    return payload.errors.map((item) => ({
+      code: clean(item?.code),
+      title: clean(item?.title),
+      detail: clean(item?.detail),
+      pointer: clean(item?.source?.pointer),
+      parameter: clean(item?.source?.parameter),
+    }));
+  }
+
+  if (payload?.errors && typeof payload.errors === "object") {
+    return Object.entries(payload.errors).map(([key, value]) => ({
+      code: clean(key),
+      title: "",
+      detail:
+        typeof value === "string"
+          ? clean(value)
+          : clean(value?.detail || value?.message || JSON.stringify(value)),
+      pointer: "",
+      parameter: "",
+    }));
+  }
+
+  if (payload && typeof payload === "object") {
+    const detail = clean(
+      payload.detail || payload.message || payload.error || payload.title
+    );
+
+    return detail
+      ? [
+          {
+            code: clean(payload.code),
+            title: clean(payload.title),
+            detail,
+            pointer: clean(payload?.source?.pointer),
+            parameter: clean(payload?.source?.parameter),
+          },
+        ]
+      : [];
+  }
+
+  return typeof payload === "string" && clean(payload)
+    ? [
+        {
+          code: "",
+          title: "",
+          detail: clean(payload),
+          pointer: "",
+          parameter: "",
+        },
+      ]
+    : [];
+}
+
+function extractTelnyxErrorMessage(payload, status) {
+  const errors = normalizeTelnyxErrors(payload);
+  const messages = errors
+    .map((item) => {
+      const base = item.detail || item.title;
+      const location = item.pointer || item.parameter;
+      return [base, location ? `(${location})` : ""]
+        .filter(Boolean)
+        .join(" ");
+    })
+    .filter(Boolean);
+
+  return messages.length
+    ? `Telnyx request failed (${status}): ${messages.join("; ")}`
+    : `Telnyx request failed (${status}).`;
+}
+
+function extractTelnyxErrorCode(payload) {
+  return clean(normalizeTelnyxErrors(payload)[0]?.code);
 }
 
 function normalizeEmail(value) {
