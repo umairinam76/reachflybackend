@@ -22,6 +22,9 @@ const ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
 const DEFAULT_MODEL =
   process.env.ANTHROPIC_AUDIT_MODEL || "claude-sonnet-4-20250514";
+const AUDIT_ENGINE_REVISION = String(
+  process.env.AUDIT_ENGINE_REVISION || "reachfly-caller-audit-v3"
+).trim();
 
 const SOCIAL_HOSTS = new Set([
   "facebook.com",
@@ -136,6 +139,7 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       queueReport(user, {
         ...input,
         kind: "mini",
+        force: input.force === true,
         campaignType: normalizeCampaignType(
           input.campaignType ||
             input.auditKind ||
@@ -241,10 +245,13 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     // a built-in ReachFly default and manager uploads only change format/style.
 
 
-    const templateKey =
+    const templateIdentity =
       reportTemplate?.templateId ||
       reportTemplate?.id ||
       `${reportTemplate?.name || "default"}:${reportTemplate?.version ?? 0}`;
+    // Include the audit-engine revision so deploying a better default format
+    // cannot keep serving an older completed report from the previous schema.
+    const templateKey = `${AUDIT_ENGINE_REVISION}:${templateIdentity}`;
 
     const auditTarget = website || `gmb:${leadIdentity}`;
     const cacheKey = reportCacheKey(
@@ -509,20 +516,43 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
           : await inspectLeadWebsite(record);
       let report;
       let provider = "anthropic";
+      let providerError = "";
 
       try {
         report = await generateWithClaude(record, evidence);
+        auditLog("anthropic-success", {
+          id: record.id,
+          kind: record.kind,
+          model: DEFAULT_MODEL,
+          issueCount: getGeneratedFindingCount(record.kind, report),
+        });
       } catch (error) {
         provider = "deterministic-fallback";
+        providerError = error?.message || String(error);
+        auditLog("anthropic-fallback", {
+          id: record.id,
+          kind: record.kind,
+          model: DEFAULT_MODEL,
+          message: providerError,
+        });
         report = buildFallbackReport(record, evidence, error);
       }
 
+      const findingCount = getGeneratedFindingCount(record.kind, report);
+      const callerReady = record.kind !== "mini" || findingCount > 0;
+
       updateRecord(id, {
-        status: "complete",
+        // A Mini Audit with zero structured findings is not caller-ready.
+        // Keep it visible for diagnosis, but do not silently unlock calling.
+        status: callerReady ? "complete" : "failed",
         report,
         evidence,
         provider,
-        error: "",
+        providerError,
+        error: callerReady
+          ? ""
+          : providerError ||
+            "No structured Mini Audit findings were generated. Regenerate the audit.",
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
@@ -599,6 +629,28 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       if (target) Object.assign(target, changes);
     });
   }
+}
+
+function getGeneratedFindingCount(kind, report) {
+  if (!report || typeof report !== "object") return 0;
+
+  if (kind === "mini") {
+    return Array.isArray(report.issues) ? report.issues.length : 0;
+  }
+
+  if (["website", "gmb"].includes(kind)) {
+    return Array.isArray(report.findings) ? report.findings.length : 0;
+  }
+
+  if (kind === "competitor") {
+    return Array.isArray(report.competitiveGaps)
+      ? report.competitiveGaps.length
+      : 0;
+  }
+
+  return Array.isArray(report.priorityFindings)
+    ? report.priorityFindings.length
+    : 0;
 }
 
 function auditLog(event, data = {}) {
@@ -1726,6 +1778,7 @@ function publicReport(record, { includeEvidence = false } = {}) {
     brand: record.brand,
     report: record.report,
     provider: record.provider,
+    providerError: record.providerError || "",
     error: record.error,
     ...(includeEvidence ? { evidence: record.evidence } : {}),
   };
