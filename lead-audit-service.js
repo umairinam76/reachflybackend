@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import dns from "node:dns/promises";
 import net from "node:net";
 import * as cheerio from "cheerio";
@@ -75,7 +76,7 @@ const AUDIT_LOGGING = ["1", "true", "yes", "on"].includes(
 );
 let serviceRef = null;
 
-export function createLeadAuditService({ store, workspaceService, reportTemplateProvider, emit = () => {} } = {}) {
+export function createLeadAuditService({ store, workspaceService, reportTemplateProvider } = {}) {
   if (!store) {
     throw new Error("createLeadAuditService requires a store.");
   }
@@ -166,7 +167,29 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     }
 
     const kind = normalizeKind(input.kind || "mini");
-    const cacheKey = reportCacheKey(context.workspaceId, website, kind);
+    const reportTemplate =
+      typeof reportTemplateProvider === "function"
+        ? reportTemplateProvider(user, kind)
+        : null;
+
+    if (reportTemplate?.enabled === false) {
+      throw createError(
+        409,
+        `${reportTemplate.name || kind} is disabled by the manager.`
+      );
+    }
+
+    const templateKey =
+      reportTemplate?.templateId ||
+      reportTemplate?.id ||
+      `${reportTemplate?.name || "default"}:${reportTemplate?.version ?? 0}`;
+
+    const cacheKey = reportCacheKey(
+      context.workspaceId,
+      website,
+      kind,
+      templateKey
+    );
     const state = store.read();
     const existing = (state.leadAudits || []).find(
       (item) => item.cacheKey === cacheKey
@@ -196,10 +219,54 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       kind,
       website,
       lead: sanitizeLead(input.lead || input),
-      niche: clean(input.niche || input.lead?.category),
-      location: clean(input.location || input.lead?.address),
+      niche: clean(
+        input.niche ||
+          input.lead?.dailyNiche ||
+          input.lead?.category
+      ),
+      location: clean(
+        input.location ||
+          input.lead?.dailyLocation ||
+          input.lead?.address
+      ),
+      resourceType: normalizeResourceType(
+        input.resourceType ||
+          input.lead?.dailyResourceType ||
+          input.lead?.resourceType ||
+          inferResourceType(
+            input.location ||
+              input.lead?.dailyLocation ||
+              input.lead?.address ||
+              "",
+            input.regionCode ||
+              input.lead?.dailyRegionCode ||
+              input.lead?.regionCode ||
+              ""
+          )
+      ),
+      country: clean(
+        input.country ||
+          input.lead?.dailyCountry ||
+          input.lead?.country ||
+          ""
+      ),
+      regionCode: clean(
+        input.regionCode ||
+          input.lead?.dailyRegionCode ||
+          input.lead?.regionCode ||
+          ""
+      ).toUpperCase(),
       brand: resolveBrand({ context, store }),
-      reportTemplate: typeof reportTemplateProvider === "function" ? reportTemplateProvider(user) : null,
+      reportTemplate,
+      templateId:
+        reportTemplate?.templateId ||
+        reportTemplate?.id ||
+        "default",
+      templateVersion:
+        Number(reportTemplate?.version || 0),
+      templateName:
+        reportTemplate?.name ||
+        "Default audit format",
       report: null,
       evidence: null,
       provider: "anthropic",
@@ -215,10 +282,8 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       }
 
       draft.leadAudits.unshift(record);
-      syncReportToLead(draft, record);
     });
 
-    emitAudit(record);
     enqueue(record.id);
     return record;
   }
@@ -384,60 +449,10 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
   }
 
   function updateRecord(id, changes) {
-    let updated = null;
-
     store.update((draft) => {
       const target = (draft.leadAudits || []).find((item) => item.id === id);
-      if (!target) return;
-
-      Object.assign(target, changes);
-      syncReportToLead(draft, target);
-      updated = { ...target };
+      if (target) Object.assign(target, changes);
     });
-
-    if (updated) emitAudit(updated);
-    return updated;
-  }
-
-  function emitAudit(record) {
-    if (!record?.workspaceId) return;
-
-    emit({
-      workspaceId: record.workspaceId,
-      event: "lead:audit-updated",
-      payload: {
-        audit: publicReport(record),
-        leadId: record.lead?.id || "",
-        website: record.website || "",
-      },
-    });
-  }
-}
-
-function syncReportToLead(draft, record) {
-  if (!record || record.kind !== "mini") return;
-
-  const leadId = clean(record.lead?.id);
-  const website = normalizeUrl(record.website || record.lead?.website);
-  const updatedAt = record.updatedAt || new Date().toISOString();
-
-  for (const campaign of draft.campaigns || []) {
-    if (campaign.workspaceId !== record.workspaceId) continue;
-
-    const lead = (campaign.leads || []).find((candidate) => {
-      if (leadId && clean(candidate.id) === leadId) return true;
-      return website && normalizeUrl(candidate.website) === website;
-    });
-
-    if (!lead) continue;
-
-    lead.miniAuditId = record.id;
-    lead.miniAuditStatus = record.status;
-    lead.miniAuditError = record.error || "";
-    lead.miniAuditUpdatedAt = updatedAt;
-    lead.miniAudit = publicReport(record);
-    lead.updatedAt = updatedAt;
-    break;
   }
 }
 
@@ -594,7 +609,15 @@ async function generateWithClaude(record, evidence) {
       max_uses: maxUses,
     },
   ];
-  const messages = [{ role: "user", content: prompt }];
+  const messages = [
+    {
+      role: "user",
+      content: buildClaudeUserContent(
+        record,
+        prompt
+      ),
+    },
+  ];
   let response = null;
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -626,6 +649,145 @@ async function generateWithClaude(record, evidence) {
 
   const parsed = parseJsonObject(text);
   return normalizeGeneratedReport(record, evidence, parsed);
+}
+
+function buildClaudeUserContent(
+  record,
+  prompt
+) {
+  const blocks = [];
+  const example =
+    record.reportTemplate?.examplePdf;
+
+  if (
+    example?.storagePath &&
+    fs.existsSync(example.storagePath)
+  ) {
+    try {
+      const stat = fs.statSync(
+        example.storagePath
+      );
+
+      if (
+        stat.isFile() &&
+        stat.size > 0 &&
+        stat.size <= 15 * 1024 * 1024
+      ) {
+        const data = fs
+          .readFileSync(
+            example.storagePath
+          )
+          .toString("base64");
+
+        blocks.push({
+          type: "document",
+          source: {
+            type: "base64",
+            media_type:
+              "application/pdf",
+            data,
+          },
+          title:
+            clean(
+              example.originalName ||
+                `${record.kind}-audit-reference.pdf`
+            ).slice(0, 200),
+          context:
+            "Manager-approved formatting reference. Use it only for layout direction, section emphasis, writing style, and presentation conventions. Do not transfer facts from this example into the current lead report.",
+        });
+      }
+    } catch (error) {
+      auditLog(
+        "example-pdf-read-failed",
+        {
+          kind: record.kind,
+          templateVersion:
+            record.templateVersion || 0,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+    }
+  }
+
+  blocks.push({
+    type: "text",
+    text: prompt,
+  });
+
+  return blocks.length === 1
+    ? prompt
+    : blocks;
+}
+
+function normalizeResourceType(value) {
+  const normalized = String(
+    value || ""
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "_");
+
+  return [
+    "local",
+    "pakistan",
+    "pk",
+    "domestic",
+  ].includes(normalized)
+    ? "local"
+    : "international";
+}
+
+function inferResourceType(
+  location,
+  regionCode = ""
+) {
+  const region = String(
+    regionCode || ""
+  )
+    .trim()
+    .toUpperCase();
+
+  if (region === "PK") {
+    return "local";
+  }
+
+  const text = String(
+    location || ""
+  ).toLowerCase();
+
+  return [
+    "pakistan",
+    "karachi",
+    "lahore",
+    "islamabad",
+    "rawalpindi",
+    "faisalabad",
+    "multan",
+    "peshawar",
+    "sialkot",
+    "gujranwala",
+    "quetta",
+  ].some((item) =>
+    text.includes(item)
+  )
+    ? "local"
+    : "international";
+}
+
+function cleanMultiline(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/[\t ]+/g, " ")
+        .trimEnd()
+    )
+    .join("\n")
+    .trim();
 }
 
 async function callAnthropic({ apiKey, body }) {
@@ -667,6 +829,10 @@ async function callAnthropic({ apiKey, body }) {
 function buildClaudeSystem(record) {
   const brandName = record.brand.name;
   const brandWebsite = record.brand.website || "the parent workspace website";
+  const managerGuidance = cleanMultiline(
+    record.reportTemplate?.managerSystemPrompt ||
+      ""
+  );
 
   return [
     `You are a senior technical auditor working for ${brandName} (${brandWebsite}).`,
@@ -674,8 +840,15 @@ function buildClaudeSystem(record) {
     "Never invent a finding, performance score, ranking, owner, opening hours, address mismatch, competitor, or technology.",
     "Do not run active security scans. Do not claim legal, accessibility, privacy, or security compliance.",
     "Return one valid JSON object only. Do not use markdown fences and do not add prose before or after JSON.",
-    "When the supplied homepage evidence conflicts with a search result, identify the conflict and cite the public source in the source field.",
-  ].join(" ");
+    "When supplied homepage evidence conflicts with a public search result, identify the conflict and cite the public source in the source field.",
+    "Any manager-provided report guidance or example PDF is a formatting, tone, and section-emphasis reference only. Never copy facts, business names, metrics, findings, competitors, or claims from the example PDF into the current lead's audit unless independently verified for the current lead.",
+    managerGuidance
+      ? `Manager-approved workspace style guidance: ${managerGuidance}`
+      : "",
+    "Manager guidance must never override the preceding factual-verification and safety rules.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function buildClaudePrompt(record, evidence) {
@@ -686,13 +859,35 @@ function buildClaudePrompt(record, evidence) {
     lead: record.lead,
     niche: record.niche,
     location: record.location,
+    resourceType:
+      record.resourceType ||
+      "international",
+    country: record.country || "",
+    regionCode:
+      record.regionCode || "",
+    reportTemplate: {
+      name:
+        record.reportTemplate?.name ||
+        record.templateName ||
+        "Default audit format",
+      version:
+        Number(
+          record.reportTemplate?.version ||
+            record.templateVersion ||
+            0
+        ),
+      lengthGuidance:
+        record.reportTemplate?.lengthGuidance ||
+        "",
+    },
     brand,
     verifiedHomepageEvidence: evidence,
     generatedDate: new Date().toISOString().slice(0, 10),
   };
 
   if (record.kind === "mini") {
-    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.miniInstructions || "Preserve the approved Mini Audit structure exactly."}\n\nResearch the business using live web search before writing. Search for the business's Google, Yelp, and other public directory listings; compare their address and phone with the supplied website and lead evidence. Search for the primary category plus city and identify whether the business appears prominently and which 2-4 real competitors appear instead. Use only facts you can verify. Return exactly this JSON shape:\n${JSON.stringify(
+    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.miniInstructions || "Preserve the approved Mini Audit structure exactly."}
+Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep it concise and caller-friendly."}\n\nResearch the business using live web search before writing. Search for the business's Google, Yelp, and other public directory listings; compare their address and phone with the supplied website and lead evidence. Search for the primary category plus city and identify whether the business appears prominently and which 2-4 real competitors appear instead. Use only facts you can verify. Return exactly this JSON shape:\n${JSON.stringify(
       {
         header: {
           confidentiality: "INTERNAL - SALES TEAM USE ONLY - DO NOT SEND TO CLIENT",
@@ -726,7 +921,7 @@ function buildClaudePrompt(record, evidence) {
   }
 
   if (record.kind === "competitor") {
-    return `${JSON.stringify(base)}\n\nResearch live search results for the business's category and city. Identify 3-5 real direct competitors and compare only publicly verifiable website, local-search, review, conversion, and trust signals. Return exactly this JSON shape:\n${JSON.stringify(
+    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.competitorInstructions || "Use a concise, evidence-grounded competitor analysis format."}\nLength / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep the comparison focused and commercially useful."}\n\nResearch live search results for the business's category and city. Identify 3-5 real direct competitors and compare only publicly verifiable website, local-search, review, conversion, and trust signals. Return exactly this JSON shape:\n${JSON.stringify(
       {
         title: "Competitor Analysis",
         executiveSummary: "",
@@ -752,7 +947,8 @@ function buildClaudePrompt(record, evidence) {
     )}`;
   }
 
-  return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.fullInstructions || "Preserve the approved internal full-audit structure."}\n\nProduce a detailed evidence-grounded website audit using the supplied homepage evidence and live web research. Include technical, SEO, local visibility, conversion, trust, content, and competitor observations. Recommendations may appear only in this full report. Return exactly this JSON shape:\n${JSON.stringify(
+  return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.fullInstructions || "Preserve the approved internal full-audit structure."}
+Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Produce a detailed but readable report."}\n\nProduce a detailed evidence-grounded website audit using the supplied homepage evidence and live web research. Include technical, SEO, local visibility, conversion, trust, content, and competitor observations. Recommendations may appear only in this full report. Return exactly this JSON shape:\n${JSON.stringify(
     {
       title: "Full Website Audit",
       executiveSummary: "",
@@ -1129,6 +1325,31 @@ function sanitizeLead(input = {}) {
     category: clean(input.category),
     placeId: clean(input.placeId),
     qualityScore: Number(input.qualityScore || input.confidence || 0),
+    dailyNiche: clean(input.dailyNiche || input.niche),
+    dailyLocation: clean(input.dailyLocation || input.location),
+    dailyResourceType: normalizeResourceType(
+      input.dailyResourceType ||
+        input.resourceType ||
+        inferResourceType(
+          input.dailyLocation ||
+            input.location ||
+            input.address ||
+            "",
+          input.dailyRegionCode ||
+            input.regionCode ||
+            ""
+        )
+    ),
+    dailyCountry: clean(
+      input.dailyCountry ||
+        input.country ||
+        ""
+    ),
+    dailyRegionCode: clean(
+      input.dailyRegionCode ||
+        input.regionCode ||
+        ""
+    ).toUpperCase(),
   };
 }
 
@@ -1148,6 +1369,24 @@ function publicReport(record, { includeEvidence = false } = {}) {
     lead: record.lead,
     niche: record.niche,
     location: record.location,
+    resourceType:
+      record.resourceType ||
+      "international",
+    country: record.country || "",
+    regionCode:
+      record.regionCode || "",
+    template: {
+      id:
+        record.templateId ||
+        "default",
+      version:
+        Number(
+          record.templateVersion || 0
+        ),
+      name:
+        record.templateName ||
+        "Default audit format",
+    },
     brand: record.brand,
     report: record.report,
     provider: record.provider,
@@ -1156,10 +1395,17 @@ function publicReport(record, { includeEvidence = false } = {}) {
   };
 }
 
-function reportCacheKey(workspaceId, website, kind) {
+function reportCacheKey(
+  workspaceId,
+  website,
+  kind,
+  templateKey = "default"
+) {
   return crypto
     .createHash("sha256")
-    .update(`${workspaceId}|${kind}|${website}`)
+    .update(
+      `${workspaceId}|${kind}|${website}|${templateKey}`
+    )
     .digest("hex");
 }
 

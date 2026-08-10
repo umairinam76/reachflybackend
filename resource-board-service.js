@@ -476,8 +476,32 @@ export function createResourceBoardService({
       if (pool.length && !pool.includes(requestedPhone)) {
         throw httpError(
           400,
-          `${requestedPhone} is not included in TELNYX_FROM_NUMBERS.`
+          `${requestedPhone} is not included in the configured manual Telnyx caller-number pool.`
         );
+      }
+
+      /*
+       * Do not save a number just because it exists in ReachFly. It must also
+       * belong to the manual WebRTC Credential Connection in Telnyx. This
+       * prevents a SIP/AI number or a number on another connection from being
+       * assigned to a manual caller and then failing in the dialer.
+       */
+      if (
+        telnyxCallService?.validateManualCallerNumber
+      ) {
+        const validation =
+          await telnyxCallService
+            .validateManualCallerNumber(
+              requestedPhone
+            );
+
+        if (!validation?.ok) {
+          throw httpError(
+            409,
+            validation?.message ||
+              `${requestedPhone} is not available for the manual Telnyx dialer.`
+          );
+        }
       }
 
       const conflict = listWorkspaceCallers(initialState, ctx.workspaceId).find(
@@ -1281,20 +1305,55 @@ function buildPhonePool(state, workspaceId, callers) {
 }
 
 function configuredPhoneNumbers(state, workspaceId) {
+  const reserved =
+    new Set(
+      String(
+        process.env.TELNYX_RESERVED_FROM_NUMBERS ||
+          process.env.TELNYX_AI_PHONE_NUMBER ||
+          process.env.TELNYX_AI_AGENT_PHONE_NUMBER ||
+          process.env.ELEVENLABS_TELNYX_PHONE_NUMBER ||
+          ""
+      )
+        .split(",")
+        .map(normalizePhone)
+        .filter(Boolean)
+    );
+
   const values = String(
     process.env.TELNYX_FROM_NUMBERS || process.env.TELNYX_FROM_NUMBER || ""
   )
     .split(",")
     .map(normalizePhone)
-    .filter(Boolean);
+    .filter(
+      (number) =>
+        Boolean(number) &&
+        !reserved.has(number)
+    );
 
   for (const dialer of state.telnyxDialers || []) {
-    if (dialer.workspaceId === workspaceId && dialer.fromNumber) {
-      values.push(normalizePhone(dialer.fromNumber));
+    if (
+      dialer.workspaceId === workspaceId &&
+      dialer.fromNumber
+    ) {
+      const number =
+        normalizePhone(
+          dialer.fromNumber
+        );
+
+      if (
+        number &&
+        !reserved.has(number)
+      ) {
+        values.push(number);
+      }
     }
   }
 
-  return [...new Set(values.filter(Boolean))];
+  return [
+    ...new Set(
+      values.filter(Boolean)
+    ),
+  ];
 }
 
 function getResourceLimit(state, workspaceId, member) {

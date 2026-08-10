@@ -232,19 +232,71 @@ export function createTelnyxCallService({
           );
         }
 
-        if (!existing.fromNumber) {
-          const fromNumber = chooseFromNumber(user, state, ctx);
-          if (fromNumber) {
-            return saveDialer({
-              workspaceId: ctx.workspaceId,
-              user,
-              credentialId: existing.credentialId,
-              sipUsername: existing.sipUsername || credential.sip_username || "",
-              fromNumber,
-              callerIdName: existing.callerIdName || user.name || "ReachFly",
-              source: existing.source || "stored",
-            });
-          }
+        const preferredFromNumber =
+          chooseFromNumber(
+            user,
+            state,
+            ctx
+          );
+
+        /*
+         * Resource Board is authoritative for the caller's manual number.
+         * Older builds kept returning a previously saved dialer.fromNumber even
+         * after the manager changed the caller's number. Synchronize it here.
+         */
+        if (
+          preferredFromNumber &&
+          normalizePhone(
+            existing.fromNumber
+          ) !==
+            preferredFromNumber
+        ) {
+          return saveDialer({
+            workspaceId:
+              ctx.workspaceId,
+            user,
+            credentialId:
+              existing.credentialId,
+            sipUsername:
+              existing.sipUsername ||
+              credential.sip_username ||
+              "",
+            fromNumber:
+              preferredFromNumber,
+            callerIdName:
+              existing.callerIdName ||
+              user.name ||
+              "ReachFly",
+            source:
+              existing.source ||
+              "stored",
+          });
+        }
+
+        if (
+          !existing.fromNumber &&
+          preferredFromNumber
+        ) {
+          return saveDialer({
+            workspaceId:
+              ctx.workspaceId,
+            user,
+            credentialId:
+              existing.credentialId,
+            sipUsername:
+              existing.sipUsername ||
+              credential.sip_username ||
+              "",
+            fromNumber:
+              preferredFromNumber,
+            callerIdName:
+              existing.callerIdName ||
+              user.name ||
+              "ReachFly",
+            source:
+              existing.source ||
+              "stored",
+          });
         }
 
         return existing;
@@ -1050,22 +1102,102 @@ export function createTelnyxCallService({
     }
     return {
       credentialId: clean(value.credentialId || value.telephonyCredentialId),
-      fromNumber: normalizePhone(value.fromNumber || value.callerIdNumber) || chooseFromNumber(user, state, ctx),
+      // Manager/Resource Board assignment is authoritative over legacy env maps.
+      fromNumber:
+        chooseFromNumber(
+          user,
+          state,
+          ctx
+        ) ||
+        normalizePhone(
+          value.fromNumber ||
+            value.callerIdNumber
+        ),
       callerIdName: clean(value.callerIdName || user.name),
     };
   }
 
   function chooseFromNumber(user, state, ctx) {
-    const explicit = normalizePhone(user.telnyxFromNumber || user.dialerNumber || user.phoneNumber);
-    if (explicit) return explicit;
-    const numbers = String(process.env.TELNYX_FROM_NUMBERS || process.env.TELNYX_FROM_NUMBER || "")
-      .split(",")
-      .map(normalizePhone)
-      .filter(Boolean);
-    if (!numbers.length) return "";
-    const callers = listWorkspaceCallers(state, ctx.workspaceId);
-    const index = Math.max(0, callers.findIndex((item) => item.id === user.id));
-    return numbers[index % numbers.length];
+    /*
+     * Resource Board is authoritative. Resolve the freshest stored user instead
+     * of relying on the login/session snapshot so a manager's phone assignment
+     * takes effect immediately without forcing the caller to sign out/in.
+     *
+     * Only explicit manual-dialer fields are accepted here. user.phoneNumber
+     * may be the employee's personal/contact number and must never silently
+     * become the outbound PSTN caller ID.
+     */
+    const storedUser =
+      (state.users || []).find(
+        (item) =>
+          item.id === user.id
+      ) || user;
+
+    const reservedNumbers =
+      configuredReservedNumbers();
+
+    const explicit =
+      normalizePhone(
+        storedUser.telnyxFromNumber ||
+          storedUser.dialerNumber ||
+          storedUser.assignedPhoneNumber ||
+          user.telnyxFromNumber ||
+          user.dialerNumber ||
+          user.assignedPhoneNumber ||
+          ""
+      );
+
+    if (
+      explicit &&
+      !reservedNumbers.has(
+        explicit
+      )
+    ) {
+      return explicit;
+    }
+
+    if (
+      explicit &&
+      reservedNumbers.has(
+        explicit
+      )
+    ) {
+      console.warn(
+        `[telnyx] Ignoring reserved manual caller ID ${explicit} for user ${user.id}.`
+      );
+    }
+
+    const numbers =
+      configuredFromNumbers()
+        .filter(
+          (number) =>
+            !reservedNumbers.has(
+              number
+            )
+        );
+
+    if (!numbers.length) {
+      return "";
+    }
+
+    const callers =
+      listWorkspaceCallers(
+        state,
+        ctx.workspaceId
+      );
+
+    const index =
+      Math.max(
+        0,
+        callers.findIndex(
+          (item) =>
+            item.id === user.id
+        )
+      );
+
+    return numbers[
+      index % numbers.length
+    ];
   }
 
   function saveDialer({ workspaceId, user, credentialId, sipUsername = "", fromNumber = "", callerIdName = "", source }) {
@@ -1266,6 +1398,102 @@ export function createTelnyxCallService({
     return records.find((item) => normalizePhone(item.phone_number) === normalized) || records[0] || null;
   }
 
+  async function validateManualCallerNumber(number) {
+    assertConfigured();
+
+    const normalized =
+      normalizePhone(number);
+
+    if (!normalized) {
+      return {
+        ok: true,
+        number: "",
+        connectionId: "",
+        assignedConnectionId: "",
+      };
+    }
+
+    if (
+      configuredReservedNumbers().has(
+        normalized
+      )
+    ) {
+      return {
+        ok: false,
+        number: normalized,
+        connectionId,
+        assignedConnectionId: "",
+        message:
+          `${normalized} is reserved for another ReachFly voice channel and cannot be used by the manual caller dialer.`,
+      };
+    }
+
+    const phoneNumber =
+      await getPhoneNumberAssignment(
+        normalized
+      );
+
+    if (!phoneNumber) {
+      return {
+        ok: false,
+        number: normalized,
+        connectionId,
+        assignedConnectionId: "",
+        message:
+          `The Telnyx number ${normalized} was not found in this account.`,
+      };
+    }
+
+    const assignedConnectionId =
+      clean(
+        phoneNumber.connection_id
+      );
+
+    if (
+      assignedConnectionId !==
+      clean(connectionId)
+    ) {
+      return {
+        ok: false,
+        number: normalized,
+        connectionId:
+          clean(connectionId),
+        assignedConnectionId,
+        message:
+          assignedConnectionId
+            ? `${normalized} belongs to Telnyx connection ${assignedConnectionId}, not the manual caller credential connection ${connectionId}. Choose a manual-calling number instead.`
+            : `${normalized} is not assigned to the manual caller credential connection ${connectionId}.`,
+      };
+    }
+
+    return {
+      ok: true,
+      number: normalized,
+      connectionId:
+        clean(connectionId),
+      assignedConnectionId,
+      status:
+        clean(
+          phoneNumber.status
+        ),
+    };
+  }
+
+  function configuredReservedNumbers() {
+    return new Set(
+      String(
+        process.env.TELNYX_RESERVED_FROM_NUMBERS ||
+          process.env.TELNYX_AI_PHONE_NUMBER ||
+          process.env.TELNYX_AI_AGENT_PHONE_NUMBER ||
+          process.env.ELEVENLABS_TELNYX_PHONE_NUMBER ||
+          ""
+      )
+        .split(",")
+        .map(normalizePhone)
+        .filter(Boolean)
+    );
+  }
+
   function configuredFromNumbers() {
     return String(process.env.TELNYX_FROM_NUMBERS || process.env.TELNYX_FROM_NUMBER || "")
       .split(",")
@@ -1290,6 +1518,7 @@ export function createTelnyxCallService({
     diagnostics,
     getBrowserSession,
     ensureCallerDialer,
+    validateManualCallerNumber,
     listDialers,
     provisionAllCallers,
     createCall,

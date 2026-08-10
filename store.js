@@ -6,9 +6,8 @@ const defaultState = {
   workspaces: [],
   workspaceMembers: [],
   workspaceInvites: [],
-  campaigns: [],
 
-  // Canonical operational collections.
+  campaigns: [],
   salesAssignments: [],
   calls: [],
   attendanceRecords: [],
@@ -26,15 +25,16 @@ const defaultState = {
   internalCalls: [],
 
   dailyLeadRuns: [],
-  telnyxDialers: [],
-  telnyxWebhookEvents: [],
-
   notifications: [],
   inbox: [],
+  activity: [],
 
-  // Kept for one-way migration from older builds.
+  // Temporary compatibility collections for older builds.
   leadAssignments: [],
   callRecords: [],
+
+  workspaceSettings: {},
+  workspaceWhatsApp: {},
 
   settings: {
     app: {
@@ -63,8 +63,6 @@ const defaultState = {
     mode: "demo",
     message: "WhatsApp not linked.",
   },
-
-  activity: [],
 };
 
 export function createStore({ dataDir = "./data" } = {}) {
@@ -77,33 +75,56 @@ export function createStore({ dataDir = "./data" } = {}) {
     writeJson(filePath, structuredClone(defaultState));
   }
 
+  /*
+   * Production performance note:
+   * Older ReachFly builds synchronously read + parsed the complete JSON store
+   * on every store.read() and again before every store.update(). Once daily
+   * queues and audit reports became large, a simple caller-queue refresh or
+   * outcome update could spend seconds repeatedly parsing the same file.
+   *
+   * Keep one authoritative in-process state for this Node process and preserve
+   * the existing atomic synchronous write on every mutation. This removes the
+   * repeated disk read/parse cost without weakening mutation durability.
+   */
+  let currentState = loadJson(filePath);
+
   function read() {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
-      return mergeState(parsed);
-    } catch (error) {
-      console.error("[store] read failed; restoring defaults", error);
-      const restored = structuredClone(defaultState);
-      writeJson(filePath, restored);
-      return restored;
-    }
+    return currentState;
   }
 
   function write(next) {
-    const normalized = mergeState(next);
-    writeJson(filePath, normalized);
-    return normalized;
+    currentState = mergeState(next);
+    writeJson(filePath, currentState);
+    return currentState;
   }
 
   function update(mutator) {
-    const state = read();
-    const next = mutator(state) || state;
-    return write(next);
+    const next = mutator(currentState) || currentState;
+
+    if (next !== currentState) {
+      currentState = mergeState(next);
+    }
+
+    writeJson(filePath, currentState);
+    return currentState;
   }
 
-  function addActivity(title, sub, icon = "🎯", extra = {}) {
+  function reload() {
+    currentState = loadJson(filePath);
+    return currentState;
+  }
+
+  function addActivity(
+    title,
+    sub,
+    icon = "🎯",
+    extra = {}
+  ) {
     update((state) => {
-      state.activity = Array.isArray(state.activity) ? state.activity : [];
+      state.activity = Array.isArray(state.activity)
+        ? state.activity
+        : [];
+
       state.activity.unshift({
         id: uid("act"),
         title,
@@ -113,11 +134,19 @@ export function createStore({ dataDir = "./data" } = {}) {
         createdAt: new Date().toISOString(),
         ...extra,
       });
+
       state.activity = state.activity.slice(0, 500);
     });
   }
 
-  return { filePath, read, write, update, addActivity };
+  return {
+    filePath,
+    read,
+    write,
+    update,
+    reload,
+    addActivity,
+  };
 }
 
 export function uid(prefix = "id") {
@@ -127,44 +156,115 @@ export function uid(prefix = "id") {
 }
 
 function mergeState(value) {
-  const source = value && typeof value === "object" ? value : {};
+  const source =
+    value && typeof value === "object" ? value : {};
+
   const next = {
     ...structuredClone(defaultState),
     ...source,
+
     settings: {
       ...defaultState.settings,
       ...(source.settings || {}),
+
       app: {
         ...defaultState.settings.app,
         ...(source.settings?.app || {}),
       },
+
       email: {
         ...defaultState.settings.email,
         ...(source.settings?.email || {}),
       },
     },
+
+    workspaceSettings:
+      source.workspaceSettings &&
+      typeof source.workspaceSettings === "object"
+        ? source.workspaceSettings
+        : {},
+
+    workspaceWhatsApp:
+      source.workspaceWhatsApp &&
+      typeof source.workspaceWhatsApp === "object"
+        ? source.workspaceWhatsApp
+        : {},
   };
 
   for (const [key, fallback] of Object.entries(defaultState)) {
     if (Array.isArray(fallback)) {
-      next[key] = Array.isArray(source[key]) ? source[key] : [];
+      next[key] = Array.isArray(source[key])
+        ? source[key]
+        : [];
     }
   }
 
-  // One-time compatibility migration. New code writes only canonical names.
-  if (!next.salesAssignments.length && Array.isArray(source.leadAssignments)) {
-    next.salesAssignments = structuredClone(source.leadAssignments);
+  // One-way migration from older collection names.
+  if (
+    next.salesAssignments.length === 0 &&
+    Array.isArray(source.leadAssignments) &&
+    source.leadAssignments.length
+  ) {
+    next.salesAssignments = structuredClone(
+      source.leadAssignments
+    );
   }
 
-  if (!next.calls.length && Array.isArray(source.callRecords)) {
+  if (
+    next.calls.length === 0 &&
+    Array.isArray(source.callRecords) &&
+    source.callRecords.length
+  ) {
     next.calls = structuredClone(source.callRecords);
   }
 
   return next;
 }
 
+function loadJson(filePath) {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(filePath, "utf8")
+    );
+
+    return mergeState(parsed);
+  } catch (error) {
+    console.error(
+      "[store] read failed; restoring defaults",
+      error
+    );
+
+    const restored =
+      structuredClone(defaultState);
+
+    writeJson(filePath, restored);
+    return restored;
+  }
+}
+
 function writeJson(filePath, data) {
   const temporaryPath = `${filePath}.tmp`;
-  fs.writeFileSync(temporaryPath, JSON.stringify(data, null, 2));
-  fs.renameSync(temporaryPath, filePath);
+
+  /*
+   * Compact JSON is intentional in production. Pretty-printing a large state
+   * file roughly doubles/triples the number of bytes written for every call
+   * outcome, task update and queue mutation.
+   */
+  const pretty =
+    String(
+      process.env.STORE_PRETTY_JSON || ""
+    ).trim().toLowerCase() === "true";
+
+  fs.writeFileSync(
+    temporaryPath,
+    pretty
+      ? JSON.stringify(data, null, 2)
+      : JSON.stringify(data),
+    "utf8"
+  );
+
+  fs.renameSync(
+    temporaryPath,
+    filePath
+  );
 }

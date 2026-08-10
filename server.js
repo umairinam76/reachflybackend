@@ -16,6 +16,7 @@ import { createWorkspaceService } from "./workspace-service.js";
 import { createAuditService } from "./audit-service.js";
 import { createAuditJobService } from "./audit-job-service.js";
 import { createLeadAuditService } from "./lead-audit-service.js";
+import { createAuditTemplateService } from "./audit-template-service.js";
 import { createSalesOperationsService } from "./sales-operations-service.js";
 import { createAttendanceService } from "./attendance-service.js";
 import {
@@ -847,6 +848,22 @@ const salesOperationsService =
     workspaceService,
   });
 
+const auditTemplateService =
+  createAuditTemplateService({
+    store,
+    workspaceService,
+    dataDir: DATA_DIR,
+    legacyTemplateProvider: (user) =>
+      salesOperationsService.getReportTemplate(user),
+    emit({ workspaceId, event, payload }) {
+      emitToWorkspace(
+        workspaceId,
+        event,
+        payload
+      );
+    },
+  });
+
 const attendanceService =
   createAttendanceService({
     store,
@@ -891,8 +908,11 @@ const leadAuditService =
   createLeadAuditService({
     store,
     workspaceService,
-    reportTemplateProvider: (user) =>
-      salesOperationsService.getReportTemplate(user),
+    reportTemplateProvider: (user, kind) =>
+      auditTemplateService.getActiveTemplateForAudit(
+        user,
+        kind
+      ),
   });
 
 const callerQueueService =
@@ -937,6 +957,70 @@ const ai = createReachFlyAI({
   campaigns,
   workspaceService,
 });
+const AUDIT_TEMPLATE_EXAMPLE_MAX_BYTES = Math.max(
+  1024,
+  Number(
+    process.env.AUDIT_TEMPLATE_EXAMPLE_MAX_BYTES ||
+      15 * 1024 * 1024
+  )
+);
+
+const auditTemplateExampleUpload = multer({
+  storage: multer.diskStorage({
+    destination(_req, _file, callback) {
+      callback(
+        null,
+        auditTemplateService.templateDirectory
+      );
+    },
+
+    filename(_req, file, callback) {
+      const originalExtension = path.extname(
+        file.originalname || ""
+      );
+      const extension =
+        originalExtension.toLowerCase() === ".pdf"
+          ? ".pdf"
+          : ".pdf";
+
+      callback(
+        null,
+        `${crypto.randomUUID()}${extension}`
+      );
+    },
+  }),
+
+  limits: {
+    fileSize:
+      AUDIT_TEMPLATE_EXAMPLE_MAX_BYTES,
+    files: 1,
+  },
+
+  fileFilter(_req, file, callback) {
+    const mimeType = String(
+      file.mimetype || ""
+    ).toLowerCase();
+
+    const extension = path.extname(
+      file.originalname || ""
+    ).toLowerCase();
+
+    if (
+      mimeType !== "application/pdf" ||
+      extension !== ".pdf"
+    ) {
+      const error = new Error(
+        "Only PDF example reports are supported."
+      );
+      error.statusCode = 415;
+      callback(error);
+      return;
+    }
+
+    callback(null, true);
+  },
+});
+
 const TEAM_UPLOAD_DIR = path.resolve(
   DATA_DIR,
   "team-attachments"
@@ -6094,6 +6178,39 @@ app.post(
 );
 
 app.get(
+  "/api/daily-leads/my-day",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        dailyLeadAutomationService.myDay(
+          req.user
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/daily-leads/my-day/submit",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        dailyLeadAutomationService.submitMyDay(
+          req.user,
+          req.body || {}
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.get(
   "/api/caller-queue",
   requireAuth,
   (req, res, next) => {
@@ -6400,6 +6517,33 @@ app.patch(
   requireAuth,
   asyncRoute(async (req, res) => {
     res.json(telnyxCallService.updateClientState(req.user, req.params.id, req.body || {}));
+  })
+);
+
+app.post(
+  "/api/telnyx/calls/:id/end",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxCallService.hangupCall(
+        req.user,
+        req.params.id
+      )
+    );
+  })
+);
+
+app.post(
+  "/api/telnyx/calls/:id/dtmf",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await telnyxCallService.sendDtmf(
+        req.user,
+        req.params.id,
+        req.body || {}
+      )
+    );
   })
 );
 
@@ -6748,6 +6892,157 @@ app.put("/api/sales/report-template", requireAuth, (req, res, next) => {
   try { res.json(salesOperationsService.updateReportTemplate(req.user, req.body || {})); }
   catch (error) { next(error); }
 });
+
+/* ==========================================================
+   Manager Audit Studio
+   ========================================================== */
+
+app.get(
+  "/api/audit-studio",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        auditTemplateService.getStudio(
+          req.user
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.put(
+  "/api/audit-studio/settings",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        auditTemplateService.saveStudioSettings(
+          req.user,
+          req.body || {}
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.put(
+  "/api/audit-studio/templates/:kind",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        auditTemplateService.saveTemplate(
+          req.user,
+          req.params.kind,
+          req.body || {}
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/audit-studio/templates/:kind/example",
+  requireAuth,
+  auditTemplateExampleUpload.single("file"),
+  (req, res, next) => {
+    try {
+      if (!req.file) {
+        const error = new Error(
+          "Select a PDF example report to upload."
+        );
+        error.statusCode = 400;
+        throw error;
+      }
+
+      res.status(201).json(
+        auditTemplateService.attachExamplePdf(
+          req.user,
+          req.params.kind,
+          req.file,
+          req.body || {}
+        )
+      );
+    } catch (error) {
+      if (req.file?.path) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {
+          // Ignore cleanup errors; the request error remains authoritative.
+        }
+      }
+      next(error);
+    }
+  }
+);
+
+app.get(
+  "/api/audit-studio/templates/:kind/example",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      const file =
+        auditTemplateService.getExampleFile(
+          req.user,
+          req.params.kind
+        );
+
+      res.setHeader(
+        "Content-Type",
+        file.mimeType ||
+          "application/pdf"
+      );
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${String(
+          file.filename ||
+            "audit-example.pdf"
+        ).replace(/["\r\n]/g, "")}"`
+      );
+
+      if (file.size > 0) {
+        res.setHeader(
+          "Content-Length",
+          String(file.size)
+        );
+      }
+
+      const stream =
+        fs.createReadStream(
+          file.path
+        );
+      stream.on("error", next);
+      stream.pipe(res);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/audit-studio/templates/:kind/restore/:version",
+  requireAuth,
+  (req, res, next) => {
+    try {
+      res.json(
+        auditTemplateService.restoreVersion(
+          req.user,
+          req.params.kind,
+          req.params.version
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 /* ==========================================================
    Role-aware team, sender, dialer and owner control routes
@@ -7777,7 +8072,7 @@ function clampInteger(
   );
 }
 
-startDailyLeadScheduler();
+dailyLeadAutomationService.startScheduler();
 
 
 const io = new SocketIOServer(
@@ -8981,9 +9276,9 @@ httpServer.on("error", (error) => {
 
 
 process.once("SIGINT", () => {
-  stopDailyLeadScheduler();
+  dailyLeadAutomationService.stop();
 });
 
 process.once("SIGTERM", () => {
-  stopDailyLeadScheduler();
+  dailyLeadAutomationService.stop();
 });

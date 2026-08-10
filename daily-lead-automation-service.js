@@ -144,6 +144,12 @@ const DEFAULT_LOCATIONS =
       "California,Texas,Florida,New York"
   );
 
+const DEFAULT_LOCAL_PAKISTAN_LOCATIONS =
+  parseCsv(
+    process.env.DAILY_LEAD_LOCAL_PAKISTAN_LOCATIONS ||
+      "Karachi,Lahore,Islamabad,Rawalpindi,Faisalabad,Multan,Peshawar,Sialkot,Gujranwala"
+  );
+
 const DEFAULT_REGION_CODE =
   String(
     process.env.DAILY_LEAD_REGION_CODE ||
@@ -286,6 +292,14 @@ export function createDailyLeadAutomationService({
         stored.locations.length
           ? stored.locations
           : DEFAULT_LOCATIONS,
+
+      localPakistanLocations:
+        Array.isArray(
+          stored.localPakistanLocations
+        ) &&
+        stored.localPakistanLocations.length
+          ? stored.localPakistanLocations
+          : DEFAULT_LOCAL_PAKISTAN_LOCATIONS,
 
       regionCode:
         stored.regionCode ||
@@ -512,11 +526,29 @@ export function createDailyLeadAutomationService({
               currentNiche:
                 dayStats.niche ||
                 "",
+              currentResourceType:
+                dayStats.resourceType ||
+                "",
+              currentLocation:
+                dayStats.location ||
+                "",
+              currentCountry:
+                dayStats.country ||
+                "",
               nextNiche:
                 plan.niche ||
                 "",
+              nextResourceType:
+                plan.resourceType ||
+                "international",
               nextLocation:
                 plan.location ||
+                "",
+              nextCountry:
+                plan.country ||
+                "",
+              nextRegionCode:
+                plan.regionCode ||
                 "",
               assignedToday:
                 dayStats.assigned,
@@ -653,11 +685,29 @@ export function createDailyLeadAutomationService({
       currentNiche:
         stats.niche ||
         "",
+      currentResourceType:
+        stats.resourceType ||
+        "",
+      currentLocation:
+        stats.location ||
+        "",
+      currentCountry:
+        stats.country ||
+        "",
       nextNiche:
         plan.niche ||
         "",
+      nextResourceType:
+        plan.resourceType ||
+        "international",
       nextLocation:
         plan.location ||
+        "",
+      nextCountry:
+        plan.country ||
+        "",
+      nextRegionCode:
+        plan.regionCode ||
         "",
       assigned:
         stats.assigned,
@@ -1414,6 +1464,13 @@ export function createDailyLeadAutomationService({
                 plan.location
                   ? [plan.location]
                   : config.locations,
+              regionCodeOverride:
+                plan.regionCode ||
+                config.regionCode,
+              resourceType:
+                plan.resourceType,
+              country:
+                plan.country,
             });
 
           generatedCount +=
@@ -2014,9 +2071,42 @@ export function createDailyLeadAutomationService({
 
             location:
               campaign.location ||
+              lead.dailyLocation ||
               lead.location ||
               lead.address ||
               "",
+
+            resourceType:
+              normalizeResourceType(
+                lead.dailyResourceType ||
+                  campaign.resourceType ||
+                  inferResourceTypeFromLocation(
+                    campaign.location ||
+                      lead.location ||
+                      lead.address ||
+                      "",
+                    campaign.regionCode ||
+                      lead.dailyRegionCode ||
+                      lead.regionCode ||
+                      ""
+                  )
+              ),
+
+            country:
+              lead.dailyCountry ||
+              campaign.country ||
+              lead.country ||
+              "",
+
+            regionCode:
+              String(
+                lead.dailyRegionCode ||
+                  campaign.regionCode ||
+                  lead.regionCode ||
+                  ""
+              )
+                .trim()
+                .toUpperCase(),
 
             previousAssigneeId:
               assignedTo ||
@@ -2108,6 +2198,39 @@ export function createDailyLeadAutomationService({
               lead.location ||
               lead.address ||
               "",
+
+            resourceType:
+              normalizeResourceType(
+                lead.dailyResourceType ||
+                  campaign.resourceType ||
+                  inferResourceTypeFromLocation(
+                    campaign.location ||
+                      lead.dailyLocation ||
+                      lead.location ||
+                      lead.address ||
+                      "",
+                    lead.dailyRegionCode ||
+                      campaign.regionCode ||
+                      lead.regionCode ||
+                      ""
+                  )
+              ),
+
+            country:
+              lead.dailyCountry ||
+              campaign.country ||
+              lead.country ||
+              "",
+
+            regionCode:
+              String(
+                lead.dailyRegionCode ||
+                  campaign.regionCode ||
+                  lead.regionCode ||
+                  ""
+              )
+                .trim()
+                .toUpperCase(),
 
             previousAssigneeId:
               assignedTo ||
@@ -2252,6 +2375,9 @@ export function createDailyLeadAutomationService({
     runId,
     nichesOverride = null,
     locationsOverride = null,
+    regionCodeOverride = "",
+    resourceType = "international",
+    country = "",
   }) {
     const niches =
       normalizeStringArray(
@@ -2323,7 +2449,13 @@ export function createDailyLeadAutomationService({
           qualityLevel:
             config.qualityLevel,
           regionCode:
-            config.regionCode,
+            String(
+              regionCodeOverride ||
+                config.regionCode ||
+                ""
+            )
+              .trim()
+              .toUpperCase(),
           exact: false,
         });
 
@@ -2343,6 +2475,16 @@ export function createDailyLeadAutomationService({
           leads,
           existingKeys,
           runId,
+          resourceType,
+          country,
+          regionCode:
+            String(
+              regionCodeOverride ||
+                config.regionCode ||
+                ""
+            )
+              .trim()
+              .toUpperCase(),
         });
 
       generated.push(
@@ -2392,6 +2534,9 @@ export function createDailyLeadAutomationService({
     leads,
     existingKeys,
     runId,
+    resourceType = "international",
+    country = "",
+    regionCode = "",
   }) {
     const now =
       new Date().toISOString();
@@ -2435,6 +2580,31 @@ export function createDailyLeadAutomationService({
         key
       );
 
+      normalizedLead.dailyResourceType =
+        normalizeResourceType(
+          resourceType
+        );
+      normalizedLead.dailyCountry =
+        cleanMarketValue(
+          country ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "Pakistan"
+              : "")
+        );
+      normalizedLead.dailyRegionCode =
+        String(
+          regionCode ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "PK"
+              : "")
+        )
+          .trim()
+          .toUpperCase();
+
       accepted.push(
         normalizedLead
       );
@@ -2470,6 +2640,30 @@ export function createDailyLeadAutomationService({
 
       niche,
       location,
+      resourceType:
+        normalizeResourceType(
+          resourceType
+        ),
+      country:
+        cleanMarketValue(
+          country ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "Pakistan"
+              : "")
+        ),
+      regionCode:
+        String(
+          regionCode ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "PK"
+              : "")
+        )
+          .trim()
+          .toUpperCase(),
 
       source:
         "automatic-google-places",
@@ -2526,6 +2720,12 @@ export function createDailyLeadAutomationService({
           "generated-google-places",
         niche,
         location,
+        resourceType:
+          campaign.resourceType,
+        country:
+          campaign.country,
+        regionCode:
+          campaign.regionCode,
         previousAssigneeId:
           "",
         priority:
@@ -2587,6 +2787,26 @@ export function createDailyLeadAutomationService({
         ...candidate,
         assignedTo:
           caller.id,
+        niche:
+          plan.niche ||
+          candidate.niche ||
+          "",
+        location:
+          plan.location ||
+          candidate.location ||
+          "",
+        resourceType:
+          plan.resourceType ||
+          candidate.resourceType ||
+          "international",
+        country:
+          plan.country ||
+          candidate.country ||
+          "",
+        regionCode:
+          plan.regionCode ||
+          candidate.regionCode ||
+          "",
       });
     }
 
@@ -2746,6 +2966,38 @@ export function createDailyLeadAutomationService({
           lead.location ||
           "";
 
+        lead.dailyResourceType =
+          normalizeResourceType(
+            plan.resourceType ||
+              candidate.resourceType ||
+              campaign.resourceType ||
+              "international"
+          );
+
+        lead.dailyCountry =
+          cleanMarketValue(
+            plan.country ||
+              candidate.country ||
+              campaign.country ||
+              (lead.dailyResourceType ===
+              "local"
+                ? "Pakistan"
+                : "")
+          );
+
+        lead.dailyRegionCode =
+          String(
+            plan.regionCode ||
+              candidate.regionCode ||
+              campaign.regionCode ||
+              (lead.dailyResourceType ===
+              "local"
+                ? "PK"
+                : "")
+          )
+            .trim()
+            .toUpperCase();
+
         lead.queueStatus =
           "current";
 
@@ -2794,6 +3046,18 @@ export function createDailyLeadAutomationService({
 
           location:
             lead.dailyLocation ||
+            "",
+
+          resourceType:
+            lead.dailyResourceType ||
+            "international",
+
+          country:
+            lead.dailyCountry ||
+            "",
+
+          regionCode:
+            lead.dailyRegionCode ||
             "",
 
           createdAt:
@@ -2847,6 +3111,18 @@ export function createDailyLeadAutomationService({
 
           location:
             lead.dailyLocation ||
+            "",
+
+          resourceType:
+            lead.dailyResourceType ||
+            "international",
+
+          country:
+            lead.dailyCountry ||
+            "",
+
+          regionCode:
+            lead.dailyRegionCode ||
             "",
 
           status:
@@ -2942,6 +3218,18 @@ export function createDailyLeadAutomationService({
             lead.dailyLocation ||
             "",
 
+          resourceType:
+            lead.dailyResourceType ||
+            "international",
+
+          country:
+            lead.dailyCountry ||
+            "",
+
+          regionCode:
+            lead.dailyRegionCode ||
+            "",
+
           dueAt:
             lead.nextActionAt ||
             now,
@@ -3025,6 +3313,40 @@ export function createDailyLeadAutomationService({
                 ?.business ||
               reference.lead
                 ?.name ||
+              "",
+
+            niche:
+              reference.niche ||
+              reference.lead
+                ?.dailyNiche ||
+              reference.lead
+                ?.category ||
+              "",
+
+            location:
+              reference.location ||
+              reference.lead
+                ?.dailyLocation ||
+              reference.lead
+                ?.address ||
+              "",
+
+            resourceType:
+              reference.resourceType ||
+              reference.lead
+                ?.dailyResourceType ||
+              "international",
+
+            country:
+              reference.country ||
+              reference.lead
+                ?.dailyCountry ||
+              "",
+
+            regionCode:
+              reference.regionCode ||
+              reference.lead
+                ?.dailyRegionCode ||
               "",
 
             automatic:
@@ -4059,6 +4381,37 @@ function resolveCallerPlan(
         ]
       : "";
 
+  const resourceType =
+    normalizeResourceType(
+      stored.resourceType ||
+        "international"
+    );
+
+  const localLocations =
+    config.localPakistanLocations?.length
+      ? config.localPakistanLocations
+      : DEFAULT_LOCAL_PAKISTAN_LOCATIONS;
+
+  const automaticPakistanLocation =
+    localLocations.length
+      ? localLocations[
+          index % localLocations.length
+        ]
+      : "Pakistan";
+
+  const location =
+    resourceType === "local"
+      ? String(
+          stored.location ||
+            automaticPakistanLocation ||
+            "Pakistan"
+        ).trim()
+      : String(
+          stored.location ||
+            fallbackLocation ||
+            ""
+        ).trim();
+
   return {
     niche:
       String(
@@ -4066,12 +4419,25 @@ function resolveCallerPlan(
         fallbackNiche ||
         ""
       ).trim(),
-    location:
-      String(
-        stored.location ||
-        fallbackLocation ||
-        ""
-      ).trim(),
+    resourceType,
+    location,
+    country:
+      resourceType === "local"
+        ? "Pakistan"
+        : cleanMarketValue(
+            stored.country ||
+              ""
+          ),
+    regionCode:
+      resourceType === "local"
+        ? "PK"
+        : String(
+            stored.regionCode ||
+              config.regionCode ||
+              "US"
+          )
+            .trim()
+            .toUpperCase(),
   };
 }
 
@@ -4106,15 +4472,127 @@ function normalizeCallerPlans(
           plan?.niche ||
           ""
         ).trim(),
+      resourceType:
+        normalizeResourceType(
+          plan?.resourceType ||
+            "international"
+        ),
       location:
         String(
           plan?.location ||
           ""
         ).trim(),
+      country:
+        cleanMarketValue(
+          plan?.country ||
+            ""
+        ),
+      regionCode:
+        String(
+          plan?.regionCode ||
+            ""
+        )
+          .trim()
+          .toUpperCase(),
     };
   }
 
   return result;
+}
+
+function normalizeResourceType(
+  value
+) {
+  const normalized =
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_-]+/g, "_");
+
+  return [
+    "local",
+    "pakistan",
+    "pk",
+    "domestic",
+  ].includes(normalized)
+    ? "local"
+    : "international";
+}
+
+function cleanMarketValue(
+  value
+) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function inferResourceTypeFromLocation(
+  location,
+  regionCode = ""
+) {
+  const region =
+    String(regionCode || "")
+      .trim()
+      .toUpperCase();
+
+  if (region === "PK") {
+    return "local";
+  }
+
+  const text =
+    String(location || "")
+      .toLowerCase();
+
+  const pakistanMarkers = [
+    "pakistan",
+    "karachi",
+    "lahore",
+    "islamabad",
+    "rawalpindi",
+    "faisalabad",
+    "multan",
+    "peshawar",
+    "sialkot",
+    "gujranwala",
+    "quetta",
+    "hyderabad, sindh",
+  ];
+
+  return pakistanMarkers.some(
+    (marker) =>
+      text.includes(marker)
+  )
+    ? "local"
+    : "international";
+}
+
+function resourceTypeMatches(
+  candidate = {},
+  plan = {}
+) {
+  const requested =
+    normalizeResourceType(
+      plan.resourceType ||
+        "international"
+    );
+
+  const actual =
+    normalizeResourceType(
+      candidate.resourceType ||
+        inferResourceTypeFromLocation(
+          candidate.location ||
+            candidate.lead?.dailyLocation ||
+            candidate.lead?.address ||
+            "",
+          candidate.regionCode ||
+            candidate.lead?.dailyRegionCode ||
+            candidate.lead?.regionCode ||
+            ""
+        )
+    );
+
+  return requested === actual;
 }
 
 function normalizeNicheKey(
@@ -4172,6 +4650,15 @@ function takeCandidatesForCaller({
       !nicheMatches(
         candidate.niche,
         plan.niche
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !resourceTypeMatches(
+        candidate,
+        plan
       )
     ) {
       continue;
@@ -4390,6 +4877,55 @@ function getCallerDayStats({
   const niche =
     mostCommonString(niches);
 
+  const resourceType =
+    mostCommonString(
+      leads
+        .map(
+          (lead) =>
+            normalizeResourceType(
+              lead.dailyResourceType ||
+                inferResourceTypeFromLocation(
+                  lead.dailyLocation ||
+                    lead.address ||
+                    "",
+                  lead.dailyRegionCode ||
+                    lead.regionCode ||
+                    ""
+                )
+            )
+        )
+        .filter(Boolean)
+    );
+
+  const location =
+    mostCommonString(
+      leads
+        .map(
+          (lead) =>
+            lead.dailyLocation ||
+            lead.location ||
+            lead.address ||
+            ""
+        )
+        .filter(Boolean)
+    );
+
+  const country =
+    mostCommonString(
+      leads
+        .map(
+          (lead) =>
+            lead.dailyCountry ||
+            lead.country ||
+            (normalizeResourceType(
+              lead.dailyResourceType
+            ) === "local"
+              ? "Pakistan"
+              : "")
+        )
+        .filter(Boolean)
+    );
+
   return {
     assigned:
       leads.length,
@@ -4402,6 +4938,9 @@ function getCallerDayStats({
           worked
       ),
     niche,
+    resourceType,
+    location,
+    country,
   };
 }
 
@@ -4536,6 +5075,13 @@ function normalizeConfig(
     locations:
       normalizeStringArray(
         value.locations
+      ),
+
+    localPakistanLocations:
+      normalizeStringArray(
+        value.localPakistanLocations?.length
+          ? value.localPakistanLocations
+          : DEFAULT_LOCAL_PAKISTAN_LOCATIONS
       ),
 
     regionCode:

@@ -64,8 +64,24 @@ export function createCallerQueueService({
             ctx.workspaceId,
           userId:
             targetUserId,
+          compact:
+            true,
         }
       );
+
+    const latestDailyQueueDate =
+      all
+        .map(
+          (assignment) =>
+            String(
+              assignment.dailyQueueDate ||
+              ""
+            )
+        )
+        .filter(Boolean)
+        .sort()
+        .at(-1) ||
+      "";
 
     const filtered =
       all
@@ -73,7 +89,10 @@ export function createCallerQueueService({
           (assignment) =>
             belongsToBucket(
               assignment,
-              bucket
+              bucket,
+              {
+                latestDailyQueueDate,
+              }
             )
         )
         .sort(
@@ -92,7 +111,10 @@ export function createCallerQueueService({
         ),
       counts:
         buildCounts(
-          all
+          all,
+          {
+            latestDailyQueueDate,
+          }
         ),
       next:
         filtered[0] ||
@@ -119,11 +141,20 @@ export function createCallerQueueService({
         }
       );
 
+    const next =
+      result.records.find(
+        (assignment) =>
+          !assignment.nextActionAt ||
+          isDue(
+            assignment.nextActionAt
+          )
+      ) ||
+      null;
+
     return {
       ok: true,
       assignment:
-        result.records[0] ||
-        null,
+        next,
       counts:
         result.counts,
     };
@@ -669,6 +700,7 @@ function collectAssignments(
   {
     workspaceId,
     userId,
+    compact = false,
   }
 ) {
   const result = [];
@@ -702,7 +734,10 @@ function collectAssignments(
       result.push(
         publicAssignment(
           campaign,
-          lead
+          lead,
+          {
+            compact,
+          }
         )
       );
     }
@@ -756,13 +791,154 @@ function findAssignment(
 
 function publicAssignment(
   campaign,
-  lead
+  lead,
+  {
+    compact = false,
+  } = {}
 ) {
   const assignmentId =
     assignmentIdentity(
       campaign,
       lead
     );
+
+  const compactLead =
+    compact
+      ? {
+          id:
+            lead.id,
+          assignmentId:
+            lead.assignmentId ||
+            assignmentId,
+          business:
+            lead.business ||
+            "",
+          name:
+            lead.name ||
+            "",
+          phone:
+            lead.phone ||
+            lead.internationalPhoneNumber ||
+            lead.nationalPhoneNumber ||
+            "",
+          internationalPhoneNumber:
+            lead.internationalPhoneNumber ||
+            "",
+          nationalPhoneNumber:
+            lead.nationalPhoneNumber ||
+            "",
+          website:
+            lead.website ||
+            lead.websiteUri ||
+            "",
+          websiteUri:
+            lead.websiteUri ||
+            "",
+          email:
+            lead.email ||
+            "",
+          address:
+            lead.address ||
+            lead.formattedAddress ||
+            "",
+          formattedAddress:
+            lead.formattedAddress ||
+            lead.address ||
+            "",
+          category:
+            lead.category ||
+            "",
+          primaryType:
+            lead.primaryType ||
+            "",
+          status:
+            lead.status ||
+            "",
+          queueStatus:
+            lead.queueStatus ||
+            "",
+          priority:
+            lead.priority ||
+            "normal",
+          nextActionAt:
+            lead.nextActionAt ||
+            "",
+          callbackAt:
+            lead.callbackAt ||
+            "",
+          followUpAt:
+            lead.followUpAt ||
+            "",
+          dailyQueueDate:
+            lead.dailyQueueDate ||
+            "",
+          dailyQueuePosition:
+            lead.dailyQueuePosition ??
+            null,
+          dailyNiche:
+            lead.dailyNiche ||
+            "",
+          dailyLocation:
+            lead.dailyLocation ||
+            "",
+          dailyResourceType:
+            lead.dailyResourceType ||
+            lead.resourceType ||
+            "",
+          dailyCountry:
+            lead.dailyCountry ||
+            lead.country ||
+            "",
+          dailyRegionCode:
+            lead.dailyRegionCode ||
+            lead.regionCode ||
+            "",
+          resourceType:
+            lead.resourceType ||
+            lead.dailyResourceType ||
+            "",
+          country:
+            lead.country ||
+            lead.dailyCountry ||
+            "",
+          regionCode:
+            lead.regionCode ||
+            lead.dailyRegionCode ||
+            "",
+          miniAuditStatus:
+            lead.miniAuditStatus ||
+            "",
+          callAttempts:
+            Number(
+              lead.callAttempts ||
+              0
+            ),
+          answeredCalls:
+            Number(
+              lead.answeredCalls ||
+              0
+            ),
+          assignedTo:
+            lead.assignedTo ||
+            lead.assigneeId ||
+            "",
+          assigneeId:
+            lead.assigneeId ||
+            lead.assignedTo ||
+            "",
+          assignedToName:
+            lead.assignedToName ||
+            "",
+          createdAt:
+            lead.createdAt ||
+            "",
+          updatedAt:
+            lead.updatedAt ||
+            "",
+        }
+      : {
+          ...lead,
+        };
 
   return {
     id:
@@ -842,15 +1018,39 @@ function publicAssignment(
     notes:
       lead.notes ||
       "",
+    resourceType:
+      lead.dailyResourceType ||
+      lead.resourceType ||
+      "",
+    location:
+      lead.dailyLocation ||
+      lead.location ||
+      campaign.location ||
+      "",
+    niche:
+      lead.dailyNiche ||
+      lead.niche ||
+      lead.category ||
+      campaign.niche ||
+      "",
+    country:
+      lead.dailyCountry ||
+      lead.country ||
+      "",
+    regionCode:
+      lead.dailyRegionCode ||
+      lead.regionCode ||
+      "",
     miniAudit:
-      lead.miniAudit ||
-      null,
+      compact
+        ? null
+        : lead.miniAudit ||
+          null,
     miniAuditStatus:
       lead.miniAuditStatus ||
       "",
-    lead: {
-      ...lead,
-    },
+    lead:
+      compactLead,
     createdAt:
       lead.createdAt ||
       campaign.createdAt ||
@@ -861,7 +1061,6 @@ function publicAssignment(
       "",
   };
 }
-
 function assignmentIdentity(
   campaign,
   lead
@@ -1058,7 +1257,11 @@ function retryDelayMinutes(
 
 function belongsToBucket(
   assignment,
-  bucket
+  bucket,
+  {
+    latestDailyQueueDate =
+      "",
+  } = {}
 ) {
   const status =
     normalizeStatus(
@@ -1145,8 +1348,10 @@ function belongsToBucket(
     }
 
     if (
-      assignment.nextActionAt &&
-      !due
+      latestDailyQueueDate &&
+      assignment.dailyQueueDate &&
+      assignment.dailyQueueDate !==
+        latestDailyQueueDate
     ) {
       return false;
     }
@@ -1172,7 +1377,8 @@ function belongsToBucket(
 }
 
 function buildCounts(
-  assignments
+  assignments,
+  bucketContext = {}
 ) {
   const buckets = [
     "current",
@@ -1191,7 +1397,8 @@ function buildCounts(
           (assignment) =>
             belongsToBucket(
               assignment,
-              bucket
+              bucket,
+              bucketContext
             )
         ).length,
       ]
