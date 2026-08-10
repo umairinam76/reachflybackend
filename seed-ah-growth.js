@@ -87,8 +87,47 @@ const COMPANY_ID =
 
 const PASSWORD =
   process.env
+    .AH_GROWTH_SEED_PASSWORD ||
+  process.env
     .AH_GROWTH_TEST_PASSWORD ||
-  "AhGrowth@123";
+  (IS_PRODUCTION
+    ? ""
+    : "AhGrowth@123");
+
+if (
+  String(PASSWORD).length < 12
+) {
+  throw new Error(
+    "Set AH_GROWTH_SEED_PASSWORD to a strong password of at least 12 characters before seeding production."
+  );
+}
+
+const DEFAULT_DAILY_NICHES = [
+  "clinics",
+  "dentists",
+  "restaurants",
+  "law firms",
+  "real estate agencies",
+];
+
+const DEFAULT_INTERNATIONAL_LOCATIONS = [
+  "California",
+  "Texas",
+  "Florida",
+  "New York",
+];
+
+const DEFAULT_LOCAL_PAKISTAN_LOCATIONS = [
+  "Karachi",
+  "Lahore",
+  "Islamabad",
+  "Rawalpindi",
+  "Faisalabad",
+  "Multan",
+  "Peshawar",
+  "Sialkot",
+  "Gujranwala",
+];
 
 /*
  * Owner permissions intentionally exclude:
@@ -223,6 +262,18 @@ const CALLER_PERMISSIONS = [
   "update_profile",
 ];
 
+/*
+ * ----------------------------------------------------------
+ * ACCOUNTS
+ * ----------------------------------------------------------
+ *
+ * 1 Owner
+ * 1 Manager
+ * 2 Local Pakistan callers
+ * 6 International callers
+ *
+ * Total users = 10
+ */
 const ACCOUNTS = [
   {
     name:
@@ -262,17 +313,23 @@ const ACCOUNTS = [
       MANAGER_PERMISSIONS,
   },
 
+  /*
+   * LOCAL CALLER 1
+   */
   {
     name:
-      "AH Growth Caller One",
+      "AH Growth Local Caller One",
 
     email:
       "caller1@ahgrowth.test",
 
     role: "caller",
 
+    resourceType:
+      "local",
+
     jobTitle:
-      "Cold Caller",
+      "Local Cold Caller",
 
     department:
       "Sales",
@@ -281,17 +338,173 @@ const ACCOUNTS = [
       CALLER_PERMISSIONS,
   },
 
+  /*
+   * LOCAL CALLER 2
+   */
   {
     name:
-      "AH Growth Caller Two",
+      "AH Growth Local Caller Two",
 
     email:
       "caller2@ahgrowth.test",
 
     role: "caller",
 
+    resourceType:
+      "local",
+
     jobTitle:
-      "Cold Caller",
+      "Local Cold Caller",
+
+    department:
+      "Sales",
+
+    permissions:
+      CALLER_PERMISSIONS,
+  },
+
+  /*
+   * INTERNATIONAL CALLER 1
+   */
+  {
+    name:
+      "AH Growth International Caller One",
+
+    email:
+      "caller3@ahgrowth.test",
+
+    role: "caller",
+
+    resourceType:
+      "international",
+
+    jobTitle:
+      "International Cold Caller",
+
+    department:
+      "Sales",
+
+    permissions:
+      CALLER_PERMISSIONS,
+  },
+
+  /*
+   * INTERNATIONAL CALLER 2
+   */
+  {
+    name:
+      "AH Growth International Caller Two",
+
+    email:
+      "caller4@ahgrowth.test",
+
+    role: "caller",
+
+    resourceType:
+      "international",
+
+    jobTitle:
+      "International Cold Caller",
+
+    department:
+      "Sales",
+
+    permissions:
+      CALLER_PERMISSIONS,
+  },
+
+  /*
+   * INTERNATIONAL CALLER 3
+   */
+  {
+    name:
+      "AH Growth International Caller Three",
+
+    email:
+      "caller5@ahgrowth.test",
+
+    role: "caller",
+
+    resourceType:
+      "international",
+
+    jobTitle:
+      "International Cold Caller",
+
+    department:
+      "Sales",
+
+    permissions:
+      CALLER_PERMISSIONS,
+  },
+
+  /*
+   * INTERNATIONAL CALLER 4
+   */
+  {
+    name:
+      "AH Growth International Caller Four",
+
+    email:
+      "caller6@ahgrowth.test",
+
+    role: "caller",
+
+    resourceType:
+      "international",
+
+    jobTitle:
+      "International Cold Caller",
+
+    department:
+      "Sales",
+
+    permissions:
+      CALLER_PERMISSIONS,
+  },
+
+  /*
+   * INTERNATIONAL CALLER 5
+   */
+  {
+    name:
+      "AH Growth International Caller Five",
+
+    email:
+      "caller7@ahgrowth.test",
+
+    role: "caller",
+
+    resourceType:
+      "international",
+
+    jobTitle:
+      "International Cold Caller",
+
+    department:
+      "Sales",
+
+    permissions:
+      CALLER_PERMISSIONS,
+  },
+
+  /*
+   * INTERNATIONAL CALLER 6
+   */
+  {
+    name:
+      "AH Growth International Caller Six",
+
+    email:
+      "caller8@ahgrowth.test",
+
+    role: "caller",
+
+    resourceType:
+      "international",
+
+    jobTitle:
+      "International Cold Caller",
 
     department:
       "Sales",
@@ -301,6 +514,11 @@ const ACCOUNTS = [
   },
 ];
 
+/*
+ * ----------------------------------------------------------
+ * PASSWORD HASHING
+ * ----------------------------------------------------------
+ */
 async function hashPassword(
   password
 ) {
@@ -320,6 +538,11 @@ async function hashPassword(
   ).toString("hex")}`;
 }
 
+/*
+ * ----------------------------------------------------------
+ * MAIN SEED
+ * ----------------------------------------------------------
+ */
 async function seedAhGrowth() {
   const passwordHash =
     await hashPassword(
@@ -354,6 +577,12 @@ async function seedAhGrowth() {
   const seededAccounts = [];
 
   store.update((draft) => {
+    /*
+     * ------------------------------------------------------
+     * ENSURE STORE COLLECTIONS
+     * ------------------------------------------------------
+     */
+
     draft.users =
       Array.isArray(
         draft.users
@@ -417,9 +646,22 @@ async function seedAhGrowth() {
         ? draft.leadAssignments
         : [];
 
+    draft.workspaceSettings =
+      draft.workspaceSettings &&
+      typeof draft.workspaceSettings ===
+        "object" &&
+      !Array.isArray(
+        draft.workspaceSettings
+      )
+        ? draft.workspaceSettings
+        : {};
+
     /*
-     * Workspace
+     * ------------------------------------------------------
+     * WORKSPACE
+     * ------------------------------------------------------
      */
+
     let workspace =
       draft.workspaces.find(
         (item) =>
@@ -466,7 +708,9 @@ async function seedAhGrowth() {
         isActive: true,
 
         plan:
-          "test",
+          IS_PRODUCTION
+            ? "production"
+            : "test",
 
         createdAt:
           timestamp,
@@ -514,7 +758,9 @@ async function seedAhGrowth() {
 
           plan:
             workspace.plan ||
-            "test",
+            (IS_PRODUCTION
+              ? "production"
+              : "test"),
 
           updatedAt:
             timestamp,
@@ -523,8 +769,11 @@ async function seedAhGrowth() {
     }
 
     /*
-     * Company
+     * ------------------------------------------------------
+     * COMPANY
+     * ------------------------------------------------------
      */
+
     let company =
       draft.companies.find(
         (item) =>
@@ -623,12 +872,19 @@ async function seedAhGrowth() {
     }
 
     /*
-     * Users and memberships
+     * ------------------------------------------------------
+     * USERS + MEMBERSHIPS
+     * ------------------------------------------------------
      */
+
     for (
       const account
       of preparedAccounts
     ) {
+      /*
+       * Find by email so running the seed again does not
+       * create duplicate accounts.
+       */
       let user =
         draft.users.find(
           (item) =>
@@ -640,6 +896,9 @@ async function seedAhGrowth() {
             account.email
         );
 
+      /*
+       * Create user if it does not already exist.
+       */
       if (!user) {
         user = {
           id:
@@ -654,6 +913,18 @@ async function seedAhGrowth() {
         );
       }
 
+      const callerResourceType =
+        account.role === "caller"
+          ? account.resourceType ||
+            "international"
+          : "";
+
+      /*
+       * Update the user.
+       *
+       * Existing IDs are preserved.
+       * Existing avatars/profile information are preserved.
+       */
       Object.assign(
         user,
         {
@@ -667,15 +938,13 @@ async function seedAhGrowth() {
             account.email,
 
           /*
-           * Store the application-compatible hash.
-           * Do not store the raw password.
+           * Only hashed passwords are stored.
            */
           passwordHash:
             account.passwordHash,
 
           /*
-           * Some older parts of the application may read
-           * passwordDigest instead of passwordHash.
+           * Older application modules may read passwordDigest.
            */
           passwordDigest:
             account.passwordHash,
@@ -719,6 +988,21 @@ async function seedAhGrowth() {
 
           department:
             account.department,
+
+          /*
+           * The daily automation and Manager dashboard can
+           * use either resourceType or callerResourceType.
+           */
+          ...(account.role ===
+          "caller"
+            ? {
+                resourceType:
+                  callerResourceType,
+
+                callerResourceType:
+                  callerResourceType,
+              }
+            : {}),
 
           status:
             "active",
@@ -765,11 +1049,14 @@ async function seedAhGrowth() {
       );
 
       /*
-       * Remove incorrectly stored legacy password fields.
+       * Never store plaintext passwords.
        */
       delete user.password;
       delete user.plainPassword;
 
+      /*
+       * Owner IDs.
+       */
       if (
         account.role ===
         "owner"
@@ -787,6 +1074,9 @@ async function seedAhGrowth() {
           user.id;
       }
 
+      /*
+       * Workspace membership.
+       */
       let membership =
         draft.workspaceMembers.find(
           (item) =>
@@ -872,12 +1162,334 @@ async function seedAhGrowth() {
         role:
           user.workspaceRole,
 
+        resourceType:
+          account.role ===
+          "caller"
+            ? callerResourceType
+            : "",
+
         permissions: [
           ...user.permissions,
         ],
       });
     }
 
+    /*
+     * ------------------------------------------------------
+     * DAILY LEAD AUTOMATION SETTINGS
+     * ------------------------------------------------------
+     *
+     * Important:
+     *
+     * Existing Manager-selected settings are preserved.
+     *
+     * We only guarantee:
+     *
+     * caller1 = Local Pakistan
+     * caller2 = Local Pakistan
+     *
+     * caller3 = International
+     * caller4 = International
+     * caller5 = International
+     * caller6 = International
+     * caller7 = International
+     * caller8 = International
+     *
+     * Manager can still change:
+     *
+     * - refresh time
+     * - timezone
+     * - niche
+     * - location
+     * - country
+     * - international market
+     */
+
+    const existingDailyLeadConfig =
+      draft.workspaceSettings[
+        WORKSPACE_ID
+      ]?.dailyLeadAutomation ||
+      {};
+
+    const existingCallerPlans =
+      existingDailyLeadConfig
+        .callerPlans &&
+      typeof existingDailyLeadConfig
+        .callerPlans ===
+        "object" &&
+      !Array.isArray(
+        existingDailyLeadConfig
+          .callerPlans
+      )
+        ? existingDailyLeadConfig
+            .callerPlans
+        : {};
+
+    const nextCallerPlans = {
+      ...existingCallerPlans,
+    };
+
+    /*
+     * Build/update a plan using each caller's real user ID.
+     */
+    for (
+      const account
+      of seededAccounts.filter(
+        (item) =>
+          item.role === "caller"
+      )
+    ) {
+      const previousPlan =
+        existingCallerPlans[
+          account.id
+        ] || {};
+
+      /*
+       * LOCAL CALLER
+       */
+      if (
+        account.resourceType ===
+        "local"
+      ) {
+        nextCallerPlans[
+          account.id
+        ] = {
+          ...previousPlan,
+
+          resourceType:
+            "local",
+
+          /*
+           * Preserve an existing Pakistan city if the manager
+           * previously selected one.
+           *
+           * If this caller was previously International,
+           * clear the old international location.
+           */
+          location:
+            previousPlan
+              .resourceType ===
+            "local"
+              ? previousPlan.location ||
+                ""
+              : "",
+
+          /*
+           * Local always means Pakistan.
+           */
+          country:
+            "Pakistan",
+
+          regionCode:
+            "PK",
+        };
+      }
+
+      /*
+       * INTERNATIONAL CALLER
+       */
+      else {
+        const wasLocal =
+          previousPlan
+            .resourceType ===
+          "local";
+
+        nextCallerPlans[
+          account.id
+        ] = {
+          ...previousPlan,
+
+          resourceType:
+            "international",
+
+          /*
+           * Do not accidentally carry Lahore/Karachi/etc into
+           * an International caller after switching type.
+           */
+          location:
+            wasLocal
+              ? ""
+              : previousPlan.location ||
+                "",
+
+          country:
+            wasLocal
+              ? ""
+              : previousPlan.country ||
+                "",
+
+          regionCode:
+            wasLocal
+              ? existingDailyLeadConfig
+                  .regionCode ||
+                "US"
+              : previousPlan
+                  .regionCode ||
+                existingDailyLeadConfig
+                  .regionCode ||
+                "US",
+        };
+      }
+    }
+
+    /*
+     * Ensure the workspace settings object exists.
+     */
+    draft.workspaceSettings[
+      WORKSPACE_ID
+    ] =
+      draft.workspaceSettings[
+        WORKSPACE_ID
+      ] ||
+      {};
+
+    /*
+     * Save daily automation defaults.
+     *
+     * Existing manager-selected values always win.
+     */
+    draft.workspaceSettings[
+      WORKSPACE_ID
+    ].dailyLeadAutomation = {
+      ...existingDailyLeadConfig,
+
+      /*
+       * Enabled by default.
+       */
+      enabled:
+        existingDailyLeadConfig
+          .enabled ??
+        true,
+
+      /*
+       * Exactly 100 leads per caller by default.
+       */
+      leadsPerCaller:
+        existingDailyLeadConfig
+          .leadsPerCaller ??
+        100,
+
+      /*
+       * Default business timezone.
+       *
+       * Manager can change this from dashboard.
+       */
+      timezone:
+        existingDailyLeadConfig
+          .timezone ||
+        "Asia/Karachi",
+
+      /*
+       * Default refresh = 04:00 Pakistan time.
+       *
+       * Manager dashboard can change this later.
+       */
+      assignmentHour:
+        existingDailyLeadConfig
+          .assignmentHour ??
+        4,
+
+      assignmentMinute:
+        existingDailyLeadConfig
+          .assignmentMinute ??
+        0,
+
+      /*
+       * Previous eligible leads become reusable after
+       * the configured recycle threshold.
+       */
+      recycleAfterHours:
+        existingDailyLeadConfig
+          .recycleAfterHours ??
+        24,
+
+      /*
+       * Stop endlessly recycling dead leads.
+       */
+      maxCallAttempts:
+        existingDailyLeadConfig
+          .maxCallAttempts ??
+        5,
+
+      /*
+       * Default niches.
+       *
+       * Manager can replace these in Daily Caller Operations.
+       */
+      niches:
+        Array.isArray(
+          existingDailyLeadConfig
+            .niches
+        ) &&
+        existingDailyLeadConfig
+          .niches.length
+          ? existingDailyLeadConfig
+              .niches
+          : [
+              ...DEFAULT_DAILY_NICHES,
+            ],
+
+      /*
+       * Default International markets.
+       */
+      locations:
+        Array.isArray(
+          existingDailyLeadConfig
+            .locations
+        ) &&
+        existingDailyLeadConfig
+          .locations.length
+          ? existingDailyLeadConfig
+              .locations
+          : [
+              ...DEFAULT_INTERNATIONAL_LOCATIONS,
+            ],
+
+      /*
+       * Pakistan cities available to Local callers.
+       */
+      localPakistanLocations:
+        Array.isArray(
+          existingDailyLeadConfig
+            .localPakistanLocations
+        ) &&
+        existingDailyLeadConfig
+          .localPakistanLocations
+          .length
+          ? existingDailyLeadConfig
+              .localPakistanLocations
+          : [
+              ...DEFAULT_LOCAL_PAKISTAN_LOCATIONS,
+            ],
+
+      /*
+       * Default International Google Places region.
+       *
+       * Local callers override this with PK.
+       */
+      regionCode:
+        existingDailyLeadConfig
+          .regionCode ||
+        "US",
+
+      /*
+       * Automatically queue the Mini Audit for daily leads.
+       */
+      autoMiniAudit:
+        existingDailyLeadConfig
+          .autoMiniAudit ??
+        true,
+
+      /*
+       * Per-caller plans.
+       */
+      callerPlans:
+        nextCallerPlans,
+    };
+
+    /*
+     * Keep timestamps current.
+     */
     workspace.updatedAt =
       timestamp;
 
@@ -885,8 +1497,11 @@ async function seedAhGrowth() {
       timestamp;
 
     /*
-     * General team channel
+     * ------------------------------------------------------
+     * GENERAL TEAM CHANNEL
+     * ------------------------------------------------------
      */
+
     let generalChannel =
       draft.teamChannels.find(
         (channel) =>
@@ -918,11 +1533,7 @@ async function seedAhGrowth() {
           "AH Growth company-wide communication.",
 
         /*
-         * An empty member list means every member of the
-         * workspace may access the General channel.
-         *
-         * Both property names are included because different
-         * parts of the application support either format.
+         * Empty membership means all workspace members.
          */
         memberIds: [],
         memberUserIds: [],
@@ -977,6 +1588,12 @@ async function seedAhGrowth() {
     }
   });
 
+  /*
+   * --------------------------------------------------------
+   * SUCCESS OUTPUT
+   * --------------------------------------------------------
+   */
+
   console.log(
     "\nAH Growth company and users were seeded successfully.\n"
   );
@@ -995,8 +1612,22 @@ async function seedAhGrowth() {
         Email:
           account.email,
 
+        Resource:
+          account.role ===
+          "caller"
+            ? account.resourceType ===
+              "local"
+              ? "Local · Pakistan"
+              : "International"
+            : "-",
+
+        /*
+         * Never print the production password.
+         */
         Password:
-          PASSWORD,
+          IS_PRODUCTION
+            ? "(private value from AH_GROWTH_SEED_PASSWORD)"
+            : PASSWORD,
 
         Permissions:
           account.permissions.length,
@@ -1037,10 +1668,79 @@ async function seedAhGrowth() {
   );
 
   console.log(
+    "\nCaller allocation:"
+  );
+
+  console.log(
+    "- caller1@ahgrowth.test and caller2@ahgrowth.test: Local · Pakistan"
+  );
+
+  console.log(
+    "- caller3@ahgrowth.test through caller8@ahgrowth.test: International"
+  );
+
+  console.log(
+    "- Daily target: 100 leads per caller"
+  );
+
+  console.log(
+    "- Default refresh: 04:00 Asia/Karachi (manager can change this from the dashboard)"
+  );
+
+  console.log(
+    "\nAccount emails:"
+  );
+
+  console.log(
+    "- Owner: owner@ahgrowth.test"
+  );
+
+  console.log(
+    "- Manager: manager@ahgrowth.test"
+  );
+
+  console.log(
+    "- Local Caller 1: caller1@ahgrowth.test"
+  );
+
+  console.log(
+    "- Local Caller 2: caller2@ahgrowth.test"
+  );
+
+  console.log(
+    "- International Caller 1: caller3@ahgrowth.test"
+  );
+
+  console.log(
+    "- International Caller 2: caller4@ahgrowth.test"
+  );
+
+  console.log(
+    "- International Caller 3: caller5@ahgrowth.test"
+  );
+
+  console.log(
+    "- International Caller 4: caller6@ahgrowth.test"
+  );
+
+  console.log(
+    "- International Caller 5: caller7@ahgrowth.test"
+  );
+
+  console.log(
+    "- International Caller 6: caller8@ahgrowth.test"
+  );
+
+  console.log(
     "\nRestart the API and log in again before testing these accounts.\n"
   );
 }
 
+/*
+ * ----------------------------------------------------------
+ * FORMAT ROLE
+ * ----------------------------------------------------------
+ */
 function formatRole(value) {
   return String(value || "")
     .replace(/_/g, " ")
@@ -1056,6 +1756,11 @@ function formatRole(value) {
     .join(" ");
 }
 
+/*
+ * ----------------------------------------------------------
+ * RUN
+ * ----------------------------------------------------------
+ */
 seedAhGrowth().catch(
   (error) => {
     console.error(
