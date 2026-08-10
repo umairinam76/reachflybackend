@@ -130,17 +130,19 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
   }
 
   function queueMiniAudit(user, input = {}) {
-    const requestedKind = normalizeKind(
-      input.kind || input.auditKind || input.campaignType || "mini"
-    );
-    const kind = ["website", "gmb"].includes(requestedKind)
-      ? requestedKind
-      : "mini";
-
+    // Mini Audit is the universal pre-call report for both Website and GMB.
+    // Campaign type stays separate and only changes what evidence is prioritized.
     return publicReport(
       queueReport(user, {
         ...input,
-        kind,
+        kind: "mini",
+        campaignType: normalizeCampaignType(
+          input.campaignType ||
+            input.auditKind ||
+            input.lead?.dailyCampaignType ||
+            input.lead?.campaignType ||
+            "website"
+        ),
       })
     );
   }
@@ -161,6 +163,44 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     );
   }
 
+  function getRuntimeTemplate(user, kind) {
+    return typeof reportTemplateProvider === "function"
+      ? reportTemplateProvider(user, kind)
+      : null;
+  }
+
+  function templateIsCustomized(template) {
+    return Boolean(
+      Number(template?.version || 0) > 0 ||
+      template?.examplePdf?.storagePath
+    );
+  }
+
+  function resolveRuntimeTemplate(user, kind, campaignType) {
+    const primary = getRuntimeTemplate(user, kind);
+
+    // Full audits use the campaign-specific Website/GMB format by default.
+    // A manager can override that campaign format later without changing workflow.
+    if (kind === "full") {
+      const campaignTemplate = getRuntimeTemplate(
+        user,
+        campaignType === "gmb" ? "gmb" : "website"
+      );
+
+      if (templateIsCustomized(campaignTemplate)) {
+        return campaignTemplate;
+      }
+
+      if (templateIsCustomized(primary)) {
+        return primary;
+      }
+
+      return campaignTemplate || primary;
+    }
+
+    return primary;
+  }
+
   function queueReport(user, input = {}) {
     const context = workspaceService?.getContext(user) || {
       user,
@@ -168,41 +208,38 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       workspace: null,
     };
     const kind = normalizeKind(input.kind || "mini");
+    const campaignType = normalizeCampaignType(
+      input.campaignType ||
+        input.auditKind ||
+        input.lead?.dailyCampaignType ||
+        input.lead?.campaignType ||
+        kind
+    );
     const website = normalizeUrl(input.website || input.lead?.website);
     const leadIdentity = clean(
       input.leadId || input.lead?.id || input.placeId || input.lead?.placeId ||
         input.business || input.lead?.business || input.lead?.name ||
         input.location || input.lead?.address
     );
+    const canResearchWithoutWebsite =
+      campaignType === "gmb" && Boolean(leadIdentity);
 
-    if (!website && kind !== "gmb") {
-      throw createError(400, "A valid website URL is required.");
-    }
-    if (!website && kind === "gmb" && !leadIdentity) {
-      throw createError(400, "A GMB audit requires a business, place ID, address, or website.");
-    }
-
-    const reportTemplate =
-      typeof reportTemplateProvider === "function"
-        ? reportTemplateProvider(user, kind)
-        : null;
-
-    if (reportTemplate?.enabled === false) {
+    if (!website && !canResearchWithoutWebsite) {
       throw createError(
-        409,
-        `${reportTemplate.name || kind} is disabled by the manager.`
+        400,
+        "A valid website URL is required for Website campaign audits."
       );
     }
 
-    if (
-      ["website", "gmb"].includes(kind) &&
-      !reportTemplate?.examplePdf?.storagePath
-    ) {
-      throw createError(
-        409,
-        `Manager must upload the ${kind === "gmb" ? "GMB / Local Visibility" : "Website / Technology"} audit-format PDF before this campaign can be queued.`
-      );
-    }
+    const reportTemplate = resolveRuntimeTemplate(
+      user,
+      kind,
+      campaignType
+    );
+
+    // No manager upload is required. The template service always supplies
+    // a built-in ReachFly default and manager uploads only change format/style.
+
 
     const templateKey =
       reportTemplate?.templateId ||
@@ -252,13 +289,19 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       website,
       campaignId: clean(input.campaignId),
       leadId: clean(input.leadId || input.lead?.id),
-      campaignType: normalizeCampaignType(input.campaignType || kind),
+      campaignType,
       auditType: clean(input.auditType) ||
-        (kind === "gmb"
-          ? "GMB / Local Visibility Audit"
-          : kind === "website"
-            ? "Website / Technology Audit"
-            : ""),
+        (kind === "mini"
+          ? "Mini Audit"
+          : kind === "competitor"
+            ? "Competitor Analysis"
+            : kind === "full"
+              ? campaignType === "gmb"
+                ? "Full GMB / Local Visibility Audit"
+                : "Full Website / Technology Audit"
+              : kind === "gmb"
+                ? "GMB / Local Visibility Audit"
+                : "Website / Technology Audit"),
       lead: sanitizeLead(input.lead || input),
       niche: clean(
         input.niche ||
@@ -460,7 +503,8 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
 
     try {
       const evidence =
-        record.kind === "gmb" && !record.website
+        !record.website &&
+        normalizeCampaignType(record.campaignType || record.kind) === "gmb"
           ? buildGmbSeedEvidence(record)
           : await inspectLeadWebsite(record);
       let report;
@@ -512,24 +556,37 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
         const campaignType = normalizeCampaignType(record.campaignType || record.kind);
         lead.dailyCampaignType = campaignType;
         lead.campaignType = campaignType;
-        lead.auditKind = record.kind;
-        lead.auditType = record.auditType ||
-          (campaignType === "gmb"
-            ? "GMB / Local Visibility Audit"
-            : "Website / Technology Audit");
-        lead.auditStatus = record.status === "complete" ? "ready" : record.status;
-        lead.auditError = record.error || "";
-        lead.auditReportId = record.id;
-        lead.auditTemplateVersion = Number(record.templateVersion || 0);
-        lead.auditReport = record.status === "complete" ? record.report : null;
-        // Existing caller UI historically reads miniAudit. Keep this compatibility
-        // alias while exposing explicit Website/GMB fields alongside it.
-        if (record.status === "complete") {
-          lead.miniAudit = record.report;
-          lead.miniAuditStatus = "completed";
+
+        // The Mini Audit is the pre-call gate. Generating competitor/full reports
+        // must never overwrite the Mini Audit or its readiness status.
+        if (record.kind === "mini") {
+          lead.auditKind = "mini";
+          lead.auditType = "Mini Audit";
+          lead.auditStatus = record.status === "complete" ? "ready" : record.status;
+          lead.auditError = record.error || "";
+          lead.auditReportId = record.id;
+          lead.auditTemplateVersion = Number(record.templateVersion || 0);
+          lead.auditReport = record.status === "complete" ? record.report : null;
+          lead.miniAudit = record.status === "complete" ? record.report : lead.miniAudit;
+          lead.miniAuditStatus = record.status === "complete" ? "completed" : record.status;
+          lead.miniAuditError = record.error || "";
+          lead.miniAuditReportId = record.id;
+        } else if (record.kind === "competitor") {
+          lead.competitorAudit = record.status === "complete" ? record.report : lead.competitorAudit;
+          lead.competitorAuditStatus = record.status;
+          lead.competitorAuditError = record.error || "";
+          lead.competitorAuditReportId = record.id;
+        } else if (record.kind === "full") {
+          lead.fullAudit = record.status === "complete" ? record.report : lead.fullAudit;
+          lead.fullAuditStatus = record.status;
+          lead.fullAuditError = record.error || "";
+          lead.fullAuditReportId = record.id;
         } else {
-          lead.miniAuditStatus = record.status;
+          lead.detailedAudit = record.status === "complete" ? record.report : lead.detailedAudit;
+          lead.detailedAuditStatus = record.status;
+          lead.detailedAuditReportId = record.id;
         }
+
         lead.updatedAt = new Date().toISOString();
         break;
       }
@@ -983,8 +1040,16 @@ function buildClaudeSystem(record) {
 
 function buildClaudePrompt(record, evidence) {
   const brand = record.brand;
+  const campaignType = normalizeCampaignType(
+    record.campaignType ||
+      record.lead?.dailyCampaignType ||
+      record.lead?.campaignType ||
+      record.kind
+  );
+  const isGmbCampaign = campaignType === "gmb";
   const base = {
     reportKind: record.kind,
+    campaignType,
     website: record.website,
     lead: record.lead,
     niche: record.niche,
@@ -1073,8 +1138,12 @@ Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep
   }
 
   if (record.kind === "mini") {
+    const miniFocus = isGmbCampaign
+      ? "This is a GMB campaign. Prioritize Google Business Profile/local visibility evidence: business identity, category, address/NAP, hours, rating and review volume/content when verifiable, profile completeness, website/contact path, local trust signals, and 2-4 real nearby/direct competitors. A website is helpful but not required for GMB."
+      : "This is a Website campaign. Prioritize website/contact/conversion evidence: availability, HTTPS/redirects, mobile usability, page clarity, contact friction, calls-to-action, forms/booking, trust signals, visible SEO metadata, local/NAP consistency, and obvious public technology issues.";
+
     return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.miniInstructions || "Preserve the approved Mini Audit structure exactly."}
-Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep it concise and caller-friendly."}\n\nResearch the business using live web search before writing. Search for the business's Google, Yelp, and other public directory listings; compare their address and phone with the supplied website and lead evidence. Search for the primary category plus city and identify whether the business appears prominently and which 2-4 real competitors appear instead. Use only facts you can verify. Return exactly this JSON shape:\n${JSON.stringify(
+Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "One page; fast caller-ready intelligence."}\n\n${miniFocus} Research live public sources before writing. Use only facts you can verify and clearly mark unavailable/uncertain fields. Return exactly this JSON shape:\n${JSON.stringify(
       {
         header: {
           confidentiality: "INTERNAL - SALES TEAM USE ONLY - DO NOT SEND TO CLIENT",
@@ -1104,11 +1173,15 @@ Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep
       },
       null,
       2
-    )}\nRules: include 6-10 issues, prioritized with address/NAP conflicts, domain authority fragmentation, and search visibility before minor issues. Each issue finding must be exactly one sentence. Each issue pain must be exactly one sentence. Include no suggested opening line, objection notes, founded/size field, recommendations, or extra sections.`;
+    )}\nRules: include 4-8 high-value issues rather than filler. For GMB, prefer review/profile/NAP/hours/category/local-visibility gaps; for Website, prefer conversion/contact/trust/SEO/usability/technical gaps. Each issue finding must be exactly one factual sentence the caller can safely say aloud. Each issue pain must be exactly one plain-English consequence sentence. Include no fabricated rankings, unsupported performance claims, recommendations, pricing, or guarantees.`;
   }
 
   if (record.kind === "competitor") {
-    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.competitorInstructions || "Use a concise, evidence-grounded competitor analysis format."}\nLength / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep the comparison focused and commercially useful."}\n\nResearch live search results for the business's category and city. Identify 3-5 real direct competitors and compare only publicly verifiable website, local-search, review, conversion, and trust signals. Return exactly this JSON shape:\n${JSON.stringify(
+    const competitorFocus = isGmbCampaign
+      ? "For this GMB campaign, identify 3-5 real nearby/direct competitors and compare verifiable local-search signals such as rating/review volume, review quality, distance/location context, category/positioning, profile completeness clues, website/contact path, and trust signals. Do not invent a map-pack rank."
+      : "For this Website campaign, identify 3-5 real direct competitors and compare verifiable website/search/conversion/trust signals such as positioning, contact path, booking/lead capture, social proof, content depth, local visibility, and public technology observations.";
+
+    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.competitorInstructions || "Use a concise, evidence-grounded competitor analysis format."}\nLength / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep the comparison focused and commercially useful."}\n\n${competitorFocus} Research live public search results. Every competitor and comparison point must be verifiable. Return exactly this JSON shape:\n${JSON.stringify(
       {
         title: "Competitor Analysis",
         executiveSummary: "",
@@ -1134,10 +1207,17 @@ Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep
     )}`;
   }
 
+  const fullTitle = isGmbCampaign
+    ? "Full GMB / Local Visibility Audit"
+    : "Full Website / Technology Audit";
+  const fullFocus = isGmbCampaign
+    ? "Build a premium GMB/local-visibility audit inspired by the approved AB Architecture examples: executive headline, score/grade, profile completeness, hours, categories, address/NAP precision, reviews and reputation, photos/posts/services when verifiable, local competitor position, keyword/local SEO observations, ranking opportunity, trust/conversion gaps, and prioritized next steps. Clearly separate verified findings from not-yet-verified areas. Do not invent map rankings or Google algorithm claims."
+    : "Build a premium Website / Technology audit: executive headline, score/grade, website availability/HTTPS, mobile/usability, performance observations when verifiable, conversion path, forms/booking/contact friction, SEO/discoverability, content, trust/social proof, local/NAP signals, visible technology risks, competitor context, and prioritized next steps. Do not run active security scans or invent performance metrics.";
+
   return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.fullInstructions || "Preserve the approved internal full-audit structure."}
-Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Produce a detailed but readable report."}\n\nProduce a detailed evidence-grounded website audit using the supplied homepage evidence and live web research. Include technical, SEO, local visibility, conversion, trust, content, and competitor observations. Recommendations may appear only in this full report. Return exactly this JSON shape:\n${JSON.stringify(
+Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Produce a detailed but readable caller-ready report."}\n\n${fullFocus} Recommendations may appear only in this full report. Use only verified public evidence and safe sales language. Return exactly this JSON shape:\n${JSON.stringify(
     {
-      title: "Full Website Audit",
+      title: fullTitle,
       executiveSummary: "",
       score: 0,
       strengths: [""],
@@ -1291,7 +1371,11 @@ function normalizeGeneratedReport(record, evidence, value) {
   }
 
   return {
-    title: clean(value.title) || "Full Website Audit",
+    title:
+      clean(value.title) ||
+      (normalizeCampaignType(record.campaignType || record.kind) === "gmb"
+        ? "Full GMB / Local Visibility Audit"
+        : "Full Website / Technology Audit"),
     executiveSummary: clean(value.executiveSummary),
     score: clamp(value.score || evidenceFallbackScore(evidence), 0, 100),
     strengths: toStringArray(value.strengths, 8),
@@ -1377,9 +1461,14 @@ function buildFallbackReport(record, evidence, error) {
 
   const mini = buildFallbackMini(record, evidence);
   return {
-    title: "Full Website Audit",
+    title:
+      normalizeCampaignType(record.campaignType || record.kind) === "gmb"
+        ? "Full GMB / Local Visibility Audit"
+        : "Full Website / Technology Audit",
     executiveSummary:
-      "This fallback report contains verified homepage observations only. Live competitor research and expanded narrative generation were unavailable.",
+      normalizeCampaignType(record.campaignType || record.kind) === "gmb"
+        ? "This fallback report contains only verified supplied/public lead observations. Live local competitor research and expanded narrative generation were unavailable."
+        : "This fallback report contains verified homepage observations only. Live competitor research and expanded narrative generation were unavailable.",
     score: evidenceFallbackScore(evidence),
     strengths: fallbackStrengths(evidence),
     priorityFindings: mini.issues.map((item) => ({

@@ -2778,10 +2778,8 @@ export function createDailyLeadAutomationService({
           candidate.resourceType ||
           "international",
         campaignType,
-        auditKind: campaignType,
-        auditType: campaignType === "gmb"
-          ? "GMB / Local Visibility Audit"
-          : "Website / Technology Audit",
+        auditKind: "mini",
+        auditType: "Mini Audit",
         country:
           plan.country ||
           candidate.country ||
@@ -2986,12 +2984,12 @@ export function createDailyLeadAutomationService({
           normalizeCampaignType(campaignType);
         lead.campaignType =
           lead.dailyCampaignType;
+        // Every assigned lead gets the same universal pre-call Mini Audit.
+        // Website/GMB remains campaign context, not the audit kind.
         lead.auditKind =
-          lead.dailyCampaignType;
+          "mini";
         lead.auditType =
-          lead.dailyCampaignType === "gmb"
-            ? "GMB / Local Visibility Audit"
-            : "Website / Technology Audit";
+          "Mini Audit";
         lead.auditStatus = "queued";
         lead.auditReport = null;
 
@@ -3055,7 +3053,7 @@ export function createDailyLeadAutomationService({
 
           auditType:
             lead.auditType ||
-            "Website / Technology Audit",
+            "Mini Audit",
 
           country:
             lead.dailyCountry ||
@@ -3128,12 +3126,11 @@ export function createDailyLeadAutomationService({
 
           auditKind:
             lead.auditKind ||
-            lead.dailyCampaignType ||
-            "website",
+            "mini",
 
           auditType:
             lead.auditType ||
-            "Website / Technology Audit",
+            "Mini Audit",
 
           auditStatus:
             lead.auditStatus ||
@@ -3204,8 +3201,8 @@ export function createDailyLeadAutomationService({
 
           description:
             lead.dailyCampaignType === "gmb"
-              ? "Review the GMB / Local Visibility Audit, contact the lead, record the outcome, and schedule a follow-up when required."
-              : "Review the Website / Technology Audit, contact the lead, record the outcome, and schedule a follow-up when required.",
+              ? "Review the default Mini Audit for this GMB lead, contact the lead, record the outcome, and generate Competitor or Full GMB analysis when useful."
+              : "Review the default Mini Audit for this Website lead, contact the lead, record the outcome, and generate Competitor or Full Website analysis when useful.",
 
           type:
             "lead_call",
@@ -3252,12 +3249,11 @@ export function createDailyLeadAutomationService({
 
           auditKind:
             lead.auditKind ||
-            lead.dailyCampaignType ||
-            "website",
+            "mini",
 
           auditType:
             lead.auditType ||
-            "Website / Technology Audit",
+            "Mini Audit",
 
           auditStatus:
             lead.auditStatus ||
@@ -3344,12 +3340,10 @@ export function createDailyLeadAutomationService({
             leadId:
               reference.leadId,
 
+            // The automatic report is always the universal Mini Audit.
+            // Campaign type is passed separately to guide research.
             kind:
-              normalizeCampaignType(
-                reference.campaignType ||
-                  reference.auditKind ||
-                  "website"
-              ),
+              "mini",
 
             campaignType:
               normalizeCampaignType(
@@ -3358,10 +3352,7 @@ export function createDailyLeadAutomationService({
               ),
 
             auditType:
-              reference.auditType ||
-              (normalizeCampaignType(reference.campaignType) === "gmb"
-                ? "GMB / Local Visibility Audit"
-                : "Website / Technology Audit"),
+              "Mini Audit",
 
             website:
               reference.lead
@@ -3456,9 +3447,8 @@ export function createDailyLeadAutomationService({
         (item) => item.id === leadId
       );
       if (!lead) return;
-      lead.auditStatus = /upload|format|template/i.test(String(message || ""))
-        ? "format_required"
-        : "failed";
+      // Report-format customization is never a queue prerequisite.
+      lead.auditStatus = "failed";
       lead.auditError = String(message || "Audit could not be queued.").slice(0, 1000);
       lead.updatedAt = new Date().toISOString();
     });

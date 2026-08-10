@@ -20,23 +20,23 @@ const DEFAULT_TEMPLATES = {
   website: {
     name: "Website / Technology Audit",
     enabled: true,
-    lengthGuidance: "1-3 pages; caller-ready website and technology pre-call audit",
+    lengthGuidance: "3-6 pages; premium caller-ready Website / Technology full audit",
     instructions:
-      "Generate a factual Website / Technology Audit for the current lead only. Focus on publicly verifiable website, technical, conversion, trust, SEO, usability, and visible technology observations. Include evidence, plain-language business impact, controlled sales wording, and a safe next step. Never copy facts from the manager PDF example; use it only as a format and presentation reference.",
+      "Use the built-in ReachFly Website / Technology format unless a manager has supplied a newer format. Keep the report caller-ready: headline, overall score and grade, business snapshot, score breakdown, verified priority findings, technical health, mobile/usability, conversion path, SEO/discoverability, trust signals, competitor context, business impact, safe caller wording, and prioritized next steps. Use only public verified evidence. A manager PDF or instructions may change structure, layout, tone, and section emphasis only; never copy facts, findings, scores, technologies, competitors, or claims from the example into another lead.",
   },
   gmb: {
     name: "GMB / Local Visibility Audit",
     enabled: true,
-    lengthGuidance: "1-3 pages; caller-ready Google Business Profile and local visibility audit",
+    lengthGuidance: "3-6 pages; premium caller-ready Google Business Profile and local visibility full audit",
     instructions:
-      "Generate a factual GMB / Local Visibility Audit for the current lead only. Research the business's public Google Business Profile and local-search presence, NAP consistency, reviews, profile completeness, category/positioning, conversion paths, and visible local competitors. Include evidence, plain-language business impact, controlled sales wording, and a safe next step. Never copy facts from the manager PDF example; use it only as a format and presentation reference.",
+      "Use the built-in ReachFly GMB / Local Visibility format unless a manager has supplied a newer format. Follow the strong AB Architecture-style structure: headline, verdict with score and grade, weighted score breakdown, local competitor position, verified profile findings, review quality and volume, hours, category, address/NAP precision, profile completeness, photos/posts/services when verifiable, keyword/local SEO observations, ranking opportunity, caller-safe talking points, and clearly marked not-yet-verified areas. Use only public verified evidence. A manager PDF or instructions may change structure, layout, tone, and section emphasis only; never copy facts, findings, scores, competitors, review counts, rankings, or claims from the example into another lead.",
   },
   mini: {
     name: "Mini Audit",
     enabled: true,
-    lengthGuidance: "1-2 pages; concise pre-call intelligence",
+    lengthGuidance: "1 page; universal caller-ready pre-call intelligence for Website and GMB leads",
     instructions:
-      "Keep the Mini Audit concise, factual, easy for a caller to scan before dialing, and focused on verified business-impact issues. Preserve the approved business snapshot and issue-first structure. Do not include recommendations in the Mini Audit.",
+      "This is the universal default pre-call audit for both Website and GMB campaigns. Keep it fast, factual, and easy to scan while dialing: business snapshot plus the strongest verified issues/opportunities, each with one factual finding, one plain-English business consequence, and a source. For Website campaigns prioritize conversion, contact friction, trust, SEO, usability, and visible technical issues. For GMB campaigns prioritize profile completeness, NAP/address, hours, reviews, categories, local trust, and visible local-position gaps. Do not include recommendations in the Mini Audit. Never require a manager PDF to generate it.",
   },
   competitor: {
     name: "Competitor Analysis",
@@ -513,12 +513,16 @@ export function createAuditTemplateService({
       state,
       context.workspaceId
     );
-    const legacy = active
+    const activeUsable = Boolean(
+      active &&
+      active.enabled !== false
+    );
+    const legacy = activeUsable
       ? null
       : getLegacyTemplate(user);
     const defaults = DEFAULT_TEMPLATES[kind];
 
-    if (active) {
+    if (activeUsable) {
       return {
         templateId: active.id,
         version:
@@ -551,11 +555,9 @@ export function createAuditTemplateService({
       name:
         legacyName(legacy, kind) ||
         defaults.name,
-      enabled:
-        legacyEnabled(
-          legacy,
-          kind
-        ),
+      // Runtime audits must always have a safe built-in fallback.
+      // Disabling a manager customization falls back to ReachFly defaults.
+      enabled: true,
       lengthGuidance:
         defaults.lengthGuidance,
       instructions:
