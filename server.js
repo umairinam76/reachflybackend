@@ -7107,6 +7107,19 @@ app.get(
   })
 );
 
+app.get(
+  "/api/resource-board/unassigned-leads",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      resourceBoardService.listUnassignedLeads(
+        req.user,
+        req.query || {}
+      )
+    );
+  })
+);
+
 app.patch(
   "/api/resource-board/leads/:assignmentId/assignee",
   requireAuth,
