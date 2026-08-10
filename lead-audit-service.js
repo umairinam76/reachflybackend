@@ -130,10 +130,17 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
   }
 
   function queueMiniAudit(user, input = {}) {
+    const requestedKind = normalizeKind(
+      input.kind || input.auditKind || input.campaignType || "mini"
+    );
+    const kind = ["website", "gmb"].includes(requestedKind)
+      ? requestedKind
+      : "mini";
+
     return publicReport(
       queueReport(user, {
         ...input,
-        kind: "mini",
+        kind,
       })
     );
   }
@@ -141,8 +148,8 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
   function queueGeneratedReport(user, input = {}) {
     const kind = normalizeKind(input.kind);
 
-    if (!['competitor', 'full'].includes(kind)) {
-      throw createError(400, "Report kind must be competitor or full.");
+    if (!["website", "gmb", "competitor", "full"].includes(kind)) {
+      throw createError(400, "Report kind must be website, gmb, competitor, or full.");
     }
 
     return publicReport(
@@ -160,13 +167,21 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       workspaceId: user.workspaceId || user.id,
       workspace: null,
     };
+    const kind = normalizeKind(input.kind || "mini");
     const website = normalizeUrl(input.website || input.lead?.website);
+    const leadIdentity = clean(
+      input.leadId || input.lead?.id || input.placeId || input.lead?.placeId ||
+        input.business || input.lead?.business || input.lead?.name ||
+        input.location || input.lead?.address
+    );
 
-    if (!website) {
+    if (!website && kind !== "gmb") {
       throw createError(400, "A valid website URL is required.");
     }
+    if (!website && kind === "gmb" && !leadIdentity) {
+      throw createError(400, "A GMB audit requires a business, place ID, address, or website.");
+    }
 
-    const kind = normalizeKind(input.kind || "mini");
     const reportTemplate =
       typeof reportTemplateProvider === "function"
         ? reportTemplateProvider(user, kind)
@@ -179,14 +194,25 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       );
     }
 
+    if (
+      ["website", "gmb"].includes(kind) &&
+      !reportTemplate?.examplePdf?.storagePath
+    ) {
+      throw createError(
+        409,
+        `Manager must upload the ${kind === "gmb" ? "GMB / Local Visibility" : "Website / Technology"} audit-format PDF before this campaign can be queued.`
+      );
+    }
+
     const templateKey =
       reportTemplate?.templateId ||
       reportTemplate?.id ||
       `${reportTemplate?.name || "default"}:${reportTemplate?.version ?? 0}`;
 
+    const auditTarget = website || `gmb:${leadIdentity}`;
     const cacheKey = reportCacheKey(
       context.workspaceId,
-      website,
+      auditTarget,
       kind,
       templateKey
     );
@@ -202,6 +228,12 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       (!existing.expiresAt || Date.parse(existing.expiresAt) > Date.now())
     ) {
       if (existing.status === "queued") enqueue(existing.id);
+      if (existing.status === "complete") {
+        syncAuditToLead(existing, {
+          campaignId: clean(input.campaignId),
+          leadId: clean(input.leadId || input.lead?.id),
+        });
+      }
       return existing;
     }
 
@@ -218,6 +250,15 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       status: "queued",
       kind,
       website,
+      campaignId: clean(input.campaignId),
+      leadId: clean(input.leadId || input.lead?.id),
+      campaignType: normalizeCampaignType(input.campaignType || kind),
+      auditType: clean(input.auditType) ||
+        (kind === "gmb"
+          ? "GMB / Local Visibility Audit"
+          : kind === "website"
+            ? "Website / Technology Audit"
+            : ""),
       lead: sanitizeLead(input.lead || input),
       niche: clean(
         input.niche ||
@@ -372,7 +413,7 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       return;
     }
 
-    if (record.kind === "mini") miniQueue.push(id);
+    if (["mini", "website", "gmb"].includes(record.kind)) miniQueue.push(id);
     else priorityQueue.push(id);
 
     auditLog("queued", { id, kind: record.kind, ...getQueueStats() });
@@ -418,7 +459,10 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     record = (store.read().leadAudits || []).find((item) => item.id === id);
 
     try {
-      const evidence = await inspectLeadWebsite(record);
+      const evidence =
+        record.kind === "gmb" && !record.website
+          ? buildGmbSeedEvidence(record)
+          : await inspectLeadWebsite(record);
       let report;
       let provider = "anthropic";
 
@@ -438,6 +482,8 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
+      const completed = (store.read().leadAudits || []).find((item) => item.id === id);
+      syncAuditToLead(completed);
     } catch (error) {
       updateRecord(id, {
         status: "failed",
@@ -445,7 +491,49 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
+      const failed = (store.read().leadAudits || []).find((item) => item.id === id);
+      syncAuditToLead(failed);
     }
+  }
+
+  function syncAuditToLead(record, override = {}) {
+    if (!record) return;
+    const campaignId = clean(override.campaignId || record.campaignId);
+    const leadId = clean(override.leadId || record.leadId || record.lead?.id);
+    if (!leadId) return;
+
+    store.update((draft) => {
+      const campaigns = (draft.campaigns || []).filter((campaign) =>
+        !campaignId || campaign.id === campaignId
+      );
+      for (const campaign of campaigns) {
+        const lead = (campaign.leads || []).find((item) => item.id === leadId);
+        if (!lead) continue;
+        const campaignType = normalizeCampaignType(record.campaignType || record.kind);
+        lead.dailyCampaignType = campaignType;
+        lead.campaignType = campaignType;
+        lead.auditKind = record.kind;
+        lead.auditType = record.auditType ||
+          (campaignType === "gmb"
+            ? "GMB / Local Visibility Audit"
+            : "Website / Technology Audit");
+        lead.auditStatus = record.status === "complete" ? "ready" : record.status;
+        lead.auditError = record.error || "";
+        lead.auditReportId = record.id;
+        lead.auditTemplateVersion = Number(record.templateVersion || 0);
+        lead.auditReport = record.status === "complete" ? record.report : null;
+        // Existing caller UI historically reads miniAudit. Keep this compatibility
+        // alias while exposing explicit Website/GMB fields alongside it.
+        if (record.status === "complete") {
+          lead.miniAudit = record.report;
+          lead.miniAuditStatus = "completed";
+        } else {
+          lead.miniAuditStatus = record.status;
+        }
+        lead.updatedAt = new Date().toISOString();
+        break;
+      }
+    });
   }
 
   function updateRecord(id, changes) {
@@ -591,6 +679,48 @@ async function inspectLeadWebsite(record) {
   };
 }
 
+function buildGmbSeedEvidence(record) {
+  const business = clean(record.lead?.business || record.lead?.name || "Business");
+  const address = clean(record.lead?.address || record.location);
+  return {
+    finalUrl: "",
+    domain: "",
+    siteName: business,
+    phone: clean(record.lead?.phone),
+    email: clean(record.lead?.email),
+    websiteAddress: "",
+    googleAddress: address,
+    decisionMaker: "",
+    businessHours: "",
+    description: `${business}${address ? ` serving ${address}` : ""}.`,
+    h1: [],
+    externalServiceLinks: [],
+    hasBooking: false,
+    bookingLinks: [],
+    hasChat: false,
+    testimonialCount: 0,
+    hasStructuredReviews: false,
+    hasFax: false,
+    faxEvidence: [],
+    formCount: 0,
+    formCtaCount: 0,
+    hasContactForm: false,
+    hasPhoneLink: false,
+    hasEmailLink: false,
+    hasPrivacy: false,
+    hasTerms: false,
+    hasSchema: false,
+    titleLength: 0,
+    metaDescription: "",
+    platform: "",
+    lead: record.lead,
+    niche: record.niche,
+    location: record.location,
+    placeId: clean(record.lead?.placeId),
+    gmbProfileUrl: clean(record.lead?.gmbProfileUrl || record.lead?.googleMapsUri),
+  };
+}
+
 async function generateWithClaude(record, evidence) {
   const apiKey = clean(process.env.ANTHROPIC_API_KEY);
 
@@ -600,8 +730,8 @@ async function generateWithClaude(record, evidence) {
 
   const kind = record.kind;
   const prompt = buildClaudePrompt(record, evidence);
-  const maxUses = kind === "mini" ? 4 : kind === "competitor" ? 7 : 8;
-  const maxTokens = kind === "mini" ? 3_000 : 6_000;
+  const maxUses = ["mini", "website"].includes(kind) ? 4 : kind === "gmb" ? 6 : kind === "competitor" ? 7 : 8;
+  const maxTokens = ["mini", "website", "gmb"].includes(kind) ? 3_500 : 6_000;
   const tools = [
     {
       type: "web_search_20250305",
@@ -885,6 +1015,63 @@ function buildClaudePrompt(record, evidence) {
     generatedDate: new Date().toISOString().slice(0, 10),
   };
 
+  if (record.kind === "website") {
+    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || "Use the manager-approved Website / Technology Audit format."}
+Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep it caller-ready and concise."}
+\nCreate a pre-call Website / Technology Audit for this exact lead. Use supplied public website evidence plus live public web search. Every material finding must be verifiable. Return exactly this JSON shape:\n${JSON.stringify(
+      {
+        title: "Website / Technology Audit",
+        summary: "",
+        score: 0,
+        findings: [
+          {
+            title: "",
+            severity: "critical|high|medium|low",
+            evidence: "",
+            businessImpact: "",
+            approvedSalesWording: "",
+            source: "",
+          },
+        ],
+        approvedOpeningLine: "",
+        suggestedNextStep: "",
+        restrictedStatements: [""],
+        disclaimer: "",
+      },
+      null,
+      2
+    )}\nCover only externally observable website/technology, conversion, trust, usability, SEO/local visibility, and visible platform signals. Do not claim private access, compromise, legal compliance, or facts not supported by evidence.`;
+  }
+
+  if (record.kind === "gmb") {
+    return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || "Use the manager-approved GMB / Local Visibility Audit format."}
+Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep it caller-ready and concise."}
+\nCreate a pre-call GMB / Local Visibility Audit for this exact business. Research its public Google Business Profile/local search presence and current local competitors. Verify NAP, reviews, categories, profile completeness, local visibility, trust/conversion signals, and observable inconsistencies. Return exactly this JSON shape:\n${JSON.stringify(
+      {
+        title: "GMB / Local Visibility Audit",
+        summary: "",
+        profileStatus: "",
+        localVisibility: "",
+        findings: [
+          {
+            title: "",
+            severity: "critical|high|medium|low",
+            evidence: "",
+            businessImpact: "",
+            approvedSalesWording: "",
+            source: "",
+          },
+        ],
+        approvedOpeningLine: "",
+        suggestedNextStep: "",
+        restrictedStatements: [""],
+        disclaimer: "",
+      },
+      null,
+      2
+    )}\nDo not invent rankings, review counts, profile ownership, suspension status, or competitors. If a value cannot be verified, say so explicitly.`;
+  }
+
   if (record.kind === "mini") {
     return `${JSON.stringify(base)}\n\nWorkspace report-format instructions: ${record.reportTemplate?.instructions || record.reportTemplate?.miniInstructions || "Preserve the approved Mini Audit structure exactly."}
 Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Keep it concise and caller-friendly."}\n\nResearch the business using live web search before writing. Search for the business's Google, Yelp, and other public directory listings; compare their address and phone with the supplied website and lead evidence. Search for the primary category plus city and identify whether the business appears prominently and which 2-4 real competitors appear instead. Use only facts you can verify. Return exactly this JSON shape:\n${JSON.stringify(
@@ -985,6 +1172,34 @@ Length / presentation guidance: ${record.reportTemplate?.lengthGuidance || "Prod
 }
 
 function normalizeGeneratedReport(record, evidence, value) {
+  if (["website", "gmb"].includes(record.kind)) {
+    const findings = Array.isArray(value.findings)
+      ? value.findings.slice(0, 12).map((item) => ({
+          title: clean(item.title || item.tag),
+          severity: normalizeSeverity(item.severity),
+          evidence: clean(item.evidence || item.finding),
+          businessImpact: clean(item.businessImpact || item.pain || item.impact),
+          approvedSalesWording: clean(item.approvedSalesWording || item.salesWording),
+          source: clean(item.source),
+        })).filter((item) => item.title && item.evidence)
+      : [];
+
+    return {
+      title: clean(value.title) ||
+        (record.kind === "gmb" ? "GMB / Local Visibility Audit" : "Website / Technology Audit"),
+      summary: clean(value.summary || value.executiveSummary),
+      score: clamp(value.score || evidenceFallbackScore(evidence), 0, 100),
+      profileStatus: record.kind === "gmb" ? clean(value.profileStatus) : "",
+      localVisibility: record.kind === "gmb" ? clean(value.localVisibility) : "",
+      findings,
+      approvedOpeningLine: clean(value.approvedOpeningLine),
+      suggestedNextStep: clean(value.suggestedNextStep),
+      restrictedStatements: toStringArray(value.restrictedStatements, 8),
+      disclaimer: clean(value.disclaimer) ||
+        "Based only on publicly accessible evidence observed at the report date. Verify any uncertain detail before using it in a sales conversation.",
+    };
+  }
+
   if (record.kind === "mini") {
     const issues = Array.isArray(value.issues) ? value.issues : [];
     const normalizedIssues = issues
@@ -1108,6 +1323,33 @@ function normalizeGeneratedReport(record, evidence, value) {
 }
 
 function buildFallbackReport(record, evidence, error) {
+  if (["website", "gmb"].includes(record.kind)) {
+    const mini = buildFallbackMini(record, evidence);
+    return {
+      title: record.kind === "gmb"
+        ? "GMB / Local Visibility Audit"
+        : "Website / Technology Audit",
+      summary: record.kind === "gmb"
+        ? "Live GMB research could not be completed. Only currently supplied public lead evidence is shown; rerun when live research is available."
+        : "Live report generation could not be completed. This fallback contains only verified public website observations.",
+      score: evidenceFallbackScore(evidence),
+      profileStatus: record.kind === "gmb" ? "Not fully verified - rerun required." : "",
+      localVisibility: record.kind === "gmb" ? "Not fully verified - rerun required." : "",
+      findings: (mini.issues || []).map((item) => ({
+        title: item.tag,
+        severity: "medium",
+        evidence: item.finding,
+        businessImpact: item.pain,
+        approvedSalesWording: "",
+        source: item.source,
+      })),
+      approvedOpeningLine: "",
+      suggestedNextStep: "Review the verified audit findings with the prospect.",
+      restrictedStatements: [],
+      disclaimer: `Claude generation unavailable: ${error.message}`,
+    };
+  }
+
   if (record.kind === "mini") {
     return {
       ...buildFallbackMini(record, evidence),
@@ -1323,7 +1565,8 @@ function sanitizeLead(input = {}) {
     phone: clean(input.phone),
     address: clean(input.address),
     category: clean(input.category),
-    placeId: clean(input.placeId),
+    placeId: clean(input.placeId || input.googlePlaceId),
+    gmbProfileUrl: clean(input.gmbProfileUrl || input.googleMapsUri || input.googleMapsUrl),
     qualityScore: Number(input.qualityScore || input.confidence || 0),
     dailyNiche: clean(input.dailyNiche || input.niche),
     dailyLocation: clean(input.dailyLocation || input.location),
@@ -1365,6 +1608,10 @@ function publicReport(record, { includeEvidence = false } = {}) {
     expiresAt: record.expiresAt,
     status: record.status,
     kind: record.kind,
+    campaignType: record.campaignType || normalizeCampaignType(record.kind),
+    auditType: record.auditType || "",
+    campaignId: record.campaignId || "",
+    leadId: record.leadId || record.lead?.id || "",
     website: record.website,
     lead: record.lead,
     niche: record.niche,
@@ -1705,7 +1952,40 @@ function renderAuditPdf(audit) {
 
   pdf.header(brand, `${audit.kind.toUpperCase()} AUDIT REPORT`, audit.website);
 
-  if (audit.kind === "mini") {
+  if (["website", "gmb"].includes(audit.kind)) {
+    pdf.heading(
+      report.title ||
+        (audit.kind === "gmb" ? "GMB / Local Visibility Audit" : "Website / Technology Audit"),
+      19
+    );
+    pdf.paragraph(report.summary || "");
+    if (Number.isFinite(Number(report.score))) {
+      pdf.score(Number(report.score || 0));
+    }
+    if (audit.kind === "gmb") {
+      pdf.keyValue("Profile status", report.profileStatus || "Not verified");
+      pdf.keyValue("Local visibility", report.localVisibility || "Not verified");
+    }
+    pdf.section("VERIFIED FINDINGS");
+    (report.findings || []).forEach((item, index) => {
+      pdf.subheading(`${index + 1}. ${item.title || "Finding"} [${String(item.severity || "medium").toUpperCase()}]`);
+      pdf.keyValue("Evidence", item.evidence);
+      pdf.keyValue("Business impact", item.businessImpact);
+      if (item.approvedSalesWording) {
+        pdf.keyValue("Approved sales wording", item.approvedSalesWording);
+      }
+      if (item.source) pdf.muted(item.source);
+    });
+    if (report.approvedOpeningLine) {
+      pdf.section("APPROVED OPENING LINE");
+      pdf.paragraph(report.approvedOpeningLine);
+    }
+    if (report.suggestedNextStep) {
+      pdf.section("SUGGESTED NEXT STEP");
+      pdf.paragraph(report.suggestedNextStep);
+    }
+    pdf.footerNote(report.disclaimer || "Public-source caller audit.");
+  } else  if (audit.kind === "mini") {
     pdf.heading(report.header?.title || "Mini Audit", 18);
     pdf.muted(report.header?.subtitle || "One page. Everything you need before you dial.");
     pdf.section("BUSINESS SNAPSHOT");
@@ -2095,8 +2375,30 @@ function isLikelyEmail(value) {
 }
 
 function normalizeKind(value) {
-  const kind = normalize(value || "mini");
-  return ["mini", "competitor", "full"].includes(kind) ? kind : "mini";
+  const kind = normalize(value || "mini").replace(/ /g, "_");
+  const aliases = {
+    website: "website",
+    website_audit: "website",
+    technology: "website",
+    technology_audit: "website",
+    tech: "website",
+    gmb: "gmb",
+    gmb_audit: "gmb",
+    google_business_profile: "gmb",
+    local_visibility: "gmb",
+    mini: "mini",
+    mini_audit: "mini",
+    competitor: "competitor",
+    competitor_analysis: "competitor",
+    full: "full",
+    full_audit: "full",
+  };
+  return aliases[kind] || "mini";
+}
+
+function normalizeCampaignType(value) {
+  const kind = normalizeKind(value);
+  return kind === "gmb" ? "gmb" : "website";
 }
 
 function normalizePageHref(value, base = "") {

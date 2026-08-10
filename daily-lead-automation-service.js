@@ -331,42 +331,21 @@ export function createDailyLeadAutomationService({
     user,
     input = {}
   ) {
-    const context =
-      getContext(user);
-
+    const context = getContext(user);
     requireManager(context);
 
-    const current =
-      getConfig(
-        context.workspaceId
-      );
+    const current = getConfig(context.workspaceId);
+    const next = normalizeConfig({
+      ...current,
+      ...input,
+    });
 
-    const next =
-      normalizeConfig({
-        ...current,
-        ...input,
-      });
-
-    store.update(
-      (draft) => {
-        ensureState(
-          draft
-        );
-
-        draft.workspaceSettings[
-          context.workspaceId
-        ] =
-          draft.workspaceSettings[
-            context.workspaceId
-          ] ||
-          {};
-
-        draft.workspaceSettings[
-          context.workspaceId
-        ].dailyLeadAutomation =
-          next;
-      }
-    );
+    store.update((draft) => {
+      ensureState(draft);
+      draft.workspaceSettings[context.workspaceId] =
+        draft.workspaceSettings[context.workspaceId] || {};
+      draft.workspaceSettings[context.workspaceId].dailyLeadAutomation = next;
+    });
 
     emitWorkspaceEvent(
       context.workspaceId,
@@ -378,481 +357,274 @@ export function createDailyLeadAutomationService({
       }
     );
 
-    // Manager timing changes take effect immediately. The scheduler is rebuilt
-    // from persisted workspace configuration instead of stale environment values.
+    // Per-caller time changes take effect immediately.
     scheduleNextRun();
 
-    // If the manager moves today's cutoff to a time that has already passed,
-    // safely catch up now. Completed daily runs remain idempotent and are skipped.
+    // If a caller's newly saved time already passed today and today's queue is
+    // still short, fill only that caller's shortage now. Workload checks keep
+    // this idempotent and prevent duplicate daily queues.
     void runDueWorkspaces({
-      source:
-        "manager-config-catch-up",
+      source: "manager-config-catch-up",
+      workspaceId: context.workspaceId,
     }).catch((error) => {
       console.error(
         `[daily-leads] manager config catch-up failed ${JSON.stringify({
-          at:
-            new Date().toISOString(),
-          workspaceId:
-            context.workspaceId,
-          message:
-            error?.message ||
-            String(error),
+          at: new Date().toISOString(),
+          workspaceId: context.workspaceId,
+          message: error?.message || String(error),
         })}`
       );
+    });
+
+    const nextRunAt = getWorkspaceNextScheduledRunDate({
+      state: store.read(),
+      workspaceId: context.workspaceId,
+      config: next,
+      now: new Date(),
     });
 
     return {
       ok: true,
       config: next,
-      nextRunAt:
-        getNextScheduledRunDate(
-          new Date(),
-          next
-        ).toISOString(),
+      nextRunAt: nextRunAt?.toISOString?.() || "",
     };
   }
 
-  function status(
-    user
-  ) {
-    const context =
-      getContext(user);
-
+  function status(user) {
+    const context = getContext(user);
     requireManager(context);
 
-    const state =
-      store.read();
+    const state = store.read();
+    const config = getConfig(context.workspaceId);
+    const now = new Date();
+    const dateKey = getDateKey(now, config.timezone);
 
-    const config =
-      getConfig(
-        context.workspaceId
+    const runs = (state.dailyLeadRuns || [])
+      .filter((run) => run.workspaceId === context.workspaceId)
+      .sort(
+        (left, right) =>
+          Date.parse(right.createdAt || 0) -
+          Date.parse(left.createdAt || 0)
       );
 
-    const runs =
-      (
-        state.dailyLeadRuns ||
-        []
-      )
-        .filter(
-          (run) =>
-            run.workspaceId ===
-            context.workspaceId
-        )
-        .sort(
-          (left, right) =>
-            Date.parse(
-              right.createdAt ||
-                0
-            ) -
-            Date.parse(
-              left.createdAt ||
-                0
-            )
-        );
-
-    const callers =
-      getActiveCallers(
-        state,
-        context.workspaceId
-      );
-
-    const dateKey =
-      getBusinessDateKey(
-        new Date(),
-        config
-      );
-
-    const nextRunAt =
-      getNextScheduledRunDate(
-        new Date(),
-        config
-      ).toISOString();
-
-    return {
-      ok: true,
-
-      workspaceId:
-        context.workspaceId,
-
+    const callers = getActiveCallers(state, context.workspaceId);
+    const workspaceNextRun = getWorkspaceNextScheduledRunDate({
+      state,
+      workspaceId: context.workspaceId,
       config,
-
-      callerCount:
-        callers.length,
-
-      dateKey,
-
-      nextRunAt,
-
-      callers:
-        callers.map(
-          (caller, index) => {
-            const plan =
-              resolveCallerPlan(
-                config,
-                caller,
-                index
-              );
-
-            const dayStats =
-              getCallerDayStats({
-                state,
-                workspaceId:
-                  context.workspaceId,
-                callerId:
-                  caller.id,
-                dateKey,
-              });
-
-            const submission =
-              getCallerSubmission({
-                state,
-                workspaceId:
-                  context.workspaceId,
-                callerId:
-                  caller.id,
-                dateKey,
-              });
-
-            return {
-              id: caller.id,
-              name:
-                caller.name ||
-                caller.fullName ||
-                caller.email ||
-                "Caller",
-              email:
-                caller.email ||
-                "",
-              currentNiche:
-                dayStats.niche ||
-                "",
-              currentResourceType:
-                dayStats.resourceType ||
-                "",
-              currentLocation:
-                dayStats.location ||
-                "",
-              currentCountry:
-                dayStats.country ||
-                "",
-              nextNiche:
-                plan.niche ||
-                "",
-              nextResourceType:
-                plan.resourceType ||
-                "international",
-              nextLocation:
-                plan.location ||
-                "",
-              nextCountry:
-                plan.country ||
-                "",
-              nextRegionCode:
-                plan.regionCode ||
-                "",
-              assignedToday:
-                dayStats.assigned,
-              workedToday:
-                dayStats.worked,
-              remainingToday:
-                dayStats.remaining,
-              submission:
-                submission ||
-                null,
-            };
-          }
-        ),
-
-      todayRun:
-        runs.find(
-          (run) =>
-            run.dateKey ===
-            dateKey
-        ) ||
-        null,
-
-      latestRun:
-        runs[0] ||
-        null,
-
-      recentRuns:
-        runs.slice(
-          0,
-          20
-        ),
-    };
-  }
-
-  function myDay(
-    user
-  ) {
-    const context =
-      getContext(user);
-
-    const role =
-      normalizeRole(
-        context?.role ||
-        user?.workspaceRole ||
-        user?.role
-      );
-
-    if (role !== "caller") {
-      throw httpError(
-        403,
-        "Caller access is required."
-      );
-    }
-
-    const config =
-      getConfig(
-        context.workspaceId
-      );
-
-    const state =
-      store.read();
-
-    const callers =
-      getActiveCallers(
-        state,
-        context.workspaceId
-      );
-
-    const callerIndex =
-      Math.max(
-        0,
-        callers.findIndex(
-          (caller) =>
-            caller.id ===
-            user.id
-        )
-      );
-
-    const caller =
-      callers[callerIndex] ||
-      user;
-
-    const dateKey =
-      getBusinessDateKey(
-        new Date(),
-        config
-      );
-
-    const stats =
-      getCallerDayStats({
-        state,
-        workspaceId:
-          context.workspaceId,
-        callerId:
-          user.id,
-        dateKey,
-      });
-
-    const plan =
-      resolveCallerPlan(
-        config,
-        caller,
-        callerIndex
-      );
-
-    const submission =
-      getCallerSubmission({
-        state,
-        workspaceId:
-          context.workspaceId,
-        callerId:
-          user.id,
-        dateKey,
-      });
+      now,
+    });
 
     return {
       ok: true,
-      workspaceId:
-        context.workspaceId,
+      workspaceId: context.workspaceId,
+      config,
+      callerCount: callers.length,
       dateKey,
-      timezone:
-        config.timezone,
-      assignmentHour:
-        config.assignmentHour,
-      assignmentMinute:
-        config.assignmentMinute,
-      leadsPerCaller:
-        config.leadsPerCaller,
-      nextRefreshAt:
-        getNextScheduledRunDate(
-          new Date(),
-          config
-        ).toISOString(),
-      currentNiche:
-        stats.niche ||
-        "",
-      currentResourceType:
-        stats.resourceType ||
-        "",
-      currentLocation:
-        stats.location ||
-        "",
-      currentCountry:
-        stats.country ||
-        "",
-      nextNiche:
-        plan.niche ||
-        "",
-      nextResourceType:
-        plan.resourceType ||
-        "international",
-      nextLocation:
-        plan.location ||
-        "",
-      nextCountry:
-        plan.country ||
-        "",
-      nextRegionCode:
-        plan.regionCode ||
-        "",
-      assigned:
-        stats.assigned,
-      worked:
-        stats.worked,
-      closed:
-        stats.closed,
-      remaining:
-        stats.remaining,
-      submission:
-        submission ||
-        null,
-    };
-  }
+      nextRunAt: workspaceNextRun?.toISOString?.() || "",
+      callers: callers.map((caller, index) => {
+        const plan = resolveCallerPlan(config, caller, index);
 
-  function submitMyDay(
-    user,
-    input = {}
-  ) {
-    const context =
-      getContext(user);
-
-    const role =
-      normalizeRole(
-        context?.role ||
-        user?.workspaceRole ||
-        user?.role
-      );
-
-    if (role !== "caller") {
-      throw httpError(
-        403,
-        "Caller access is required."
-      );
-    }
-
-    const config =
-      getConfig(
-        context.workspaceId
-      );
-
-    const dateKey =
-      getBusinessDateKey(
-        new Date(),
-        config
-      );
-
-    const submittedAt =
-      new Date().toISOString();
-
-    let saved = null;
-
-    store.update(
-      (draft) => {
-        ensureState(draft);
-
-        const stats =
-          getCallerDayStats({
-            state: draft,
-            workspaceId:
-              context.workspaceId,
-            callerId:
-              user.id,
-            dateKey,
-          });
-
-        const existing =
-          draft.dailyCallerSubmissions.find(
-            (item) =>
-              item.workspaceId ===
-                context.workspaceId &&
-              item.callerId ===
-                user.id &&
-              item.dateKey ===
-                dateKey
-          );
-
-        const record = {
-          id:
-            existing?.id ||
-            crypto.randomUUID(),
-          workspaceId:
-            context.workspaceId,
-          callerId:
-            user.id,
-          callerName:
-            user.name ||
-            user.fullName ||
-            user.email ||
-            "Caller",
+        // Manager view shows the calendar day's queue. Before a caller's
+        // selected delivery time, today's assigned count therefore remains 0.
+        const dayStats = getCallerDayStats({
+          state,
+          workspaceId: context.workspaceId,
+          callerId: caller.id,
           dateKey,
-          status:
-            "submitted",
-          assigned:
-            stats.assigned,
-          worked:
-            stats.worked,
-          closed:
-            stats.closed,
-          remaining:
-            stats.remaining,
-          notes:
-            String(
-              input.notes ||
-              ""
-            ).slice(0, 2000),
-          submittedAt,
-          deadlineAt:
-            getNextScheduledRunDate(
-              new Date(),
-              config
-            ).toISOString(),
-          createdAt:
-            existing?.createdAt ||
-            submittedAt,
-          updatedAt:
-            submittedAt,
+        });
+
+        const submission = getCallerSubmission({
+          state,
+          workspaceId: context.workspaceId,
+          callerId: caller.id,
+          dateKey,
+        });
+
+        const callerConfig = {
+          ...config,
+          assignmentHour: plan.assignmentHour,
+          assignmentMinute: plan.assignmentMinute,
         };
 
-        if (existing) {
-          Object.assign(
-            existing,
-            record
-          );
-          saved = {
-            ...existing,
-          };
-        } else {
-          draft.dailyCallerSubmissions.unshift(
-            record
-          );
-          saved = {
-            ...record,
-          };
-        }
-      }
+        return {
+          id: caller.id,
+          name: caller.name || caller.fullName || caller.email || "Caller",
+          email: caller.email || "",
+          currentNiche: dayStats.niche || "",
+          currentResourceType: dayStats.resourceType || "",
+          currentLocation: dayStats.location || "",
+          currentCountry: dayStats.country || "",
+          nextNiche: plan.niche || "",
+          nextResourceType: plan.resourceType || "international",
+          nextLocation: plan.location || "",
+          nextCountry: plan.country || "",
+          nextRegionCode: plan.regionCode || "",
+          assignmentHour: plan.assignmentHour,
+          assignmentMinute: plan.assignmentMinute,
+          websiteCalls: plan.websiteCalls,
+          gmbCalls: plan.gmbCalls,
+          nextRefreshAt: getNextScheduledRunDate(now, callerConfig).toISOString(),
+          assignedToday: dayStats.assigned,
+          workedToday: dayStats.worked,
+          remainingToday: dayStats.remaining,
+          websiteAssignedToday: dayStats.websiteAssigned,
+          gmbAssignedToday: dayStats.gmbAssigned,
+          websiteWorkedToday: dayStats.websiteWorked,
+          gmbWorkedToday: dayStats.gmbWorked,
+          submission: submission || null,
+        };
+      }),
+      todayRun: runs.find((run) => run.dateKey === dateKey) || null,
+      latestRun: runs[0] || null,
+      recentRuns: runs.slice(0, 20),
+    };
+  }
+
+  function myDay(user) {
+    const context = getContext(user);
+    const role = normalizeRole(
+      context?.role || user?.workspaceRole || user?.role
     );
 
-    emitWorkspaceEvent(
-      context.workspaceId,
-      "daily-leads:submitted",
-      {
-        submission: saved,
-      }
+    if (role !== "caller") {
+      throw httpError(403, "Caller access is required.");
+    }
+
+    const config = getConfig(context.workspaceId);
+    const state = store.read();
+    const callers = getActiveCallers(state, context.workspaceId);
+    const foundIndex = callers.findIndex((caller) => caller.id === user.id);
+    const callerIndex = foundIndex >= 0 ? foundIndex : 0;
+    const caller = callers[callerIndex] || user;
+    const plan = resolveCallerPlan(config, caller, callerIndex);
+    const callerConfig = {
+      ...config,
+      assignmentHour: plan.assignmentHour,
+      assignmentMinute: plan.assignmentMinute,
+    };
+
+    // Caller keeps the previous working queue until their own scheduled time.
+    const dateKey = getBusinessDateKey(new Date(), callerConfig);
+    const stats = getCallerDayStats({
+      state,
+      workspaceId: context.workspaceId,
+      callerId: user.id,
+      dateKey,
+    });
+    const submission = getCallerSubmission({
+      state,
+      workspaceId: context.workspaceId,
+      callerId: user.id,
+      dateKey,
+    });
+
+    return {
+      ok: true,
+      workspaceId: context.workspaceId,
+      dateKey,
+      timezone: config.timezone,
+      assignmentHour: plan.assignmentHour,
+      assignmentMinute: plan.assignmentMinute,
+      leadsPerCaller: config.leadsPerCaller,
+      websiteCalls: plan.websiteCalls,
+      gmbCalls: plan.gmbCalls,
+      nextRefreshAt: getNextScheduledRunDate(new Date(), callerConfig).toISOString(),
+      currentNiche: stats.niche || "",
+      currentResourceType: stats.resourceType || "",
+      currentLocation: stats.location || "",
+      currentCountry: stats.country || "",
+      nextNiche: plan.niche || "",
+      nextResourceType: plan.resourceType || "international",
+      nextLocation: plan.location || "",
+      nextCountry: plan.country || "",
+      nextRegionCode: plan.regionCode || "",
+      assigned: stats.assigned,
+      worked: stats.worked,
+      closed: stats.closed,
+      remaining: stats.remaining,
+      websiteAssigned: stats.websiteAssigned,
+      gmbAssigned: stats.gmbAssigned,
+      websiteWorked: stats.websiteWorked,
+      gmbWorked: stats.gmbWorked,
+      submission: submission || null,
+    };
+  }
+
+  function submitMyDay(user, input = {}) {
+    const context = getContext(user);
+    const role = normalizeRole(
+      context?.role || user?.workspaceRole || user?.role
     );
+
+    if (role !== "caller") {
+      throw httpError(403, "Caller access is required.");
+    }
+
+    const config = getConfig(context.workspaceId);
+    const state = store.read();
+    const callers = getActiveCallers(state, context.workspaceId);
+    const foundIndex = callers.findIndex((caller) => caller.id === user.id);
+    const callerIndex = foundIndex >= 0 ? foundIndex : 0;
+    const caller = callers[callerIndex] || user;
+    const plan = resolveCallerPlan(config, caller, callerIndex);
+    const callerConfig = {
+      ...config,
+      assignmentHour: plan.assignmentHour,
+      assignmentMinute: plan.assignmentMinute,
+    };
+
+    const dateKey = getBusinessDateKey(new Date(), callerConfig);
+    const submittedAt = new Date().toISOString();
+    let saved = null;
+
+    store.update((draft) => {
+      ensureState(draft);
+
+      const stats = getCallerDayStats({
+        state: draft,
+        workspaceId: context.workspaceId,
+        callerId: user.id,
+        dateKey,
+      });
+
+      const existing = draft.dailyCallerSubmissions.find(
+        (item) =>
+          item.workspaceId === context.workspaceId &&
+          item.callerId === user.id &&
+          item.dateKey === dateKey
+      );
+
+      const record = {
+        id: existing?.id || crypto.randomUUID(),
+        workspaceId: context.workspaceId,
+        callerId: user.id,
+        callerName: user.name || user.fullName || user.email || "Caller",
+        dateKey,
+        status: "submitted",
+        assigned: stats.assigned,
+        worked: stats.worked,
+        closed: stats.closed,
+        remaining: stats.remaining,
+        notes: String(input.notes || "").slice(0, 2000),
+        submittedAt,
+        deadlineAt: getNextScheduledRunDate(new Date(), callerConfig).toISOString(),
+        createdAt: existing?.createdAt || submittedAt,
+        updatedAt: submittedAt,
+      };
+
+      if (existing) {
+        Object.assign(existing, record);
+        saved = { ...existing };
+      } else {
+        draft.dailyCallerSubmissions.unshift(record);
+        saved = { ...record };
+      }
+    });
+
+    emitWorkspaceEvent(context.workspaceId, "daily-leads:submitted", {
+      submission: saved,
+    });
 
     return {
       ok: true,
@@ -886,61 +658,48 @@ export function createDailyLeadAutomationService({
 
   async function runDueWorkspaces({
     source = "scheduler",
+    workspaceId: onlyWorkspaceId = "",
   } = {}) {
     const now = new Date();
     const results = [];
+    const workspaceIds = onlyWorkspaceId
+      ? [onlyWorkspaceId]
+      : getWorkspaceIds();
 
-    for (const workspaceId of getWorkspaceIds()) {
+    for (const workspaceId of workspaceIds) {
       const config = getConfig(workspaceId);
       if (!config.enabled) continue;
 
-      const local =
-        getZonedDateParts(
-          now,
-          config.timezone
-        );
+      const state = store.read();
+      const callers = getActiveCallers(state, workspaceId);
+      if (!callers.length) continue;
 
-      const isPastCutoff =
-        local.hour >
-          config.assignmentHour ||
-        (
-          local.hour ===
-            config.assignmentHour &&
-          local.minute >=
-            config.assignmentMinute
-        );
+      const local = getZonedDateParts(now, config.timezone);
+      const dateKey = getDateKey(now, config.timezone);
+      const dueCallerIds = [];
 
-      if (!isPastCutoff) {
-        continue;
-      }
+      callers.forEach((caller, index) => {
+        const plan = resolveCallerPlan(config, caller, index);
+        const isPastCallerCutoff =
+          local.hour > plan.assignmentHour ||
+          (local.hour === plan.assignmentHour &&
+            local.minute >= plan.assignmentMinute);
 
-      const dateKey =
-        getDateKey(
-          now,
-          config.timezone
-        );
+        if (!isPastCallerCutoff) return;
 
-      const existing =
-        findTodayRun(
-          store.read(),
+        const stats = getCallerDayStats({
+          state,
           workspaceId,
-          dateKey
-        );
+          callerId: caller.id,
+          dateKey,
+        });
 
-      if (
-        existing &&
-        FINISHED_RUN_STATUSES.has(
-          normalizeStatus(
-            existing.status
-          )
-        ) &&
-        Number(
-          existing.assignedCount ||
-          0
-        ) > 0
-      ) {
-        continue;
-      }
+        if (stats.assigned < config.leadsPerCaller) {
+          dueCallerIds.push(caller.id);
+        }
+      });
+
+      if (!dueCallerIds.length) continue;
 
       try {
         results.push(
@@ -948,28 +707,24 @@ export function createDailyLeadAutomationService({
             workspaceId,
             source,
             force: false,
+            callerIds: dueCallerIds,
+            dateKeyOverride: dateKey,
           })
         );
       } catch (error) {
         results.push({
           ok: false,
           workspaceId,
-          error:
-            error?.message ||
-            String(error),
+          callerIds: dueCallerIds,
+          error: error?.message || String(error),
         });
       }
     }
 
     return {
-      ok:
-        results.every(
-          (item) =>
-            item.ok !== false
-        ),
+      ok: results.every((item) => item.ok !== false),
       results,
-      completedAt:
-        new Date().toISOString(),
+      completedAt: new Date().toISOString(),
     };
   }
 
@@ -982,6 +737,17 @@ export function createDailyLeadAutomationService({
 
     requireManager(context);
 
+    const callerId =
+      String(
+        input.callerId ||
+          ""
+      ).trim();
+
+    const config =
+      getConfig(
+        context.workspaceId
+      );
+
     return runWorkspace({
       workspaceId:
         context.workspaceId,
@@ -991,10 +757,32 @@ export function createDailyLeadAutomationService({
 
       source:
         input.source ||
-        "manual",
+        (callerId
+          ? "manager-caller-now"
+          : "manual"),
 
       force:
         input.force === true,
+
+      callerIds:
+        callerId
+          ? [callerId]
+          : null,
+
+      // A caller-specific manual run always targets the manager's calendar day,
+      // regardless of whether that caller's normal delivery time is still ahead.
+      dateKeyOverride:
+        callerId
+          ? getDateKey(
+              new Date(),
+              config.timezone
+            )
+          : "",
+
+      overrideToday:
+        callerId &&
+        input.overrideToday ===
+          true,
     });
   }
 
@@ -1096,47 +884,36 @@ export function createDailyLeadAutomationService({
     requestedBy = "",
     source = "automatic",
     force = false,
+    callerIds = null,
+    dateKeyOverride = "",
+    overrideToday = false,
   }) {
     if (!workspaceId) {
-      throw httpError(
-        400,
-        "workspaceId is required."
-      );
+      throw httpError(400, "workspaceId is required.");
     }
 
-    if (
-      workspaceLocks.has(
-        workspaceId
-      )
-    ) {
+    if (workspaceLocks.has(workspaceId)) {
       return {
         ok: true,
         skipped: true,
         workspaceId,
-        reason:
-          "An allocation run is already active for this workspace.",
+        reason: "An allocation run is already active for this workspace.",
       };
     }
 
-    const execution =
-      executeWorkspaceRun({
-        workspaceId,
-        requestedBy,
-        source,
-        force,
-      }).finally(
-        () => {
-          workspaceLocks.delete(
-            workspaceId
-          );
-        }
-      );
-
-    workspaceLocks.set(
+    const execution = executeWorkspaceRun({
       workspaceId,
-      execution
-    );
+      requestedBy,
+      source,
+      force,
+      callerIds,
+      dateKeyOverride,
+      overrideToday,
+    }).finally(() => {
+      workspaceLocks.delete(workspaceId);
+    });
 
+    workspaceLocks.set(workspaceId, execution);
     return execution;
   }
 
@@ -1226,430 +1003,635 @@ export function createDailyLeadAutomationService({
     requestedBy,
     source,
     force,
+    callerIds = null,
+    dateKeyOverride = "",
+    overrideToday = false,
   }) {
-    const startedAt =
-      new Date().toISOString();
+    const startedAt = new Date().toISOString();
+    const config = getConfig(workspaceId);
 
-    const config =
-      getConfig(
-        workspaceId
-      );
-
-    if (
-      !config.enabled &&
-      !force
-    ) {
+    if (!config.enabled && !force) {
       return {
         ok: true,
         skipped: true,
         workspaceId,
-        reason:
-          "Daily lead automation is disabled.",
+        reason: "Daily lead automation is disabled.",
       };
     }
 
+    const now = new Date();
     const dateKey =
-      getBusinessDateKey(
-        new Date(),
-        config
-      );
+      String(dateKeyOverride || "").trim() ||
+      (force
+        ? getDateKey(now, config.timezone)
+        : getBusinessDateKey(now, config));
 
     recoverStaleRuns({
       workspaceId,
       dateKey,
-      staleRunMinutes:
-        config.staleRunMinutes,
+      staleRunMinutes: config.staleRunMinutes,
     });
 
-    const currentState =
-      store.read();
+    const currentState = store.read();
+    const allCallers = getActiveCallers(currentState, workspaceId);
 
-    const previousRun =
-      findTodayRun(
-        currentState,
-        workspaceId,
-        dateKey
-      );
+    if (!allCallers.length) {
+      throw httpError(422, "No active callers were found in this workspace.");
+    }
 
-    if (
-      previousRun &&
-      FINISHED_RUN_STATUSES.has(
-        normalizeStatus(
-          previousRun.status
+    const requestedCallerIds = Array.isArray(callerIds)
+      ? new Set(
+          callerIds
+            .map((value) => String(value || "").trim())
+            .filter(Boolean)
         )
-      ) &&
-      Number(
-        previousRun.assignedCount ||
-        0
-      ) > 0 &&
-      !force
-    ) {
-      return {
-        ok: true,
-        skipped: true,
-        workspaceId,
-        run:
-          previousRun,
-        reason:
-          "Today's automatic allocation has already completed.",
-      };
-    }
+      : null;
 
-    if (
-      previousRun &&
-      normalizeStatus(
-        previousRun.status
-      ) === "running" &&
-      !force
-    ) {
-      return {
-        ok: true,
-        skipped: true,
-        workspaceId,
-        run:
-          previousRun,
-        reason:
-          "Today's allocation is currently running.",
-      };
-    }
-
-    const callers =
-      getActiveCallers(
-        currentState,
-        workspaceId
-      );
+    const callers = requestedCallerIds
+      ? allCallers.filter((caller) => requestedCallerIds.has(caller.id))
+      : allCallers;
 
     if (!callers.length) {
-      throw httpError(
-        422,
-        "No active callers were found in this workspace."
-      );
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        reason: "No matching active callers require allocation.",
+      };
     }
 
-    // At the configured manager cutoff, close the previous reporting window.
-    // Missing submissions are recorded, but useful leads are still eligible to
-    // roll forward into the new 100-lead queue.
+    const isPartialCallerRun = Boolean(requestedCallerIds);
+    const previousRun = findTodayRun(currentState, workspaceId, dateKey);
+
+    // Workspace-wide automatic runs keep the old run guard. A per-caller run
+    // must not be blocked by another caller's completed run on the same date.
+    if (
+      !isPartialCallerRun &&
+      previousRun &&
+      FINISHED_RUN_STATUSES.has(normalizeStatus(previousRun.status)) &&
+      Number(previousRun.assignedCount || 0) > 0 &&
+      !force
+    ) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        run: previousRun,
+        reason: "Today's automatic allocation has already completed.",
+      };
+    }
+
+    if (
+      !isPartialCallerRun &&
+      previousRun &&
+      normalizeStatus(previousRun.status) === "running" &&
+      !force
+    ) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        run: previousRun,
+        reason: "Today's allocation is currently running.",
+      };
+    }
+
+    const callerIndexById = new Map(
+      allCallers.map((caller, index) => [caller.id, index])
+    );
+
     finalizePreviousDaySubmissions({
       workspaceId,
       dateKey,
       callers,
       config,
+      callerIndexById,
     });
 
-    const targetCount =
-      callers.length *
-      config.leadsPerCaller;
-
-    const run =
-      createRunRecord({
-        workspaceId,
-        dateKey,
-        source,
-        requestedBy,
-        callerCount:
-          callers.length,
-        leadsPerCaller:
-          config.leadsPerCaller,
-        targetCount,
-        startedAt,
-      });
+    const targetCount = callers.length * config.leadsPerCaller;
+    const run = createRunRecord({
+      workspaceId,
+      dateKey,
+      source,
+      requestedBy,
+      callerCount: callers.length,
+      leadsPerCaller: config.leadsPerCaller,
+      targetCount,
+      startedAt,
+    });
 
     try {
-      const reusable =
-        collectReusableLeads({
-          state:
-            store.read(),
-          workspaceId,
-          dateKey,
-          config,
-        });
+      let overrideResult = {
+        supersededCount: 0,
+        leadIds: [],
+      };
 
-      const available = [
-        ...reusable.items,
-      ];
+      // Manager override replaces only today's UNWORKED queue for the selected
+      // caller(s). Already-worked / completed leads remain intact in history and
+      // count toward the daily target. The removed lead IDs are excluded from
+      // this immediate replacement run so "override" really produces a fresh
+      // queue instead of instantly selecting the same leads again.
+      if (
+        overrideToday &&
+        isPartialCallerRun
+      ) {
+        overrideResult =
+          supersedeCallerTodayQueue({
+            workspaceId,
+            dateKey,
+            callerIds:
+              callers.map(
+                (caller) =>
+                  caller.id
+              ),
+            requestedBy,
+          });
+      }
 
-      const workload =
-        countCurrentAssignmentsByCaller({
-          state:
-            store.read(),
-          workspaceId,
-          dateKey,
-          callers,
-        });
+      const protectedTodayLeadIds =
+        overrideToday
+          ? getAssignedDailyLeadIds({
+              state: store.read(),
+              workspaceId,
+              dateKey,
+              callers,
+            })
+          : [];
+
+      const reusable = collectReusableLeads({
+        state: store.read(),
+        workspaceId,
+        dateKey,
+        config,
+        excludeLeadIds:
+          new Set([
+            ...(overrideResult.leadIds ||
+              []),
+            ...protectedTodayLeadIds,
+          ]),
+      });
+      const available = [...reusable.items];
+      const workload = overrideToday
+        ? countAssignedDailyLeadsByCaller({
+            state: store.read(),
+            workspaceId,
+            dateKey,
+            callers,
+          })
+        : countCurrentAssignmentsByCaller({
+            state: store.read(),
+            workspaceId,
+            dateKey,
+            callers,
+          });
 
       const assignedByCaller = {};
       const assignedLeadRefs = [];
       let assignedCount = 0;
       let generatedCount = 0;
 
-      for (
-        let callerIndex = 0;
-        callerIndex < callers.length;
-        callerIndex += 1
-      ) {
-        const caller =
-          callers[callerIndex];
+      for (const caller of callers) {
+        const callerIndex = callerIndexById.get(caller.id) ?? 0;
+        const plan = resolveCallerPlan(config, caller, callerIndex);
+        const current = workload.get(caller.id) || 0;
+        const overallRequired = Math.max(0, config.leadsPerCaller - current);
+        assignedByCaller[caller.id] = 0;
 
-        const plan =
-          resolveCallerPlan(
-            config,
-            caller,
-            callerIndex
-          );
+        if (!overallRequired) continue;
 
-        const current =
-          workload.get(
-            caller.id
-          ) ||
-          0;
+        const currentStats = getCallerDayStats({
+          state: store.read(),
+          workspaceId,
+          callerId: caller.id,
+          dateKey,
+        });
+        const mix = normalizeCallMix(plan, config.leadsPerCaller);
+        let websiteRequired = Math.max(
+          0,
+          mix.websiteCalls - currentStats.websiteAssigned
+        );
+        let gmbRequired = Math.max(
+          0,
+          mix.gmbCalls - currentStats.gmbAssigned
+        );
 
-        const required =
-          Math.max(
-            0,
-            config.leadsPerCaller -
-              current
-          );
-
-        assignedByCaller[
-          caller.id
-        ] = 0;
-
-        if (!required) {
-          continue;
+        // Never exceed the caller's remaining daily capacity. When an existing
+        // queue has the old mix, the manager can use Override + assign now to
+        // replace only unworked tasks and apply the new ratio immediately.
+        const requestedByMix = websiteRequired + gmbRequired;
+        if (requestedByMix > overallRequired) {
+          const overflow = requestedByMix - overallRequired;
+          if (websiteRequired >= gmbRequired) {
+            websiteRequired = Math.max(0, websiteRequired - overflow);
+          } else {
+            gmbRequired = Math.max(0, gmbRequired - overflow);
+          }
         }
 
-        const reusableForCaller =
-          takeCandidatesForCaller({
-            available,
-            caller,
-            plan,
-            limit: required,
-          });
+        const required = websiteRequired + gmbRequired;
+        if (!required) continue;
 
-        let callerCandidates = [
-          ...reusableForCaller,
-        ];
-
-        const missing =
-          required -
-          callerCandidates.length;
+        const reusableForCaller = takeCandidatesForCaller({
+          available,
+          caller,
+          plan,
+          limit: required,
+        });
+        let callerCandidates = [...reusableForCaller];
+        const missing = required - callerCandidates.length;
 
         if (
           missing > 0 &&
-          generatedCount <
-            config.maxGenerationPerRun
+          generatedCount < config.maxGenerationPerRun
         ) {
-          const allowed =
-            Math.min(
-              missing,
-              config.maxGenerationPerRun -
-                generatedCount
-            );
+          const allowed = Math.min(
+            missing,
+            config.maxGenerationPerRun - generatedCount
+          );
 
-          const generated =
-            await generateRealLeads({
-              workspaceId,
-              requestedBy,
-              config,
-              requested: allowed,
-              existingKeys:
-                reusable.usedKeys,
-              runId:
-                run.id,
-              nichesOverride:
-                plan.niche
-                  ? [plan.niche]
-                  : config.niches,
-              locationsOverride:
-                plan.location
-                  ? [plan.location]
-                  : config.locations,
-              regionCodeOverride:
-                plan.regionCode ||
-                config.regionCode,
-              resourceType:
-                plan.resourceType,
-              country:
-                plan.country,
-            });
-
-          generatedCount +=
-            generated.length;
-
-          callerCandidates = [
-            ...callerCandidates,
-            ...generated,
-          ];
-        }
-
-        const callerResult =
-          assignLeadsToCaller({
+          const generated = await generateRealLeads({
             workspaceId,
-            dateKey,
-            caller,
-            candidates:
-              callerCandidates,
-            required,
             requestedBy,
-            source,
-            runId:
-              run.id,
-            plan,
+            config,
+            requested: allowed,
+            existingKeys: reusable.usedKeys,
+            runId: run.id,
+            nichesOverride: plan.niche ? [plan.niche] : config.niches,
+            locationsOverride: plan.location ? [plan.location] : config.locations,
+            regionCodeOverride: plan.regionCode || config.regionCode,
+            resourceType: plan.resourceType,
+            country: plan.country,
           });
 
-        assignedCount +=
-          callerResult.assignedCount;
+          generatedCount += generated.length;
+          callerCandidates = [...callerCandidates, ...generated];
+        }
 
-        assignedByCaller[
-          caller.id
-        ] +=
-          callerResult.assignedCount;
+        const callerResult = assignLeadsToCaller({
+          workspaceId,
+          dateKey,
+          caller,
+          candidates: callerCandidates,
+          required,
+          campaignMix: {
+            website: websiteRequired,
+            gmb: gmbRequired,
+          },
+          requestedBy,
+          source,
+          runId: run.id,
+          plan,
+        });
 
-        assignedLeadRefs.push(
-          ...callerResult.assignedLeadRefs
-        );
+        assignedCount += callerResult.assignedCount;
+        assignedByCaller[caller.id] += callerResult.assignedCount;
+        assignedLeadRefs.push(...callerResult.assignedLeadRefs);
       }
 
       let auditQueuedCount = 0;
-
-      if (
-        config.autoMiniAudit &&
-        assignedLeadRefs.length
-      ) {
-        auditQueuedCount =
-          queueMiniAudits(
-            assignedLeadRefs
-          );
+      if (config.autoMiniAudit && assignedLeadRefs.length) {
+        auditQueuedCount = queueCampaignAudits(assignedLeadRefs);
       }
 
-      const shortfall =
-        Math.max(
-          0,
-          targetCount -
-            callers.reduce(
-              (total, caller) =>
-                total +
-                (
-                  workload.get(
-                    caller.id
-                  ) ||
-                  0
-                ),
-              0
-            ) -
-            assignedCount
-        );
-
-      const finalStatus =
-        shortfall > 0
-          ? "completed_partial"
-          : "completed";
-
-      const completedRun =
-        updateRunRecord(
-          run.id,
-          {
-            status:
-              finalStatus,
-            recycledCount:
-              reusable.recycledCount,
-            reusedCount:
-              reusable.reusedCount,
-            generatedCount,
-            assignedCount,
-            auditQueuedCount,
-            shortfall,
-            assignedByCaller,
-            callerPlans:
-              Object.fromEntries(
-                callers.map(
-                  (caller, index) => [
-                    caller.id,
-                    resolveCallerPlan(
-                      config,
-                      caller,
-                      index
-                    ),
-                  ]
-                )
-              ),
-            completedAt:
-              new Date().toISOString(),
-            updatedAt:
-              new Date().toISOString(),
-          }
-        );
-
-      emitWorkspaceEvent(
-        workspaceId,
-        "daily-leads:completed",
-        {
-          run:
-            completedRun,
-          dateKey,
-        }
+      const existingCount = callers.reduce(
+        (total, caller) => total + (workload.get(caller.id) || 0),
+        0
       );
+      const shortfall = Math.max(
+        0,
+        targetCount - existingCount - assignedCount
+      );
+      const finalStatus = shortfall > 0 ? "completed_partial" : "completed";
+
+      const completedRun = updateRunRecord(run.id, {
+        status: finalStatus,
+        recycledCount: reusable.recycledCount,
+        reusedCount: reusable.reusedCount,
+        generatedCount,
+        assignedCount,
+        auditQueuedCount,
+        shortfall,
+        assignedByCaller,
+        overriddenCount:
+          overrideResult.supersededCount ||
+          0,
+        scheduledCallerIds: callers.map((caller) => caller.id),
+        callerPlans: Object.fromEntries(
+          callers.map((caller) => [
+            caller.id,
+            resolveCallerPlan(
+              config,
+              caller,
+              callerIndexById.get(caller.id) ?? 0
+            ),
+          ])
+        ),
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      emitWorkspaceEvent(workspaceId, "daily-leads:completed", {
+        run: completedRun,
+        dateKey,
+        callerIds: callers.map((caller) => caller.id),
+      });
 
       console.log(
         `[daily-leads] workspace completed ${JSON.stringify({
-          at:
-            new Date().toISOString(),
+          at: new Date().toISOString(),
           workspaceId,
           dateKey,
-          callerCount:
-            callers.length,
-          leadsPerCaller:
-            config.leadsPerCaller,
-          reusedCount:
-            reusable.reusedCount,
-          recycledCount:
-            reusable.recycledCount,
+          callerCount: callers.length,
+          callerIds: callers.map((caller) => caller.id),
+          leadsPerCaller: config.leadsPerCaller,
+          reusedCount: reusable.reusedCount,
+          recycledCount: reusable.recycledCount,
           generatedCount,
           assignedCount,
+          overriddenCount:
+            overrideResult.supersededCount ||
+            0,
           shortfall,
-          status:
-            finalStatus,
+          status: finalStatus,
         })}`
       );
 
       return {
         ok: true,
         workspaceId,
-        run:
-          completedRun,
+        callerIds: callers.map((caller) => caller.id),
+        run: completedRun,
       };
     } catch (error) {
-      const failedRun =
-        updateRunRecord(
-          run.id,
-          {
-            status:
-              "failed",
-            errors: [
-              error?.message ||
-                String(error),
-            ],
-            completedAt:
-              new Date().toISOString(),
-            updatedAt:
-              new Date().toISOString(),
-          }
-        );
+      const failedRun = updateRunRecord(run.id, {
+        status: "failed",
+        errors: [error?.message || String(error)],
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
 
-      emitWorkspaceEvent(
-        workspaceId,
-        "daily-leads:failed",
-        {
-          run:
-            failedRun,
-          error:
-            error?.message ||
-            String(error),
-        }
-      );
+      emitWorkspaceEvent(workspaceId, "daily-leads:failed", {
+        run: failedRun,
+        error: error?.message || String(error),
+      });
 
       throw error;
     }
+  }
+
+  function supersedeCallerTodayQueue({
+    workspaceId,
+    dateKey,
+    callerIds = [],
+    requestedBy = "",
+  }) {
+    const callerIdSet =
+      new Set(
+        callerIds
+          .map((value) =>
+            String(value || "").trim()
+          )
+          .filter(Boolean)
+      );
+
+    if (!callerIdSet.size) {
+      return {
+        supersededCount: 0,
+        leadIds: [],
+      };
+    }
+
+    const now =
+      new Date().toISOString();
+    const supersededLeadIds =
+      new Set();
+
+    store.update((draft) => {
+      ensureState(draft);
+
+      for (
+        const campaign
+        of draft.campaigns || []
+      ) {
+        if (
+          campaign.workspaceId !==
+          workspaceId
+        ) {
+          continue;
+        }
+
+        for (
+          const lead
+          of campaign.leads || []
+        ) {
+          const callerId =
+            String(
+              lead.assignedTo ||
+                lead.assigneeId ||
+                ""
+            );
+
+          const queueDate =
+            String(
+              lead.dailyQueueDate ||
+                lead.assignmentDate ||
+                ""
+            );
+
+          if (
+            !callerIdSet.has(
+              callerId
+            ) ||
+            queueDate !== dateKey ||
+            !isReplaceableDailyLead(
+              lead
+            )
+          ) {
+            continue;
+          }
+
+          supersededLeadIds.add(
+            String(lead.id)
+          );
+
+          lead.timeline =
+            Array.isArray(
+              lead.timeline
+            )
+              ? lead.timeline
+              : [];
+
+          lead.timeline.unshift({
+            id:
+              crypto.randomUUID(),
+            type:
+              "daily_assignment_overridden",
+            actorId:
+              requestedBy ||
+              "manager",
+            previousAssigneeId:
+              callerId,
+            assignmentDate:
+              dateKey,
+            createdAt: now,
+          });
+
+          lead.previousAssigneeId =
+            callerId;
+          lead.assignedTo = "";
+          lead.assigneeId = "";
+          lead.assignedToName = "";
+          lead.assignmentDate = "";
+          lead.dailyQueueDate = "";
+          lead.dailyLeadRunId = "";
+          lead.queueStatus =
+            "removed";
+          lead.supersededQueueDate =
+            dateKey;
+          lead.supersededAt = now;
+          lead.supersededBy =
+            requestedBy ||
+            "manager";
+
+          if (
+            [
+              "",
+              "new",
+              "assigned",
+              "pending",
+              "ready",
+            ].includes(
+              normalizeStatus(
+                lead.status
+              )
+            )
+          ) {
+            lead.status = "new";
+          }
+
+          lead.updatedAt = now;
+        }
+      }
+
+      if (
+        !supersededLeadIds.size
+      ) {
+        return;
+      }
+
+      for (
+        const assignment
+        of draft.salesAssignments || []
+      ) {
+        const callerId =
+          String(
+            assignment.assignedTo ||
+              assignment.assigneeId ||
+              assignment.userId ||
+              ""
+          );
+        const assignmentDate =
+          String(
+            assignment.assignmentDate ||
+              assignment.dailyQueueDate ||
+              ""
+          );
+
+        if (
+          !callerIdSet.has(
+            callerId
+          ) ||
+          assignmentDate !==
+            dateKey ||
+          !supersededLeadIds.has(
+            String(
+              assignment.leadId ||
+                ""
+            )
+          ) ||
+          !isActiveAssignment(
+            assignment
+          )
+        ) {
+          continue;
+        }
+
+        assignment.status =
+          "reassigned";
+        assignment.queueStatus =
+          "removed";
+        assignment.completedAt = now;
+        assignment.supersededAt = now;
+        assignment.supersededBy =
+          requestedBy ||
+          "manager";
+        assignment.supersededReason =
+          "manager_override_today";
+        assignment.updatedAt = now;
+      }
+
+      for (
+        const task
+        of draft.teamTasks || []
+      ) {
+        const callerId =
+          String(
+            task.assignedTo ||
+              task.assignedToUserId ||
+              task.userId ||
+              ""
+          );
+        const taskDate =
+          String(
+            task.assignmentDate ||
+              task.dailyQueueDate ||
+              ""
+          );
+        const status =
+          normalizeStatus(
+            task.status
+          );
+
+        if (
+          !callerIdSet.has(
+            callerId
+          ) ||
+          taskDate !== dateKey ||
+          !supersededLeadIds.has(
+            String(
+              task.leadId ||
+                ""
+            )
+          ) ||
+          [
+            "completed",
+            "cancelled",
+          ].includes(status)
+        ) {
+          continue;
+        }
+
+        task.status =
+          "cancelled";
+        task.queueStatus =
+          "removed";
+        task.completedAt = now;
+        task.supersededAt = now;
+        task.supersededBy =
+          requestedBy ||
+          "manager";
+        task.supersededReason =
+          "manager_override_today";
+        task.updatedAt = now;
+      }
+    });
+
+    return {
+      supersededCount:
+        supersededLeadIds.size,
+      leadIds:
+        [...supersededLeadIds],
+    };
   }
 
   /* ------------------------------------------------------------------------
@@ -1687,6 +1669,7 @@ export function createDailyLeadAutomationService({
       generatedCount: 0,
       assignedCount: 0,
       auditQueuedCount: 0,
+      overriddenCount: 0,
       shortfall:
         targetCount,
 
@@ -1913,6 +1896,8 @@ export function createDailyLeadAutomationService({
     workspaceId,
     dateKey,
     config,
+    excludeLeadIds =
+      new Set(),
   }) {
     const items = [];
     const usedKeys =
@@ -1983,6 +1968,9 @@ export function createDailyLeadAutomationService({
       ) {
         if (
           !lead?.id ||
+          excludeLeadIds.has(
+            String(lead.id)
+          ) ||
           !isRealLead(
             lead,
             campaign
@@ -2274,92 +2262,60 @@ export function createDailyLeadAutomationService({
     dateKey,
     callers,
     config,
+    callerIndexById = new Map(),
   }) {
-    const previousDateKey =
-      addDaysToDateKey(
-        dateKey,
-        -1
-      );
+    const previousDateKey = addDaysToDateKey(dateKey, -1);
+    const now = new Date().toISOString();
 
-    const now =
-      new Date().toISOString();
+    store.update((draft) => {
+      ensureState(draft);
 
-    store.update(
-      (draft) => {
-        ensureState(draft);
+      for (const caller of callers) {
+        const existing = getCallerSubmission({
+          state: draft,
+          workspaceId,
+          callerId: caller.id,
+          dateKey: previousDateKey,
+        });
+        if (existing) continue;
 
-        for (const caller of callers) {
-          const existing =
-            getCallerSubmission({
-              state: draft,
-              workspaceId,
-              callerId:
-                caller.id,
-              dateKey:
-                previousDateKey,
-            });
+        const stats = getCallerDayStats({
+          state: draft,
+          workspaceId,
+          callerId: caller.id,
+          dateKey: previousDateKey,
+        });
+        if (!stats.assigned) continue;
 
-          if (existing) {
-            continue;
-          }
+        const plan = resolveCallerPlan(
+          config,
+          caller,
+          callerIndexById.get(caller.id) ?? 0
+        );
 
-          const stats =
-            getCallerDayStats({
-              state: draft,
-              workspaceId,
-              callerId:
-                caller.id,
-              dateKey:
-                previousDateKey,
-            });
-
-          if (!stats.assigned) {
-            continue;
-          }
-
-          draft.dailyCallerSubmissions.unshift({
-            id:
-              crypto.randomUUID(),
-            workspaceId,
-            callerId:
-              caller.id,
-            callerName:
-              caller.name ||
-              caller.fullName ||
-              caller.email ||
-              "Caller",
-            dateKey:
-              previousDateKey,
-            status:
-              "missed_deadline",
-            assigned:
-              stats.assigned,
-            worked:
-              stats.worked,
-            closed:
-              stats.closed,
-            remaining:
-              stats.remaining,
-            submittedAt:
-              "",
-            deadlineAt:
-              zonedDateTimeToUtc({
-                dateKey,
-                hour:
-                  config.assignmentHour,
-                minute:
-                  config.assignmentMinute,
-                timeZone:
-                  config.timezone,
-              }).toISOString(),
-            createdAt:
-              now,
-            updatedAt:
-              now,
-          });
-        }
+        draft.dailyCallerSubmissions.unshift({
+          id: crypto.randomUUID(),
+          workspaceId,
+          callerId: caller.id,
+          callerName: caller.name || caller.fullName || caller.email || "Caller",
+          dateKey: previousDateKey,
+          status: "missed_deadline",
+          assigned: stats.assigned,
+          worked: stats.worked,
+          closed: stats.closed,
+          remaining: stats.remaining,
+          submittedAt: "",
+          deadlineAt: zonedDateTimeToUtc({
+            dateKey,
+            hour: plan.assignmentHour,
+            minute: plan.assignmentMinute,
+            timeZone: config.timezone,
+          }).toISOString(),
+          createdAt: now,
+          updatedAt: now,
+        });
       }
-    );
+    });
   }
 
   /* ------------------------------------------------------------------------
@@ -2746,6 +2702,7 @@ export function createDailyLeadAutomationService({
     caller,
     candidates,
     required,
+    campaignMix = null,
     requestedBy,
     source,
     runId,
@@ -2753,6 +2710,14 @@ export function createDailyLeadAutomationService({
   }) {
     const assignedLeadRefs = [];
     let assignedCount = 0;
+    let websiteRemaining = Math.max(
+      0,
+      Number(campaignMix?.website || 0)
+    );
+    let gmbRemaining = Math.max(
+      0,
+      Number(campaignMix?.gmb || 0)
+    );
 
     for (
       const candidate
@@ -2765,6 +2730,13 @@ export function createDailyLeadAutomationService({
         break;
       }
 
+      const campaignType =
+        websiteRemaining > 0
+          ? "website"
+          : gmbRemaining > 0
+            ? "gmb"
+            : "website";
+
       const assigned =
         assignSingleLead({
           workspaceId,
@@ -2775,6 +2747,7 @@ export function createDailyLeadAutomationService({
           source,
           runId,
           plan,
+          campaignType,
         });
 
       if (!assigned) {
@@ -2782,6 +2755,11 @@ export function createDailyLeadAutomationService({
       }
 
       assignedCount += 1;
+      if (campaignType === "gmb") {
+        gmbRemaining = Math.max(0, gmbRemaining - 1);
+      } else {
+        websiteRemaining = Math.max(0, websiteRemaining - 1);
+      }
 
       assignedLeadRefs.push({
         ...candidate,
@@ -2799,6 +2777,11 @@ export function createDailyLeadAutomationService({
           plan.resourceType ||
           candidate.resourceType ||
           "international",
+        campaignType,
+        auditKind: campaignType,
+        auditType: campaignType === "gmb"
+          ? "GMB / Local Visibility Audit"
+          : "Website / Technology Audit",
         country:
           plan.country ||
           candidate.country ||
@@ -2831,6 +2814,7 @@ export function createDailyLeadAutomationService({
     source,
     runId,
     plan = {},
+    campaignType = "website",
   }) {
     const now =
       new Date().toISOString();
@@ -2998,6 +2982,19 @@ export function createDailyLeadAutomationService({
             .trim()
             .toUpperCase();
 
+        lead.dailyCampaignType =
+          normalizeCampaignType(campaignType);
+        lead.campaignType =
+          lead.dailyCampaignType;
+        lead.auditKind =
+          lead.dailyCampaignType;
+        lead.auditType =
+          lead.dailyCampaignType === "gmb"
+            ? "GMB / Local Visibility Audit"
+            : "Website / Technology Audit";
+        lead.auditStatus = "queued";
+        lead.auditReport = null;
+
         lead.queueStatus =
           "current";
 
@@ -3051,6 +3048,14 @@ export function createDailyLeadAutomationService({
           resourceType:
             lead.dailyResourceType ||
             "international",
+
+          campaignType:
+            lead.dailyCampaignType ||
+            "website",
+
+          auditType:
+            lead.auditType ||
+            "Website / Technology Audit",
 
           country:
             lead.dailyCountry ||
@@ -3117,6 +3122,23 @@ export function createDailyLeadAutomationService({
             lead.dailyResourceType ||
             "international",
 
+          campaignType:
+            lead.dailyCampaignType ||
+            "website",
+
+          auditKind:
+            lead.auditKind ||
+            lead.dailyCampaignType ||
+            "website",
+
+          auditType:
+            lead.auditType ||
+            "Website / Technology Audit",
+
+          auditStatus:
+            lead.auditStatus ||
+            "queued",
+
           country:
             lead.dailyCountry ||
             "",
@@ -3181,7 +3203,9 @@ export function createDailyLeadAutomationService({
             }`,
 
           description:
-            "Review the mini audit, contact the lead, record the outcome, and schedule a follow-up when required.",
+            lead.dailyCampaignType === "gmb"
+              ? "Review the GMB / Local Visibility Audit, contact the lead, record the outcome, and schedule a follow-up when required."
+              : "Review the Website / Technology Audit, contact the lead, record the outcome, and schedule a follow-up when required.",
 
           type:
             "lead_call",
@@ -3222,6 +3246,23 @@ export function createDailyLeadAutomationService({
             lead.dailyResourceType ||
             "international",
 
+          campaignType:
+            lead.dailyCampaignType ||
+            "website",
+
+          auditKind:
+            lead.auditKind ||
+            lead.dailyCampaignType ||
+            "website",
+
+          auditType:
+            lead.auditType ||
+            "Website / Technology Audit",
+
+          auditStatus:
+            lead.auditStatus ||
+            "queued",
+
           country:
             lead.dailyCountry ||
             "",
@@ -3259,7 +3300,7 @@ export function createDailyLeadAutomationService({
      Mini audits
      ------------------------------------------------------------------------ */
 
-  function queueMiniAudits(
+  function queueCampaignAudits(
     assignedLeadRefs
   ) {
     if (
@@ -3302,6 +3343,25 @@ export function createDailyLeadAutomationService({
 
             leadId:
               reference.leadId,
+
+            kind:
+              normalizeCampaignType(
+                reference.campaignType ||
+                  reference.auditKind ||
+                  "website"
+              ),
+
+            campaignType:
+              normalizeCampaignType(
+                reference.campaignType ||
+                  "website"
+              ),
+
+            auditType:
+              reference.auditType ||
+              (normalizeCampaignType(reference.campaignType) === "gmb"
+                ? "GMB / Local Visibility Audit"
+                : "Website / Technology Audit"),
 
             website:
               reference.lead
@@ -3359,8 +3419,13 @@ export function createDailyLeadAutomationService({
 
         queued += 1;
       } catch (error) {
+        markLeadAuditQueueFailure({
+          campaignId: reference.campaignId,
+          leadId: reference.leadId,
+          message: error?.message || String(error),
+        });
         console.warn(
-          `[daily-leads] mini audit queue failed ${JSON.stringify({
+          `[daily-leads] campaign audit queue failed ${JSON.stringify({
             campaignId:
               reference.campaignId,
 
@@ -3376,6 +3441,27 @@ export function createDailyLeadAutomationService({
     }
 
     return queued;
+  }
+
+  function markLeadAuditQueueFailure({
+    campaignId,
+    leadId,
+    message,
+  }) {
+    store.update((draft) => {
+      const campaign = (draft.campaigns || []).find(
+        (item) => item.id === campaignId
+      );
+      const lead = campaign?.leads?.find(
+        (item) => item.id === leadId
+      );
+      if (!lead) return;
+      lead.auditStatus = /upload|format|template/i.test(String(message || ""))
+        ? "format_required"
+        : "failed";
+      lead.auditError = String(message || "Audit could not be queued.").slice(0, 1000);
+      lead.updatedAt = new Date().toISOString();
+    });
   }
 
   function resolveSystemUser(
@@ -3399,136 +3485,98 @@ export function createDailyLeadAutomationService({
      ------------------------------------------------------------------------ */
 
   function scheduleNextRun() {
-    if (stopped) {
-      return;
-    }
+    if (stopped) return;
 
     if (schedulerTimer) {
-      clearTimeout(
-        schedulerTimer
-      );
+      clearTimeout(schedulerTimer);
       schedulerTimer = null;
     }
 
     const now = new Date();
+    const state = store.read();
+    const targets = [];
 
-    const targets =
-      getWorkspaceIds()
-        .map(
-          (workspaceId) => {
-            const config =
-              getConfig(
-                workspaceId
-              );
+    for (const workspaceId of getWorkspaceIds()) {
+      const config = getConfig(workspaceId);
+      if (!config.enabled) continue;
 
-            if (!config.enabled) {
-              return null;
-            }
+      const callers = getActiveCallers(state, workspaceId);
+      callers.forEach((caller, index) => {
+        const plan = resolveCallerPlan(config, caller, index);
+        const callerConfig = {
+          ...config,
+          assignmentHour: plan.assignmentHour,
+          assignmentMinute: plan.assignmentMinute,
+        };
+        targets.push({
+          workspaceId,
+          callerId: caller.id,
+          callerName: caller.name || caller.email || "Caller",
+          config,
+          plan,
+          nextRun: getNextScheduledRunDate(now, callerConfig),
+        });
+      });
+    }
 
-            const nextRun =
-              getNextScheduledRunDate(
-                now,
-                config
-              );
-
-            return {
-              workspaceId,
-              config,
-              nextRun,
-            };
-          }
-        )
-        .filter(Boolean)
-        .sort(
-          (left, right) =>
-            left.nextRun.getTime() -
-            right.nextRun.getTime()
-        );
+    targets.sort(
+      (left, right) => left.nextRun.getTime() - right.nextRun.getTime()
+    );
 
     if (!targets.length) {
-      // Keep a lightweight watcher alive so a manager can enable automation
-      // without requiring a backend restart.
-      schedulerTimer =
-        setTimeout(
-          scheduleNextRun,
-          60_000
-        );
+      schedulerTimer = setTimeout(scheduleNextRun, 60_000);
       schedulerTimer.unref?.();
       return;
     }
 
     const next = targets[0];
-    const delayMs =
-      Math.max(
-        1000,
-        next.nextRun.getTime() -
-          now.getTime()
-      );
+    const delayMs = Math.max(1000, next.nextRun.getTime() - now.getTime());
 
     console.log(
       `[daily-leads] scheduled ${JSON.stringify({
-        at:
-          now.toISOString(),
-        workspaceId:
-          next.workspaceId,
-        timeZone:
-          next.config.timezone,
-        hour:
-          next.config.assignmentHour,
-        minute:
-          next.config.assignmentMinute,
-        nextRunAt:
-          next.nextRun.toISOString(),
+        at: now.toISOString(),
+        workspaceId: next.workspaceId,
+        callerId: next.callerId,
+        callerName: next.callerName,
+        timeZone: next.config.timezone,
+        hour: next.plan.assignmentHour,
+        minute: next.plan.assignmentMinute,
+        nextRunAt: next.nextRun.toISOString(),
         delayMs,
       })}`
     );
 
-    schedulerTimer =
-      setTimeout(
-        async () => {
-          if (schedulerRunning) {
-            scheduleNextRun();
-            return;
-          }
+    schedulerTimer = setTimeout(async () => {
+      if (schedulerRunning) {
+        scheduleNextRun();
+        return;
+      }
 
-          schedulerRunning = true;
-
-          try {
-            const result =
-              await runDueWorkspaces({
-                source:
-                  "manager-scheduled-refresh",
-              });
-
-            console.log(
-              `[daily-leads] completed ${JSON.stringify({
-                at:
-                  new Date().toISOString(),
-                source:
-                  "manager-scheduled-refresh",
-                result,
-              })}`
-            );
-          } catch (error) {
-            console.error(
-              `[daily-leads] scheduled run failed ${JSON.stringify({
-                at:
-                  new Date().toISOString(),
-                message:
-                  error?.message ||
-                  String(error),
-                stack:
-                  error?.stack ||
-                  "",
-              })}`
-            );
-          } finally {
-            schedulerRunning = false;
-            scheduleNextRun();
-          }
-        },
-        delayMs
-      );
+      schedulerRunning = true;
+      try {
+        const result = await runDueWorkspaces({
+          source: "manager-scheduled-refresh",
+        });
+        console.log(
+          `[daily-leads] completed ${JSON.stringify({
+            at: new Date().toISOString(),
+            source: "manager-scheduled-refresh",
+            result,
+          })}`
+        );
+      } catch (error) {
+        console.error(
+          `[daily-leads] scheduled run failed ${JSON.stringify({
+            at: new Date().toISOString(),
+            message: error?.message || String(error),
+            stack: error?.stack || "",
+          })}`
+        );
+      } finally {
+        schedulerRunning = false;
+        scheduleNextRun();
+      }
+    }, delayMs);
 
     schedulerTimer.unref?.();
   }
@@ -3684,6 +3732,163 @@ function getActiveCallers(
           )
         )
     );
+}
+
+function isReplaceableDailyLead(
+  lead
+) {
+  const status =
+    normalizeStatus(
+      lead?.status
+    );
+
+  return (
+    Number(
+      lead?.callAttempts ||
+        0
+    ) <= 0 &&
+    [
+      "",
+      "new",
+      "assigned",
+      "pending",
+      "ready",
+    ].includes(status)
+  );
+}
+
+function getAssignedDailyLeadIds({
+  state,
+  workspaceId,
+  dateKey,
+  callers,
+}) {
+  const callerIds =
+    new Set(
+      callers.map(
+        (caller) =>
+          caller.id
+      )
+    );
+  const ids =
+    new Set();
+
+  for (
+    const campaign
+    of state.campaigns || []
+  ) {
+    if (
+      campaign.workspaceId !==
+      workspaceId
+    ) {
+      continue;
+    }
+
+    for (
+      const lead
+      of campaign.leads || []
+    ) {
+      const callerId =
+        String(
+          lead.assignedTo ||
+            lead.assigneeId ||
+            ""
+        );
+
+      if (
+        callerIds.has(callerId) &&
+        String(
+          lead.dailyQueueDate ||
+            lead.assignmentDate ||
+            ""
+        ) === dateKey &&
+        lead.id
+      ) {
+        ids.add(
+          String(lead.id)
+        );
+      }
+    }
+  }
+
+  return [...ids];
+}
+
+function countAssignedDailyLeadsByCaller({
+  state,
+  workspaceId,
+  dateKey,
+  callers,
+}) {
+  const callerIds =
+    new Set(
+      callers.map(
+        (caller) =>
+          caller.id
+      )
+    );
+
+  const result =
+    new Map(
+      callers.map(
+        (caller) => [
+          caller.id,
+          0,
+        ]
+      )
+    );
+
+  const seen =
+    new Set();
+
+  for (
+    const campaign
+    of state.campaigns || []
+  ) {
+    if (
+      campaign.workspaceId !==
+      workspaceId
+    ) {
+      continue;
+    }
+
+    for (
+      const lead
+      of campaign.leads || []
+    ) {
+      const callerId =
+        String(
+          lead.assignedTo ||
+            lead.assigneeId ||
+            ""
+        );
+
+      if (
+        !callerIds.has(callerId) ||
+        String(
+          lead.dailyQueueDate ||
+            lead.assignmentDate ||
+            ""
+        ) !== dateKey ||
+        seen.has(
+          `${callerId}:${lead.id}`
+        )
+      ) {
+        continue;
+      }
+
+      seen.add(
+        `${callerId}:${lead.id}`
+      );
+      result.set(
+        callerId,
+        (result.get(callerId) || 0) +
+          1
+      );
+    }
+  }
+
+  return result;
 }
 
 function countCurrentAssignmentsByCaller({
@@ -4359,145 +4564,161 @@ function resolveCallerPlan(
   caller,
   index = 0
 ) {
-  const stored =
-    config.callerPlans?.[
-      caller?.id
-    ] ||
-    {};
+  const stored = config.callerPlans?.[caller?.id] || {};
+  const fallbackNiche = config.niches.length
+    ? config.niches[index % config.niches.length]
+    : "";
+  const fallbackLocation = config.locations.length
+    ? config.locations[index % config.locations.length]
+    : "";
+  const resourceType = normalizeResourceType(
+    stored.resourceType || "international"
+  );
+  const localLocations = config.localPakistanLocations?.length
+    ? config.localPakistanLocations
+    : DEFAULT_LOCAL_PAKISTAN_LOCATIONS;
+  const automaticPakistanLocation = localLocations.length
+    ? localLocations[index % localLocations.length]
+    : "Pakistan";
+  const location = resourceType === "local"
+    ? String(stored.location || automaticPakistanLocation || "Pakistan").trim()
+    : String(stored.location || fallbackLocation || "").trim();
 
-  const fallbackNiche =
-    config.niches.length
-      ? config.niches[
-          index %
-            config.niches.length
-        ]
-      : "";
-
-  const fallbackLocation =
-    config.locations.length
-      ? config.locations[
-          index %
-            config.locations.length
-        ]
-      : "";
-
-  const resourceType =
-    normalizeResourceType(
-      stored.resourceType ||
-        "international"
-    );
-
-  const localLocations =
-    config.localPakistanLocations?.length
-      ? config.localPakistanLocations
-      : DEFAULT_LOCAL_PAKISTAN_LOCATIONS;
-
-  const automaticPakistanLocation =
-    localLocations.length
-      ? localLocations[
-          index % localLocations.length
-        ]
-      : "Pakistan";
-
-  const location =
-    resourceType === "local"
-      ? String(
-          stored.location ||
-            automaticPakistanLocation ||
-            "Pakistan"
-        ).trim()
-      : String(
-          stored.location ||
-            fallbackLocation ||
-            ""
-        ).trim();
+  const callMix = normalizeCallMix(stored, config.leadsPerCaller);
 
   return {
-    niche:
-      String(
-        stored.niche ||
-        fallbackNiche ||
-        ""
-      ).trim(),
+    niche: String(stored.niche || fallbackNiche || "").trim(),
     resourceType,
     location,
     country:
       resourceType === "local"
         ? "Pakistan"
-        : cleanMarketValue(
-            stored.country ||
-              ""
-          ),
+        : cleanMarketValue(stored.country || ""),
     regionCode:
       resourceType === "local"
         ? "PK"
-        : String(
-            stored.regionCode ||
-              config.regionCode ||
-              "US"
-          )
+        : String(stored.regionCode || config.regionCode || "US")
             .trim()
             .toUpperCase(),
+    assignmentHour: isValidHour(stored.assignmentHour)
+      ? Number(stored.assignmentHour)
+      : config.assignmentHour,
+    assignmentMinute: isValidMinute(stored.assignmentMinute)
+      ? Number(stored.assignmentMinute)
+      : config.assignmentMinute,
+    websiteCalls: callMix.websiteCalls,
+    gmbCalls: callMix.gmbCalls,
   };
 }
 
-function normalizeCallerPlans(
-  value
-) {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    Array.isArray(value)
-  ) {
+function normalizeCallerPlans(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
   }
 
   const result = {};
 
-  for (
-    const [callerId, plan]
-    of Object.entries(value)
-  ) {
-    const id =
-      String(
-        callerId ||
-        ""
-      ).trim();
-
+  for (const [callerId, plan] of Object.entries(value)) {
+    const id = String(callerId || "").trim();
     if (!id) continue;
 
-    result[id] = {
-      niche:
-        String(
-          plan?.niche ||
-          ""
-        ).trim(),
-      resourceType:
-        normalizeResourceType(
-          plan?.resourceType ||
-            "international"
-        ),
-      location:
-        String(
-          plan?.location ||
-          ""
-        ).trim(),
-      country:
-        cleanMarketValue(
-          plan?.country ||
-            ""
-        ),
-      regionCode:
-        String(
-          plan?.regionCode ||
-            ""
-        )
-          .trim()
-          .toUpperCase(),
+    const normalized = {
+      niche: String(plan?.niche || "").trim(),
+      resourceType: normalizeResourceType(plan?.resourceType || "international"),
+      location: String(plan?.location || "").trim(),
+      country: cleanMarketValue(plan?.country || ""),
+      regionCode: String(plan?.regionCode || "").trim().toUpperCase(),
     };
+
+    if (isValidCallCount(plan?.websiteCalls)) {
+      normalized.websiteCalls = Number(plan.websiteCalls);
+    }
+    if (isValidCallCount(plan?.gmbCalls)) {
+      normalized.gmbCalls = Number(plan.gmbCalls);
+    }
+
+    if (isValidHour(plan?.assignmentHour)) {
+      normalized.assignmentHour = Number(plan.assignmentHour);
+    }
+    if (isValidMinute(plan?.assignmentMinute)) {
+      normalized.assignmentMinute = Number(plan.assignmentMinute);
+    }
+
+    result[id] = normalized;
   }
 
   return result;
+}
+
+function isValidCallCount(value) {
+  if (value === "" || value === null || value === undefined) return false;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 5000;
+}
+
+function normalizeCallMix(plan = {}, totalInput = 100) {
+  const total = Math.max(1, Math.min(5000, Number(totalInput || 100)));
+  let websiteCalls = isValidCallCount(plan.websiteCalls)
+    ? Number(plan.websiteCalls)
+    : Math.round(total * 0.8);
+  let gmbCalls = isValidCallCount(plan.gmbCalls)
+    ? Number(plan.gmbCalls)
+    : Math.max(0, total - websiteCalls);
+
+  websiteCalls = Math.max(0, Math.min(total, websiteCalls));
+  gmbCalls = Math.max(0, Math.min(total, gmbCalls));
+
+  const sum = websiteCalls + gmbCalls;
+  if (sum !== total) {
+    // Keep the manager's Website value authoritative and balance GMB to the
+    // caller's daily target. This makes a 50/50 entry exactly 50 + 50 for 100.
+    gmbCalls = Math.max(0, total - websiteCalls);
+  }
+
+  return { websiteCalls, gmbCalls };
+}
+
+function normalizeCampaignType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "_");
+  return ["gmb", "google_business_profile", "google_business", "local_visibility"].includes(normalized)
+    ? "gmb"
+    : "website";
+}
+
+function isValidHour(value) {
+  if (value === "" || value === null || value === undefined) return false;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 23;
+}
+
+function isValidMinute(value) {
+  if (value === "" || value === null || value === undefined) return false;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 59;
+}
+
+function getWorkspaceNextScheduledRunDate({
+  state,
+  workspaceId,
+  config,
+  now = new Date(),
+}) {
+  const callers = getActiveCallers(state, workspaceId);
+  if (!callers.length) return getNextScheduledRunDate(now, config);
+
+  return callers
+    .map((caller, index) => {
+      const plan = resolveCallerPlan(config, caller, index);
+      return getNextScheduledRunDate(now, {
+        ...config,
+        assignmentHour: plan.assignmentHour,
+        assignmentMinute: plan.assignmentMinute,
+      });
+    })
+    .sort((left, right) => left.getTime() - right.getTime())[0];
 }
 
 function normalizeResourceType(
@@ -4926,6 +5147,20 @@ function getCallerDayStats({
         .filter(Boolean)
     );
 
+  const isWorkedLead = (lead) => {
+    const status = normalizeStatus(lead.status);
+    return (
+      Number(lead.callAttempts || 0) > 0 ||
+      !["", "new", "assigned", "pending", "ready"].includes(status)
+    );
+  };
+  const websiteLeads = leads.filter(
+    (lead) => normalizeCampaignType(lead.dailyCampaignType || lead.campaignType || lead.auditKind) === "website"
+  );
+  const gmbLeads = leads.filter(
+    (lead) => normalizeCampaignType(lead.dailyCampaignType || lead.campaignType || lead.auditKind) === "gmb"
+  );
+
   return {
     assigned:
       leads.length,
@@ -4941,6 +5176,10 @@ function getCallerDayStats({
     resourceType,
     location,
     country,
+    websiteAssigned: websiteLeads.length,
+    gmbAssigned: gmbLeads.length,
+    websiteWorked: websiteLeads.filter(isWorkedLead).length,
+    gmbWorked: gmbLeads.filter(isWorkedLead).length,
   };
 }
 

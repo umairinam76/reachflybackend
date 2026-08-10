@@ -9,12 +9,28 @@ const MANAGER_ROLES = new Set([
 ]);
 
 const REPORT_KINDS = [
+  "website",
+  "gmb",
   "mini",
   "competitor",
   "full",
 ];
 
 const DEFAULT_TEMPLATES = {
+  website: {
+    name: "Website / Technology Audit",
+    enabled: true,
+    lengthGuidance: "1-3 pages; caller-ready website and technology pre-call audit",
+    instructions:
+      "Generate a factual Website / Technology Audit for the current lead only. Focus on publicly verifiable website, technical, conversion, trust, SEO, usability, and visible technology observations. Include evidence, plain-language business impact, controlled sales wording, and a safe next step. Never copy facts from the manager PDF example; use it only as a format and presentation reference.",
+  },
+  gmb: {
+    name: "GMB / Local Visibility Audit",
+    enabled: true,
+    lengthGuidance: "1-3 pages; caller-ready Google Business Profile and local visibility audit",
+    instructions:
+      "Generate a factual GMB / Local Visibility Audit for the current lead only. Research the business's public Google Business Profile and local-search presence, NAP consistency, reviews, profile completeness, category/positioning, conversion paths, and visible local competitors. Include evidence, plain-language business impact, controlled sales wording, and a safe next step. Never copy facts from the manager PDF example; use it only as a format and presentation reference.",
+  },
   mini: {
     name: "Mini Audit",
     enabled: true,
@@ -939,6 +955,15 @@ function normalizeKind(value) {
     .replace(/[-\s]+/g, "_");
 
   const aliases = {
+    website: "website",
+    website_audit: "website",
+    technology: "website",
+    technology_audit: "website",
+    tech: "website",
+    gmb: "gmb",
+    gmb_audit: "gmb",
+    google_business_profile: "gmb",
+    local_visibility: "gmb",
     mini: "mini",
     mini_audit: "mini",
     competitor: "competitor",
@@ -953,7 +978,7 @@ function normalizeKind(value) {
   if (!kind) {
     throw httpError(
       400,
-      "Report type must be mini, competitor, or full."
+      "Report type must be website, gmb, mini, competitor, or full."
     );
   }
 
@@ -965,6 +990,7 @@ function legacyName(
   kind
 ) {
   if (!legacy) return "";
+  if (["website", "gmb"].includes(kind)) return undefined;
 
   if (
     legacy.name &&
@@ -981,6 +1007,7 @@ function legacyInstructions(
   kind
 ) {
   if (!legacy) return "";
+  if (["website", "gmb"].includes(kind)) return undefined;
 
   if (kind === "mini") {
     return cleanMultiline(

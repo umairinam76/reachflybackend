@@ -243,6 +243,19 @@ export function createCallerQueueService({
         lead,
         now,
       }) {
+        const campaignType = normalizeCampaignType(
+          lead.dailyCampaignType || lead.campaignType || lead.auditKind
+        );
+        if (
+          ["website", "gmb"].includes(campaignType) &&
+          !isCampaignAuditReady(lead)
+        ) {
+          throw httpError(
+            409,
+            `${campaignType === "gmb" ? "GMB / Local Visibility" : "Website / Technology"} audit is not Ready for Caller yet.`
+          );
+        }
+
         lead.status =
           "calling";
         lead.queueStatus =
@@ -893,6 +906,28 @@ function publicAssignment(
             lead.dailyRegionCode ||
             lead.regionCode ||
             "",
+          dailyCampaignType:
+            normalizeCampaignType(
+              lead.dailyCampaignType || lead.campaignType || lead.auditKind
+            ),
+          campaignType:
+            normalizeCampaignType(
+              lead.dailyCampaignType || lead.campaignType || lead.auditKind
+            ),
+          auditKind:
+            lead.auditKind ||
+            lead.dailyCampaignType ||
+            "",
+          auditType:
+            lead.auditType ||
+            "",
+          auditStatus:
+            lead.auditStatus ||
+            lead.miniAuditStatus ||
+            "",
+          auditReportId:
+            lead.auditReportId ||
+            "",
           resourceType:
             lead.resourceType ||
             lead.dailyResourceType ||
@@ -1041,6 +1076,29 @@ function publicAssignment(
       lead.dailyRegionCode ||
       lead.regionCode ||
       "",
+    campaignType:
+      normalizeCampaignType(
+        lead.dailyCampaignType || lead.campaignType || lead.auditKind
+      ),
+    auditKind:
+      lead.auditKind ||
+      lead.dailyCampaignType ||
+      "",
+    auditType:
+      lead.auditType ||
+      "",
+    auditStatus:
+      lead.auditStatus ||
+      lead.miniAuditStatus ||
+      "",
+    auditReportId:
+      lead.auditReportId ||
+      "",
+    auditReport:
+      compact
+        ? null
+        : lead.auditReport ||
+          null,
     miniAudit:
       compact
         ? null
@@ -1061,6 +1119,31 @@ function publicAssignment(
       "",
   };
 }
+function normalizeCampaignType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "_");
+  if (["gmb", "gmb_audit", "google_business_profile", "google_business", "local_visibility"].includes(normalized)) {
+    return "gmb";
+  }
+  if (["website", "website_audit", "technology", "technology_audit", "tech"].includes(normalized)) {
+    return "website";
+  }
+  return "";
+}
+
+function isCampaignAuditReady(lead) {
+  const status = normalizeStatus(
+    lead.auditStatus || lead.miniAuditStatus || ""
+  );
+  return Boolean(
+    lead.auditReport ||
+    lead.miniAudit ||
+    ["ready", "complete", "completed", "crm_audit_ready", "ready_for_caller"].includes(status)
+  );
+}
+
 function assignmentIdentity(
   campaign,
   lead
