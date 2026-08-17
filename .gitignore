@@ -15,3 +15,4 @@ node_modules/
 *.key
 *.p12
 *.pfx
+ahgrowth-caller-credentials.txt
