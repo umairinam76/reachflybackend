@@ -1,0 +1,207 @@
+[
+  {
+    "file": ".env.example",
+    "status": "added",
+    "sha256": "b76d6715c5233587a64fbfc7d96271447187421037c0e1a51d9289584105b68e"
+  },
+  {
+    "file": ".gitignore",
+    "status": "unchanged",
+    "sha256": "67716db08b61ae5ee5abdebe93f118f6fc0c64d06960dc2926a86e7388722172"
+  },
+  {
+    "file": "attendance-service.js",
+    "status": "unchanged",
+    "sha256": "fe4816106eb0eb5c007bfb035e41edfa183e13c4b2733bba53fad8b0e5d7ad5f"
+  },
+  {
+    "file": "audit-job-service.js",
+    "status": "unchanged",
+    "sha256": "721671858f05395cba15e2eba58a45818686cfb01dbba863837c9005d5f54638"
+  },
+  {
+    "file": "audit-service.js",
+    "status": "unchanged",
+    "sha256": "926e30eab722d1c1ff1058be384976e8f49d1cf19b5285b73ce6dec23e4ce37e"
+  },
+  {
+    "file": "audit-template-service.js",
+    "status": "unchanged",
+    "sha256": "13c717e38041a840d14ea03c0ae021a928dfa668a53ab1e979bf604537824964"
+  },
+  {
+    "file": "caller-queue-service.js",
+    "status": "unchanged",
+    "sha256": "b731cbc51e69468f74fccaab907bb9a4568515f8628be5a55147138135862b8c"
+  },
+  {
+    "file": "campaigns.js",
+    "status": "unchanged",
+    "sha256": "caa58346c55a4b3fa9675072f0ba3a07c77945d07d842b1fd93d760e7e543269"
+  },
+  {
+    "file": "daily-lead-automation-service.js",
+    "status": "unchanged",
+    "sha256": "1ea97b9bbd125591234559c655bdb50803963ff7d7ed6d886e7e62d8c7ac1bb9"
+  },
+  {
+    "file": "email.js",
+    "status": "unchanged",
+    "sha256": "8875e23e4efed9f402b32ca6757b2a75850fe88391f09381d3d4fd146f074772"
+  },
+  {
+    "file": "env.js",
+    "status": "modified",
+    "sha256": "e4b2ff0dc09c5d5ca214c8283a8b1a38a233266dca9b3ed4990df61b3df97c8d"
+  },
+  {
+    "file": "google-places.js",
+    "status": "unchanged",
+    "sha256": "9525434475d7d1f326a47bd70e53ceeeb3f7687ea3fec5d37fff8ec385ddde15"
+  },
+  {
+    "file": "lead-audit-service.js",
+    "status": "unchanged",
+    "sha256": "a7b2d357931f12d6024729b17156e92ae6aa0f47e00a836199d39293457ad30c"
+  },
+  {
+    "file": "leadFinder.js",
+    "status": "unchanged",
+    "sha256": "e31e668b93a64bb6f0eac9c07ec90e8cb77ff5a00f2975bd6864bd64f6bb83a5"
+  },
+  {
+    "file": "migrate-state-to-supabase.js",
+    "status": "added",
+    "sha256": "819759b2f6eb70c4780ee7d165d26f25afa940037cb11a67344234731e31fcd9"
+  },
+  {
+    "file": "myip-history.js",
+    "status": "unchanged",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "file": "profile-service.js",
+    "status": "unchanged",
+    "sha256": "0d32c7ea8c8c42f5f55cde4bb4684b850501ec4d733adfd2e2f4c493c0f35252"
+  },
+  {
+    "file": "reachfly-ai.js",
+    "status": "unchanged",
+    "sha256": "75fa6e0dbe38fc3898fcc0e2e958a3098c76fd6d1c1a4b1f335750c22928eaf7"
+  },
+  {
+    "file": "register-workspace-platform.js",
+    "status": "unchanged",
+    "sha256": "d8b31ae68eed6ce6c327fc6c9d528e95b82dedc62fc940f0db32ed71f2a18c48"
+  },
+  {
+    "file": "resource-board-service.js",
+    "status": "unchanged",
+    "sha256": "4eb4fcba2e34bde51204af8572ba9b1bb29c797d0f8fbad004fbeae97f034436"
+  },
+  {
+    "file": "role-dashboard-service.js",
+    "status": "unchanged",
+    "sha256": "1719fed046690cca20aaf4fbc231e75d740c29a8f60d7d27883a1d178e6e5227"
+  },
+  {
+    "file": "role-test-seed.js",
+    "status": "unchanged",
+    "sha256": "291deb173d9d6bf4dc992b8f98a5115da92f5034790585dfa5ade8b8538d1314"
+  },
+  {
+    "file": "sales-operations-service.js",
+    "status": "unchanged",
+    "sha256": "090fbcb157332fa9f84a78cfb6a908ac832b5942408eb7bda22a1ce253d8ad13"
+  },
+  {
+    "file": "seed-ah-growth.js",
+    "status": "modified",
+    "sha256": "aea8fea32714bc4ca45ad97e0ddf667fe074f19c9aa2852d188253ed05f7824a"
+  },
+  {
+    "file": "seed-codesync-labs.js",
+    "status": "modified",
+    "sha256": "e6491850f43651a89676427a8b7091dd481709743a80a7b74d275bd4ca095f86"
+  },
+  {
+    "file": "seed-test-accounts.js",
+    "status": "modified",
+    "sha256": "25221fa1caf25bb08a0760d78789e8dbe098b63becc468ae436bb0ad4630d976"
+  },
+  {
+    "file": "server.js",
+    "status": "modified",
+    "sha256": "81f6a8ba254f57f4898c9983c2f981a2f703faccab6792216bd6b2c0ff2980c4"
+  },
+  {
+    "file": "socket-service.js",
+    "status": "unchanged",
+    "sha256": "f8112e66b9beb97cc871ac49ac581577c980c0e433c3d6ebebb37b2d6d8f6c38"
+  },
+  {
+    "file": "store.js",
+    "status": "modified",
+    "sha256": "9cc2a3a2df38a8e21ee2691243a083f66542c04f3f70b10f2595b58d28581fe2"
+  },
+  {
+    "file": "supabase/001_reachfly_entities.sql",
+    "status": "added",
+    "sha256": "1a51fb34a07791e4ac777a8c2b20e659680f921fe67172b602632284e37595b6"
+  },
+  {
+    "file": "supabase-entity-client.js",
+    "status": "added",
+    "sha256": "8a9460a85cdccbd4397f3d16cd21df1d992456ad08f0373646f2e80ffdf3bbb7"
+  },
+  {
+    "file": "team-chat-service.js",
+    "status": "unchanged",
+    "sha256": "8ac21033854bc6bbccd8d09602cc8ad266067cabb394d7d57b612d5cdbc6e6ea"
+  },
+  {
+    "file": "team-communication-service.js",
+    "status": "unchanged",
+    "sha256": "2ff6dc98a2a84b3d9b7e50dfa81ef82f5b7872fab69e85265770eefc149d9e82"
+  },
+  {
+    "file": "team-control-service.js",
+    "status": "unchanged",
+    "sha256": "d2569391e35679f058fc5fb3943707b1f9a34890bc5df17e8404d7bdc7fcfa97"
+  },
+  {
+    "file": "telnyx-ai-agent-service.js",
+    "status": "unchanged",
+    "sha256": "406142c36152b671ca32ee88e1b451fdb28a92c2c22edcc9a10e7b7f7c5d38e5"
+  },
+  {
+    "file": "telnyx-call-service.js",
+    "status": "unchanged",
+    "sha256": "56a10a8bf9fb01cb7c0a83fc0b91f6e33ff2883a8992b80f772b1afda9e055dd"
+  },
+  {
+    "file": "verify-supabase.js",
+    "status": "added",
+    "sha256": "159cc1f1558fbe1b4e7274286706d025e7ac59c88fb3422aa0494451362f89a9"
+  },
+  {
+    "file": "vonage-call-service.js",
+    "status": "unchanged",
+    "sha256": "700a937d49987de715aa5b91024a9f09160dbf5d4565da46bd8b207062bbb431"
+  },
+  {
+    "file": "whatsapp.js",
+    "status": "unchanged",
+    "sha256": "a46fa0114b967388d50b2bbe00a8cfcea5b109cc2e28ff5f441c000b338c416d"
+  },
+  {
+    "file": "workspace-platform-client.js",
+    "status": "unchanged",
+    "sha256": "5c5bab66392492b53fab917e3ec21d280dcd0f341c94469c04df6e12d1b66601"
+  },
+  {
+    "file": "workspace-service.js",
+    "status": "unchanged",
+    "sha256": "d31445bf0ef8806bb006f8ad2646800512a763d1a5384bc1122d1f6f3a44dfe5"
+  }
+]

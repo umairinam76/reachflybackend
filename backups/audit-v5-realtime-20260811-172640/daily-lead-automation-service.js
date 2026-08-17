@@ -1,0 +1,5717 @@
+import crypto from "node:crypto";
+
+/* ==========================================================================
+   Constants
+   ========================================================================== */
+
+const ACTIVE_CALLER_ROLES = new Set([
+  "caller",
+]);
+
+const TERMINAL_LEAD_STATUSES = new Set([
+  "qualified",
+  "converted",
+  "customer",
+  "closed",
+  "completed",
+  "meeting_booked",
+  "appointment_booked",
+  "not_interested",
+  "do_not_call",
+  "invalid_number",
+  "wrong_number",
+  "duplicate",
+  "blocked",
+]);
+
+const RECYCLABLE_LEAD_STATUSES = new Set([
+  "",
+  "new",
+  "assigned",
+  "pending",
+  "ready",
+  "in_progress",
+  "no_answer",
+  "busy",
+  "voicemail",
+  "callback",
+  "follow_up",
+  "missed",
+  "unreachable",
+]);
+
+const ACTIVE_ASSIGNMENT_STATUSES = new Set([
+  "",
+  "assigned",
+  "pending",
+  "ready",
+  "current",
+  "in_progress",
+  "callback",
+  "follow_up",
+]);
+
+const FINISHED_RUN_STATUSES = new Set([
+  "completed",
+  "completed_partial",
+]);
+
+const DEFAULT_TIMEZONE =
+  process.env.DAILY_LEAD_TIMEZONE ||
+  "Asia/Karachi";
+
+const DEFAULT_ASSIGNMENT_HOUR =
+  clampInteger(
+    process.env.DAILY_LEAD_ASSIGNMENT_HOUR,
+    4,
+    0,
+    23
+  );
+
+const DEFAULT_ASSIGNMENT_MINUTE =
+  clampInteger(
+    process.env.DAILY_LEAD_ASSIGNMENT_MINUTE,
+    0,
+    0,
+    59
+  );
+
+const DEFAULT_LEADS_PER_CALLER =
+  clampInteger(
+    process.env.DAILY_LEADS_PER_CALLER,
+    100,
+    1,
+    5000
+  );
+
+const DEFAULT_RECYCLE_AFTER_HOURS =
+  clampInteger(
+    process.env.DAILY_LEAD_RECYCLE_AFTER_HOURS,
+    24,
+    1,
+    24 * 365
+  );
+
+const DEFAULT_MAX_CALL_ATTEMPTS =
+  clampInteger(
+    process.env.DAILY_LEAD_MAX_CALL_ATTEMPTS,
+    5,
+    1,
+    100
+  );
+
+const DEFAULT_GENERATION_BATCH_SIZE =
+  clampInteger(
+    process.env.DAILY_LEAD_GENERATION_BATCH_SIZE,
+    200,
+    1,
+    1000
+  );
+
+const DEFAULT_MAX_GENERATION_PER_RUN =
+  clampInteger(
+    process.env.DAILY_LEAD_MAX_GENERATION_PER_RUN,
+    2000,
+    1,
+    100000
+  );
+
+const DEFAULT_STARTUP_DELAY_MS =
+  clampInteger(
+    process.env.DAILY_LEAD_STARTUP_DELAY_MS,
+    15000,
+    0,
+    60 * 60 * 1000
+  );
+
+const DEFAULT_STALE_RUN_MINUTES =
+  clampInteger(
+    process.env.DAILY_LEAD_STALE_RUN_MINUTES,
+    30,
+    1,
+    24 * 60
+  );
+
+const DEFAULT_MINI_PREFETCH_ENABLED =
+  envFlag("DAILY_DEFAULT_MINI_PREFETCH_ENABLED", true);
+
+const DEFAULT_MINI_PREFETCH_INITIAL_DELAY_MS =
+  clampInteger(
+    process.env.DAILY_DEFAULT_MINI_PREFETCH_INITIAL_DELAY_MS,
+    60_000,
+    5_000,
+    10 * 60 * 1000
+  );
+
+const DEFAULT_MINI_PREFETCH_SWEEP_MS =
+  clampInteger(
+    process.env.DAILY_DEFAULT_MINI_PREFETCH_SWEEP_MS,
+    5 * 60 * 1000,
+    60_000,
+    60 * 60 * 1000
+  );
+
+const DEFAULT_NICHES =
+  parseCsv(
+    process.env.DAILY_LEAD_NICHES ||
+      "clinics,dentists,restaurants,law firms,real estate agencies"
+  );
+
+const DEFAULT_LOCATIONS =
+  parseCsv(
+    process.env.DAILY_LEAD_LOCATIONS ||
+      "California,Texas,Florida,New York"
+  );
+
+const DEFAULT_LOCAL_PAKISTAN_LOCATIONS =
+  parseCsv(
+    process.env.DAILY_LEAD_LOCAL_PAKISTAN_LOCATIONS ||
+      "Karachi,Lahore,Islamabad,Rawalpindi,Faisalabad,Multan,Peshawar,Sialkot,Gujranwala"
+  );
+
+const DEFAULT_REGION_CODE =
+  String(
+    process.env.DAILY_LEAD_REGION_CODE ||
+      "US"
+  ).trim();
+
+const DEFAULT_RADIUS_KM =
+  clampNumber(
+    process.env.DAILY_LEAD_RADIUS_KM,
+    50,
+    1,
+    500
+  );
+
+const DEFAULT_QUALITY_LEVEL =
+  String(
+    process.env.DAILY_LEAD_QUALITY_LEVEL ||
+      "balanced"
+  ).trim();
+
+const AUTO_MINI_AUDIT =
+  envFlag(
+    "DAILY_LEAD_AUTO_MINI_AUDIT",
+    true
+  );
+
+/* ==========================================================================
+   Service
+   ========================================================================== */
+
+export function createDailyLeadAutomationService({
+  store,
+  workspaceService,
+  leadFinder,
+  leadAuditService = null,
+  emitToWorkspace = null,
+  emit = null,
+} = {}) {
+  if (
+    !store?.read ||
+    !store?.update
+  ) {
+    throw new Error(
+      "createDailyLeadAutomationService requires a store exposing read() and update()."
+    );
+  }
+
+  if (
+    !leadFinder?.findLeads
+  ) {
+    throw new Error(
+      "createDailyLeadAutomationService requires leadFinder.findLeads()."
+    );
+  }
+
+  const workspaceEmitter =
+    typeof emitToWorkspace === "function"
+      ? emitToWorkspace
+      : typeof emit === "function"
+        ? (workspaceId, eventName, payload) =>
+            emit({ workspaceId, event: eventName, payload })
+        : null;
+
+  let stopped = false;
+  let schedulerTimer = null;
+  let startupTimer = null;
+  let defaultMiniPrefetchTimer = null;
+  let defaultMiniPrefetchRunning = false;
+  let schedulerRunning = false;
+
+  const workspaceLocks =
+    new Map();
+
+  /* ------------------------------------------------------------------------
+     Public API
+     ------------------------------------------------------------------------ */
+
+  function getConfig(
+    workspaceId = ""
+  ) {
+    const state =
+      store.read();
+
+    const stored =
+      state.workspaceSettings?.[
+        workspaceId
+      ]?.dailyLeadAutomation ||
+      {};
+
+    return normalizeConfig({
+      enabled:
+        stored.enabled ??
+        envFlag(
+          "DAILY_LEAD_AUTOMATION_ENABLED",
+          false
+        ),
+
+      leadsPerCaller:
+        stored.leadsPerCaller ??
+        DEFAULT_LEADS_PER_CALLER,
+
+      timezone:
+        stored.timezone ||
+        DEFAULT_TIMEZONE,
+
+      assignmentHour:
+        stored.assignmentHour ??
+        DEFAULT_ASSIGNMENT_HOUR,
+
+      assignmentMinute:
+        stored.assignmentMinute ??
+        DEFAULT_ASSIGNMENT_MINUTE,
+
+      recycleAfterHours:
+        stored.recycleAfterHours ??
+        DEFAULT_RECYCLE_AFTER_HOURS,
+
+      maxCallAttempts:
+        stored.maxCallAttempts ??
+        DEFAULT_MAX_CALL_ATTEMPTS,
+
+      generationBatchSize:
+        stored.generationBatchSize ??
+        DEFAULT_GENERATION_BATCH_SIZE,
+
+      maxGenerationPerRun:
+        stored.maxGenerationPerRun ??
+        DEFAULT_MAX_GENERATION_PER_RUN,
+
+      niches:
+        Array.isArray(
+          stored.niches
+        ) &&
+        stored.niches.length
+          ? stored.niches
+          : DEFAULT_NICHES,
+
+      locations:
+        Array.isArray(
+          stored.locations
+        ) &&
+        stored.locations.length
+          ? stored.locations
+          : DEFAULT_LOCATIONS,
+
+      localPakistanLocations:
+        Array.isArray(
+          stored.localPakistanLocations
+        ) &&
+        stored.localPakistanLocations.length
+          ? stored.localPakistanLocations
+          : DEFAULT_LOCAL_PAKISTAN_LOCATIONS,
+
+      regionCode:
+        stored.regionCode ||
+        DEFAULT_REGION_CODE,
+
+      radiusKm:
+        stored.radiusKm ??
+        DEFAULT_RADIUS_KM,
+
+      qualityLevel:
+        stored.qualityLevel ||
+        DEFAULT_QUALITY_LEVEL,
+
+      autoMiniAudit:
+        stored.autoMiniAudit ??
+        AUTO_MINI_AUDIT,
+
+      callerPlans:
+        stored.callerPlans ||
+        {},
+
+      staleRunMinutes:
+        stored.staleRunMinutes ??
+        DEFAULT_STALE_RUN_MINUTES,
+    });
+  }
+
+  function saveConfig(
+    user,
+    input = {}
+  ) {
+    const context = getContext(user);
+    requireManager(context);
+
+    const current = getConfig(context.workspaceId);
+    const next = normalizeConfig({
+      ...current,
+      ...input,
+    });
+
+    store.update((draft) => {
+      ensureState(draft);
+      draft.workspaceSettings[context.workspaceId] =
+        draft.workspaceSettings[context.workspaceId] || {};
+      draft.workspaceSettings[context.workspaceId].dailyLeadAutomation = next;
+    });
+
+    emitWorkspaceEvent(
+      context.workspaceId,
+      "daily-leads:config-updated",
+      {
+        config: next,
+        updatedBy: user.id,
+        updatedAt: new Date().toISOString(),
+      }
+    );
+
+    // Per-caller time changes take effect immediately.
+    scheduleNextRun();
+
+    // Production safety: saving manager configuration never launches an
+    // immediate allocation. The normal per-caller scheduler remains active.
+
+    const nextRunAt = getWorkspaceNextScheduledRunDate({
+      state: store.read(),
+      workspaceId: context.workspaceId,
+      config: next,
+      now: new Date(),
+    });
+
+    return {
+      ok: true,
+      config: next,
+      nextRunAt: nextRunAt?.toISOString?.() || "",
+    };
+  }
+
+  function status(user) {
+    const context = getContext(user);
+    requireManager(context);
+
+    const state = store.read();
+    const config = getConfig(context.workspaceId);
+    const now = new Date();
+    const dateKey = getDateKey(now, config.timezone);
+
+    const runs = (state.dailyLeadRuns || [])
+      .filter((run) => run.workspaceId === context.workspaceId)
+      .sort(
+        (left, right) =>
+          Date.parse(right.createdAt || 0) -
+          Date.parse(left.createdAt || 0)
+      );
+
+    const callers = getActiveCallers(state, context.workspaceId);
+    const workspaceNextRun = getWorkspaceNextScheduledRunDate({
+      state,
+      workspaceId: context.workspaceId,
+      config,
+      now,
+    });
+
+    return {
+      ok: true,
+      workspaceId: context.workspaceId,
+      config,
+      callerCount: callers.length,
+      dateKey,
+      nextRunAt: workspaceNextRun?.toISOString?.() || "",
+      callers: callers.map((caller, index) => {
+        const plan = resolveCallerPlan(config, caller, index);
+
+        // Manager view shows the calendar day's queue. Before a caller's
+        // selected delivery time, today's assigned count therefore remains 0.
+        const dayStats = getCallerDayStats({
+          state,
+          workspaceId: context.workspaceId,
+          callerId: caller.id,
+          dateKey,
+        });
+
+        const submission = getCallerSubmission({
+          state,
+          workspaceId: context.workspaceId,
+          callerId: caller.id,
+          dateKey,
+        });
+
+        const callerConfig = {
+          ...config,
+          assignmentHour: plan.assignmentHour,
+          assignmentMinute: plan.assignmentMinute,
+        };
+
+        return {
+          id: caller.id,
+          name: caller.name || caller.fullName || caller.email || "Caller",
+          email: caller.email || "",
+          currentNiche: dayStats.niche || "",
+          currentResourceType: dayStats.resourceType || "",
+          currentLocation: dayStats.location || "",
+          currentCountry: dayStats.country || "",
+          nextNiche: plan.niche || "",
+          nextResourceType: plan.resourceType || "international",
+          nextLocation: plan.location || "",
+          nextCountry: plan.country || "",
+          nextRegionCode: plan.regionCode || "",
+          assignmentHour: plan.assignmentHour,
+          assignmentMinute: plan.assignmentMinute,
+          websiteCalls: plan.websiteCalls,
+          gmbCalls: plan.gmbCalls,
+          nextRefreshAt: getNextScheduledRunDate(now, callerConfig).toISOString(),
+          assignedToday: dayStats.assigned,
+          workedToday: dayStats.worked,
+          remainingToday: dayStats.remaining,
+          websiteAssignedToday: dayStats.websiteAssigned,
+          gmbAssignedToday: dayStats.gmbAssigned,
+          websiteWorkedToday: dayStats.websiteWorked,
+          gmbWorkedToday: dayStats.gmbWorked,
+          submission: submission || null,
+        };
+      }),
+      todayRun: runs.find((run) => run.dateKey === dateKey) || null,
+      latestRun: runs[0] || null,
+      recentRuns: runs.slice(0, 20),
+    };
+  }
+
+  function myDay(user) {
+    const context = getContext(user);
+    const role = normalizeRole(
+      context?.role || user?.workspaceRole || user?.role
+    );
+
+    if (role !== "caller") {
+      throw httpError(403, "Caller access is required.");
+    }
+
+    const config = getConfig(context.workspaceId);
+    const state = store.read();
+    const callers = getActiveCallers(state, context.workspaceId);
+    const foundIndex = callers.findIndex((caller) => caller.id === user.id);
+    const callerIndex = foundIndex >= 0 ? foundIndex : 0;
+    const caller = callers[callerIndex] || user;
+    const plan = resolveCallerPlan(config, caller, callerIndex);
+    const callerConfig = {
+      ...config,
+      assignmentHour: plan.assignmentHour,
+      assignmentMinute: plan.assignmentMinute,
+    };
+
+    // Caller keeps the previous working queue until their own scheduled time.
+    const dateKey = getBusinessDateKey(new Date(), callerConfig);
+    const stats = getCallerDayStats({
+      state,
+      workspaceId: context.workspaceId,
+      callerId: user.id,
+      dateKey,
+    });
+    const submission = getCallerSubmission({
+      state,
+      workspaceId: context.workspaceId,
+      callerId: user.id,
+      dateKey,
+    });
+
+    return {
+      ok: true,
+      workspaceId: context.workspaceId,
+      dateKey,
+      timezone: config.timezone,
+      assignmentHour: plan.assignmentHour,
+      assignmentMinute: plan.assignmentMinute,
+      leadsPerCaller: config.leadsPerCaller,
+      websiteCalls: plan.websiteCalls,
+      gmbCalls: plan.gmbCalls,
+      nextRefreshAt: getNextScheduledRunDate(new Date(), callerConfig).toISOString(),
+      currentNiche: stats.niche || "",
+      currentResourceType: stats.resourceType || "",
+      currentLocation: stats.location || "",
+      currentCountry: stats.country || "",
+      nextNiche: plan.niche || "",
+      nextResourceType: plan.resourceType || "international",
+      nextLocation: plan.location || "",
+      nextCountry: plan.country || "",
+      nextRegionCode: plan.regionCode || "",
+      assigned: stats.assigned,
+      worked: stats.worked,
+      closed: stats.closed,
+      remaining: stats.remaining,
+      websiteAssigned: stats.websiteAssigned,
+      gmbAssigned: stats.gmbAssigned,
+      websiteWorked: stats.websiteWorked,
+      gmbWorked: stats.gmbWorked,
+      submission: submission || null,
+    };
+  }
+
+  function submitMyDay(user, input = {}) {
+    const context = getContext(user);
+    const role = normalizeRole(
+      context?.role || user?.workspaceRole || user?.role
+    );
+
+    if (role !== "caller") {
+      throw httpError(403, "Caller access is required.");
+    }
+
+    const config = getConfig(context.workspaceId);
+    const state = store.read();
+    const callers = getActiveCallers(state, context.workspaceId);
+    const foundIndex = callers.findIndex((caller) => caller.id === user.id);
+    const callerIndex = foundIndex >= 0 ? foundIndex : 0;
+    const caller = callers[callerIndex] || user;
+    const plan = resolveCallerPlan(config, caller, callerIndex);
+    const callerConfig = {
+      ...config,
+      assignmentHour: plan.assignmentHour,
+      assignmentMinute: plan.assignmentMinute,
+    };
+
+    const dateKey = getBusinessDateKey(new Date(), callerConfig);
+    const submittedAt = new Date().toISOString();
+    let saved = null;
+
+    store.update((draft) => {
+      ensureState(draft);
+
+      const stats = getCallerDayStats({
+        state: draft,
+        workspaceId: context.workspaceId,
+        callerId: user.id,
+        dateKey,
+      });
+
+      const existing = draft.dailyCallerSubmissions.find(
+        (item) =>
+          item.workspaceId === context.workspaceId &&
+          item.callerId === user.id &&
+          item.dateKey === dateKey
+      );
+
+      const record = {
+        id: existing?.id || crypto.randomUUID(),
+        workspaceId: context.workspaceId,
+        callerId: user.id,
+        callerName: user.name || user.fullName || user.email || "Caller",
+        dateKey,
+        status: "submitted",
+        assigned: stats.assigned,
+        worked: stats.worked,
+        closed: stats.closed,
+        remaining: stats.remaining,
+        notes: String(input.notes || "").slice(0, 2000),
+        submittedAt,
+        deadlineAt: getNextScheduledRunDate(new Date(), callerConfig).toISOString(),
+        createdAt: existing?.createdAt || submittedAt,
+        updatedAt: submittedAt,
+      };
+
+      if (existing) {
+        Object.assign(existing, record);
+        saved = { ...existing };
+      } else {
+        draft.dailyCallerSubmissions.unshift(record);
+        saved = { ...record };
+      }
+    });
+
+    emitWorkspaceEvent(context.workspaceId, "daily-leads:submitted", {
+      submission: saved,
+    });
+
+    return {
+      ok: true,
+      submission: saved,
+    };
+  }
+
+  function getWorkspaceIds() {
+    const state = store.read();
+    const ids = new Set();
+
+    for (const workspace of state.workspaces || []) {
+      if (
+        workspace?.id &&
+        workspace.active !== false &&
+        workspace.isActive !== false &&
+        workspace.status !== "inactive"
+      ) {
+        ids.add(workspace.id);
+      }
+    }
+
+    for (const user of state.users || []) {
+      if (user?.workspaceId) {
+        ids.add(user.workspaceId);
+      }
+    }
+
+    return [...ids];
+  }
+
+  async function runDueWorkspaces({
+    source = "scheduler",
+    workspaceId: onlyWorkspaceId = "",
+  } = {}) {
+    const now = new Date();
+    const results = [];
+    const workspaceIds = onlyWorkspaceId
+      ? [onlyWorkspaceId]
+      : getWorkspaceIds();
+
+    for (const workspaceId of workspaceIds) {
+      const config = getConfig(workspaceId);
+      if (!config.enabled) continue;
+
+      const state = store.read();
+      const callers = getActiveCallers(state, workspaceId);
+      if (!callers.length) continue;
+
+      const local = getZonedDateParts(now, config.timezone);
+      const dateKey = getDateKey(now, config.timezone);
+      const dueCallerIds = [];
+
+      callers.forEach((caller, index) => {
+        const plan = resolveCallerPlan(config, caller, index);
+        const isPastCallerCutoff =
+          local.hour > plan.assignmentHour ||
+          (local.hour === plan.assignmentHour &&
+            local.minute >= plan.assignmentMinute);
+
+        if (!isPastCallerCutoff) return;
+
+        const stats = getCallerDayStats({
+          state,
+          workspaceId,
+          callerId: caller.id,
+          dateKey,
+        });
+
+        if (stats.assigned < config.leadsPerCaller) {
+          dueCallerIds.push(caller.id);
+        }
+      });
+
+      if (!dueCallerIds.length) continue;
+
+      try {
+        results.push(
+          await runWorkspace({
+            workspaceId,
+            source,
+            force: false,
+            callerIds: dueCallerIds,
+            dateKeyOverride: dateKey,
+          })
+        );
+      } catch (error) {
+        results.push({
+          ok: false,
+          workspaceId,
+          callerIds: dueCallerIds,
+          error: error?.message || String(error),
+        });
+      }
+    }
+
+    return {
+      ok: results.every((item) => item.ok !== false),
+      results,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
+  async function runForUser(
+    user,
+    input = {}
+  ) {
+    const context =
+      getContext(user);
+
+    requireManager(context);
+
+    const callerId =
+      String(
+        input.callerId ||
+          ""
+      ).trim();
+
+    const config =
+      getConfig(
+        context.workspaceId
+      );
+
+    return runWorkspace({
+      workspaceId:
+        context.workspaceId,
+
+      requestedBy:
+        user.id,
+
+      source:
+        input.source ||
+        (callerId
+          ? "manager-caller-now"
+          : "manual"),
+
+      force:
+        input.force === true,
+
+      callerIds:
+        callerId
+          ? [callerId]
+          : null,
+
+      // A caller-specific manual run always targets the manager's calendar day,
+      // regardless of whether that caller's normal delivery time is still ahead.
+      dateKeyOverride:
+        callerId
+          ? getDateKey(
+              new Date(),
+              config.timezone
+            )
+          : "",
+
+      overrideToday:
+        callerId &&
+        input.overrideToday ===
+          true,
+    });
+  }
+
+  async function runAllWorkspaces({
+    source =
+      "scheduler",
+
+    force =
+      false,
+  } = {}) {
+    const state =
+      store.read();
+
+    const workspaceIds =
+      new Set();
+
+    for (
+      const workspace
+      of state.workspaces ||
+      []
+    ) {
+      if (
+        workspace?.id &&
+        workspace.active !== false &&
+        workspace.isActive !== false &&
+        workspace.status !==
+          "inactive"
+      ) {
+        workspaceIds.add(
+          workspace.id
+        );
+      }
+    }
+
+    for (
+      const user
+      of state.users ||
+      []
+    ) {
+      if (
+        user?.workspaceId
+      ) {
+        workspaceIds.add(
+          user.workspaceId
+        );
+      }
+    }
+
+    const results = [];
+
+    for (
+      const workspaceId
+      of workspaceIds
+    ) {
+      const config =
+        getConfig(
+          workspaceId
+        );
+
+      if (!config.enabled) {
+        continue;
+      }
+
+      try {
+        results.push(
+          await runWorkspace({
+            workspaceId,
+            source,
+            force,
+          })
+        );
+      } catch (error) {
+        results.push({
+          ok: false,
+          workspaceId,
+          error:
+            error?.message ||
+            String(error),
+        });
+      }
+    }
+
+    return {
+      ok:
+        results.every(
+          (result) =>
+            result.ok !== false
+        ),
+
+      results,
+
+      completedAt:
+        new Date().toISOString(),
+    };
+  }
+
+  async function runWorkspace({
+    workspaceId,
+    requestedBy = "",
+    source = "automatic",
+    force = false,
+    callerIds = null,
+    dateKeyOverride = "",
+    overrideToday = false,
+  }) {
+    if (!workspaceId) {
+      throw httpError(400, "workspaceId is required.");
+    }
+
+    if (workspaceLocks.has(workspaceId)) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        reason: "An allocation run is already active for this workspace.",
+      };
+    }
+
+    const execution = executeWorkspaceRun({
+      workspaceId,
+      requestedBy,
+      source,
+      force,
+      callerIds,
+      dateKeyOverride,
+      overrideToday,
+    }).finally(() => {
+      workspaceLocks.delete(workspaceId);
+    });
+
+    workspaceLocks.set(workspaceId, execution);
+    return execution;
+  }
+
+  function startScheduler() {
+    if (stopped) {
+      stopped = false;
+    }
+
+    scheduleNextRun();
+
+    if (startupTimer) {
+      clearTimeout(startupTimer);
+    }
+
+    // Production safety: API restarts must not trigger allocation.
+    // The normal per-caller schedule remains active.
+    startupTimer = null;
+
+    console.log(
+      "[daily-leads] startup-catch-up disabled; scheduled caller runs remain active."
+    );
+
+    // Default Mini Audit prefetch is audit-only. It never changes lead ownership,
+    // daily allocation, or Telnyx calling. The first sweep is delayed so API
+    // startup can settle on the small production host.
+    scheduleDefaultMiniAuditPrefetch(DEFAULT_MINI_PREFETCH_INITIAL_DELAY_MS);
+
+    return {
+      stop,
+    };
+  }
+
+  function stop() {
+    stopped = true;
+
+    if (schedulerTimer) {
+      clearTimeout(
+        schedulerTimer
+      );
+
+      schedulerTimer = null;
+    }
+
+    if (startupTimer) {
+      clearTimeout(
+        startupTimer
+      );
+
+      startupTimer = null;
+    }
+
+    if (defaultMiniPrefetchTimer) {
+      clearTimeout(defaultMiniPrefetchTimer);
+      defaultMiniPrefetchTimer = null;
+    }
+  }
+
+  /* ------------------------------------------------------------------------
+     Workspace execution
+     ------------------------------------------------------------------------ */
+
+  async function executeWorkspaceRun({
+    workspaceId,
+    requestedBy,
+    source,
+    force,
+    callerIds = null,
+    dateKeyOverride = "",
+    overrideToday = false,
+  }) {
+    const startedAt = new Date().toISOString();
+    const config = getConfig(workspaceId);
+
+    if (!config.enabled && !force) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        reason: "Daily lead automation is disabled.",
+      };
+    }
+
+    const now = new Date();
+    const dateKey =
+      String(dateKeyOverride || "").trim() ||
+      (force
+        ? getDateKey(now, config.timezone)
+        : getBusinessDateKey(now, config));
+
+    recoverStaleRuns({
+      workspaceId,
+      dateKey,
+      staleRunMinutes: config.staleRunMinutes,
+    });
+
+    const currentState = store.read();
+    const allCallers = getActiveCallers(currentState, workspaceId);
+
+    if (!allCallers.length) {
+      throw httpError(422, "No active callers were found in this workspace.");
+    }
+
+    const requestedCallerIds = Array.isArray(callerIds)
+      ? new Set(
+          callerIds
+            .map((value) => String(value || "").trim())
+            .filter(Boolean)
+        )
+      : null;
+
+    const callers = requestedCallerIds
+      ? allCallers.filter((caller) => requestedCallerIds.has(caller.id))
+      : allCallers;
+
+    if (!callers.length) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        reason: "No matching active callers require allocation.",
+      };
+    }
+
+    const isPartialCallerRun = Boolean(requestedCallerIds);
+    const previousRun = findTodayRun(currentState, workspaceId, dateKey);
+
+    // Workspace-wide automatic runs keep the old run guard. A per-caller run
+    // must not be blocked by another caller's completed run on the same date.
+    if (
+      !isPartialCallerRun &&
+      previousRun &&
+      FINISHED_RUN_STATUSES.has(normalizeStatus(previousRun.status)) &&
+      Number(previousRun.assignedCount || 0) > 0 &&
+      !force
+    ) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        run: previousRun,
+        reason: "Today's automatic allocation has already completed.",
+      };
+    }
+
+    if (
+      !isPartialCallerRun &&
+      previousRun &&
+      normalizeStatus(previousRun.status) === "running" &&
+      !force
+    ) {
+      return {
+        ok: true,
+        skipped: true,
+        workspaceId,
+        run: previousRun,
+        reason: "Today's allocation is currently running.",
+      };
+    }
+
+    const callerIndexById = new Map(
+      allCallers.map((caller, index) => [caller.id, index])
+    );
+
+    finalizePreviousDaySubmissions({
+      workspaceId,
+      dateKey,
+      callers,
+      config,
+      callerIndexById,
+    });
+
+    const targetCount = callers.length * config.leadsPerCaller;
+    const run = createRunRecord({
+      workspaceId,
+      dateKey,
+      source,
+      requestedBy,
+      callerCount: callers.length,
+      leadsPerCaller: config.leadsPerCaller,
+      targetCount,
+      startedAt,
+    });
+
+    try {
+      let overrideResult = {
+        supersededCount: 0,
+        leadIds: [],
+      };
+
+      // Manager override replaces only today's UNWORKED queue for the selected
+      // caller(s). Already-worked / completed leads remain intact in history and
+      // count toward the daily target. The removed lead IDs are excluded from
+      // this immediate replacement run so "override" really produces a fresh
+      // queue instead of instantly selecting the same leads again.
+      if (
+        overrideToday &&
+        isPartialCallerRun
+      ) {
+        overrideResult =
+          supersedeCallerTodayQueue({
+            workspaceId,
+            dateKey,
+            callerIds:
+              callers.map(
+                (caller) =>
+                  caller.id
+              ),
+            requestedBy,
+          });
+      }
+
+      const protectedTodayLeadIds =
+        overrideToday
+          ? getAssignedDailyLeadIds({
+              state: store.read(),
+              workspaceId,
+              dateKey,
+              callers,
+            })
+          : [];
+
+      const reusable = collectReusableLeads({
+        state: store.read(),
+        workspaceId,
+        dateKey,
+        config,
+        excludeLeadIds:
+          new Set([
+            ...(overrideResult.leadIds ||
+              []),
+            ...protectedTodayLeadIds,
+          ]),
+      });
+      const available = [...reusable.items];
+      const workload = overrideToday
+        ? countAssignedDailyLeadsByCaller({
+            state: store.read(),
+            workspaceId,
+            dateKey,
+            callers,
+          })
+        : countCurrentAssignmentsByCaller({
+            state: store.read(),
+            workspaceId,
+            dateKey,
+            callers,
+          });
+
+      const assignedByCaller = {};
+      const assignedLeadRefs = [];
+      let assignedCount = 0;
+      let generatedCount = 0;
+
+      for (const caller of callers) {
+        const callerIndex = callerIndexById.get(caller.id) ?? 0;
+        const plan = resolveCallerPlan(config, caller, callerIndex);
+        const current = workload.get(caller.id) || 0;
+        const overallRequired = Math.max(0, config.leadsPerCaller - current);
+        assignedByCaller[caller.id] = 0;
+
+        if (!overallRequired) continue;
+
+        const currentStats = getCallerDayStats({
+          state: store.read(),
+          workspaceId,
+          callerId: caller.id,
+          dateKey,
+        });
+        const mix = normalizeCallMix(plan, config.leadsPerCaller);
+        let websiteRequired = Math.max(
+          0,
+          mix.websiteCalls - currentStats.websiteAssigned
+        );
+        let gmbRequired = Math.max(
+          0,
+          mix.gmbCalls - currentStats.gmbAssigned
+        );
+
+        // Never exceed the caller's remaining daily capacity. When an existing
+        // queue has the old mix, the manager can use Override + assign now to
+        // replace only unworked tasks and apply the new ratio immediately.
+        const requestedByMix = websiteRequired + gmbRequired;
+        if (requestedByMix > overallRequired) {
+          const overflow = requestedByMix - overallRequired;
+          if (websiteRequired >= gmbRequired) {
+            websiteRequired = Math.max(0, websiteRequired - overflow);
+          } else {
+            gmbRequired = Math.max(0, gmbRequired - overflow);
+          }
+        }
+
+        const required = websiteRequired + gmbRequired;
+        if (!required) continue;
+
+        const reusableForCaller = takeCandidatesForCaller({
+          available,
+          caller,
+          plan,
+          limit: required,
+        });
+        let callerCandidates = [...reusableForCaller];
+        const missing = required - callerCandidates.length;
+
+        if (
+          missing > 0 &&
+          generatedCount < config.maxGenerationPerRun
+        ) {
+          const allowed = Math.min(
+            missing,
+            config.maxGenerationPerRun - generatedCount
+          );
+
+          const generated = await generateRealLeads({
+            workspaceId,
+            requestedBy,
+            config,
+            requested: allowed,
+            existingKeys: reusable.usedKeys,
+            runId: run.id,
+            nichesOverride: plan.niche ? [plan.niche] : config.niches,
+            locationsOverride: plan.location ? [plan.location] : config.locations,
+            regionCodeOverride: plan.regionCode || config.regionCode,
+            resourceType: plan.resourceType,
+            country: plan.country,
+          });
+
+          generatedCount += generated.length;
+          callerCandidates = [...callerCandidates, ...generated];
+        }
+
+        const callerResult = assignLeadsToCaller({
+          workspaceId,
+          dateKey,
+          caller,
+          candidates: callerCandidates,
+          required,
+          campaignMix: {
+            website: websiteRequired,
+            gmb: gmbRequired,
+          },
+          requestedBy,
+          source,
+          runId: run.id,
+          plan,
+        });
+
+        assignedCount += callerResult.assignedCount;
+        assignedByCaller[caller.id] += callerResult.assignedCount;
+        assignedLeadRefs.push(...callerResult.assignedLeadRefs);
+      }
+
+      // Every assigned Website/GMB lead receives a real default Mini Audit job.
+      // queueCampaignAudits() batches by caller, and lead-audit-service persists a
+      // full caller batch in one store transaction. Worker concurrency is hard-capped
+      // at two, so this does not recreate the old 100-per-lead persistence storm.
+      const auditQueuedCount = assignedLeadRefs.length
+        ? queueCampaignAudits(assignedLeadRefs)
+        : 0;
+
+      const existingCount = callers.reduce(
+        (total, caller) => total + (workload.get(caller.id) || 0),
+        0
+      );
+      const shortfall = Math.max(
+        0,
+        targetCount - existingCount - assignedCount
+      );
+      const finalStatus = shortfall > 0 ? "completed_partial" : "completed";
+
+      const completedRun = updateRunRecord(run.id, {
+        status: finalStatus,
+        recycledCount: reusable.recycledCount,
+        reusedCount: reusable.reusedCount,
+        generatedCount,
+        assignedCount,
+        auditQueuedCount,
+        shortfall,
+        assignedByCaller,
+        overriddenCount:
+          overrideResult.supersededCount ||
+          0,
+        scheduledCallerIds: callers.map((caller) => caller.id),
+        callerPlans: Object.fromEntries(
+          callers.map((caller) => [
+            caller.id,
+            resolveCallerPlan(
+              config,
+              caller,
+              callerIndexById.get(caller.id) ?? 0
+            ),
+          ])
+        ),
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      emitWorkspaceEvent(workspaceId, "daily-leads:completed", {
+        run: completedRun,
+        dateKey,
+        callerIds: callers.map((caller) => caller.id),
+      });
+
+      console.log(
+        `[daily-leads] workspace completed ${JSON.stringify({
+          at: new Date().toISOString(),
+          workspaceId,
+          dateKey,
+          callerCount: callers.length,
+          callerIds: callers.map((caller) => caller.id),
+          leadsPerCaller: config.leadsPerCaller,
+          reusedCount: reusable.reusedCount,
+          recycledCount: reusable.recycledCount,
+          generatedCount,
+          assignedCount,
+          overriddenCount:
+            overrideResult.supersededCount ||
+            0,
+          shortfall,
+          status: finalStatus,
+        })}`
+      );
+
+      return {
+        ok: true,
+        workspaceId,
+        callerIds: callers.map((caller) => caller.id),
+        run: completedRun,
+      };
+    } catch (error) {
+      const failedRun = updateRunRecord(run.id, {
+        status: "failed",
+        errors: [error?.message || String(error)],
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      emitWorkspaceEvent(workspaceId, "daily-leads:failed", {
+        run: failedRun,
+        error: error?.message || String(error),
+      });
+
+      throw error;
+    }
+  }
+
+  function supersedeCallerTodayQueue({
+    workspaceId,
+    dateKey,
+    callerIds = [],
+    requestedBy = "",
+  }) {
+    const callerIdSet =
+      new Set(
+        callerIds
+          .map((value) =>
+            String(value || "").trim()
+          )
+          .filter(Boolean)
+      );
+
+    if (!callerIdSet.size) {
+      return {
+        supersededCount: 0,
+        leadIds: [],
+      };
+    }
+
+    const now =
+      new Date().toISOString();
+    const supersededLeadIds =
+      new Set();
+
+    store.update((draft) => {
+      ensureState(draft);
+
+      for (
+        const campaign
+        of draft.campaigns || []
+      ) {
+        if (
+          campaign.workspaceId !==
+          workspaceId
+        ) {
+          continue;
+        }
+
+        for (
+          const lead
+          of campaign.leads || []
+        ) {
+          const callerId =
+            String(
+              lead.assignedTo ||
+                lead.assigneeId ||
+                ""
+            );
+
+          const queueDate =
+            String(
+              lead.dailyQueueDate ||
+                lead.assignmentDate ||
+                ""
+            );
+
+          if (
+            !callerIdSet.has(
+              callerId
+            ) ||
+            queueDate !== dateKey ||
+            !isReplaceableDailyLead(
+              lead
+            )
+          ) {
+            continue;
+          }
+
+          supersededLeadIds.add(
+            String(lead.id)
+          );
+
+          lead.timeline =
+            Array.isArray(
+              lead.timeline
+            )
+              ? lead.timeline
+              : [];
+
+          lead.timeline.unshift({
+            id:
+              crypto.randomUUID(),
+            type:
+              "daily_assignment_overridden",
+            actorId:
+              requestedBy ||
+              "manager",
+            previousAssigneeId:
+              callerId,
+            assignmentDate:
+              dateKey,
+            createdAt: now,
+          });
+
+          lead.previousAssigneeId =
+            callerId;
+          lead.assignedTo = "";
+          lead.assigneeId = "";
+          lead.assignedToName = "";
+          lead.assignmentDate = "";
+          lead.dailyQueueDate = "";
+          lead.dailyLeadRunId = "";
+          lead.queueStatus =
+            "removed";
+          lead.supersededQueueDate =
+            dateKey;
+          lead.supersededAt = now;
+          lead.supersededBy =
+            requestedBy ||
+            "manager";
+
+          if (
+            [
+              "",
+              "new",
+              "assigned",
+              "pending",
+              "ready",
+            ].includes(
+              normalizeStatus(
+                lead.status
+              )
+            )
+          ) {
+            lead.status = "new";
+          }
+
+          lead.updatedAt = now;
+        }
+      }
+
+      if (
+        !supersededLeadIds.size
+      ) {
+        return;
+      }
+
+      for (
+        const assignment
+        of draft.salesAssignments || []
+      ) {
+        const callerId =
+          String(
+            assignment.assignedTo ||
+              assignment.assigneeId ||
+              assignment.userId ||
+              ""
+          );
+        const assignmentDate =
+          String(
+            assignment.assignmentDate ||
+              assignment.dailyQueueDate ||
+              ""
+          );
+
+        if (
+          !callerIdSet.has(
+            callerId
+          ) ||
+          assignmentDate !==
+            dateKey ||
+          !supersededLeadIds.has(
+            String(
+              assignment.leadId ||
+                ""
+            )
+          ) ||
+          !isActiveAssignment(
+            assignment
+          )
+        ) {
+          continue;
+        }
+
+        assignment.status =
+          "reassigned";
+        assignment.queueStatus =
+          "removed";
+        assignment.completedAt = now;
+        assignment.supersededAt = now;
+        assignment.supersededBy =
+          requestedBy ||
+          "manager";
+        assignment.supersededReason =
+          "manager_override_today";
+        assignment.updatedAt = now;
+      }
+
+      for (
+        const task
+        of draft.teamTasks || []
+      ) {
+        const callerId =
+          String(
+            task.assignedTo ||
+              task.assignedToUserId ||
+              task.userId ||
+              ""
+          );
+        const taskDate =
+          String(
+            task.assignmentDate ||
+              task.dailyQueueDate ||
+              ""
+          );
+        const status =
+          normalizeStatus(
+            task.status
+          );
+
+        if (
+          !callerIdSet.has(
+            callerId
+          ) ||
+          taskDate !== dateKey ||
+          !supersededLeadIds.has(
+            String(
+              task.leadId ||
+                ""
+            )
+          ) ||
+          [
+            "completed",
+            "cancelled",
+          ].includes(status)
+        ) {
+          continue;
+        }
+
+        task.status =
+          "cancelled";
+        task.queueStatus =
+          "removed";
+        task.completedAt = now;
+        task.supersededAt = now;
+        task.supersededBy =
+          requestedBy ||
+          "manager";
+        task.supersededReason =
+          "manager_override_today";
+        task.updatedAt = now;
+      }
+    });
+
+    return {
+      supersededCount:
+        supersededLeadIds.size,
+      leadIds:
+        [...supersededLeadIds],
+    };
+  }
+
+  /* ------------------------------------------------------------------------
+     Run records
+     ------------------------------------------------------------------------ */
+
+  function createRunRecord({
+    workspaceId,
+    dateKey,
+    source,
+    requestedBy,
+    callerCount,
+    leadsPerCaller,
+    targetCount,
+    startedAt,
+  }) {
+    const run = {
+      id:
+        crypto.randomUUID(),
+
+      workspaceId,
+      dateKey,
+      source,
+      requestedBy,
+
+      status:
+        "running",
+
+      callerCount,
+      leadsPerCaller,
+      targetCount,
+
+      recycledCount: 0,
+      reusedCount: 0,
+      generatedCount: 0,
+      assignedCount: 0,
+      auditQueuedCount: 0,
+      overriddenCount: 0,
+      shortfall:
+        targetCount,
+
+      assignedByCaller:
+        {},
+
+      errors: [],
+
+      startedAt,
+
+      completedAt: "",
+
+      createdAt:
+        startedAt,
+
+      updatedAt:
+        startedAt,
+    };
+
+    store.update(
+      (draft) => {
+        ensureState(
+          draft
+        );
+
+        const previous =
+          draft.dailyLeadRuns.find(
+            (item) =>
+              item.workspaceId ===
+                workspaceId &&
+              item.dateKey ===
+                dateKey
+          );
+
+        if (previous) {
+          Object.assign(
+            previous,
+            run,
+            {
+              id:
+                previous.id ||
+                run.id,
+
+              createdAt:
+                previous.createdAt ||
+                run.createdAt,
+            }
+          );
+        } else {
+          draft.dailyLeadRuns.unshift(
+            run
+          );
+        }
+      }
+    );
+
+    return (
+      findRunById(
+        run.id
+      ) ||
+      findTodayRun(
+        store.read(),
+        workspaceId,
+        dateKey
+      )
+    );
+  }
+
+  function updateRunRecord(
+    runId,
+    updates
+  ) {
+    let updated =
+      null;
+
+    store.update(
+      (draft) => {
+        ensureState(
+          draft
+        );
+
+        const run =
+          draft.dailyLeadRuns.find(
+            (item) =>
+              item.id ===
+              runId
+          );
+
+        if (!run) {
+          return;
+        }
+
+        Object.assign(
+          run,
+          updates
+        );
+
+        updated = {
+          ...run,
+        };
+      }
+    );
+
+    return (
+      updated ||
+      findRunById(
+        runId
+      )
+    );
+  }
+
+  function findRunById(
+    runId
+  ) {
+    return (
+      store
+        .read()
+        .dailyLeadRuns
+        ?.find(
+          (run) =>
+            run.id ===
+            runId
+        ) ||
+      null
+    );
+  }
+
+  function recoverStaleRuns({
+    workspaceId,
+    dateKey,
+    staleRunMinutes,
+  }) {
+    const now =
+      Date.now();
+
+    const staleAfterMs =
+      staleRunMinutes *
+      60 *
+      1000;
+
+    store.update(
+      (draft) => {
+        ensureState(
+          draft
+        );
+
+        for (
+          const run
+          of draft.dailyLeadRuns
+        ) {
+          if (
+            run.workspaceId !==
+              workspaceId ||
+            run.dateKey !==
+              dateKey ||
+            normalizeStatus(
+              run.status
+            ) !== "running"
+          ) {
+            continue;
+          }
+
+          const started =
+            Date.parse(
+              run.startedAt ||
+                run.updatedAt ||
+                run.createdAt ||
+                0
+            );
+
+          const stale =
+            !Number.isFinite(
+              started
+            ) ||
+            now - started >=
+              staleAfterMs;
+
+          const emptyRun =
+            Number(
+              run.assignedCount ||
+                0
+            ) === 0 &&
+            Number(
+              run.generatedCount ||
+                0
+            ) === 0;
+
+          if (
+            stale ||
+            emptyRun
+          ) {
+            run.status =
+              "failed";
+
+            run.errors =
+              Array.isArray(
+                run.errors
+              )
+                ? run.errors
+                : [];
+
+            run.errors.push(
+              "Recovered an incomplete daily lead run after backend restart."
+            );
+
+            run.completedAt =
+              new Date()
+                .toISOString();
+
+            run.updatedAt =
+              run.completedAt;
+          }
+        }
+      }
+    );
+  }
+
+  /* ------------------------------------------------------------------------
+     Existing lead collection
+     ------------------------------------------------------------------------ */
+
+  function collectReusableLeads({
+    state,
+    workspaceId,
+    dateKey,
+    config,
+    excludeLeadIds =
+      new Set(),
+  }) {
+    const items = [];
+    const usedKeys =
+      new Set();
+
+    let reusedCount =
+      0;
+
+    let recycledCount =
+      0;
+
+    const activeAssignmentLeadIds =
+      new Set(
+        getAssignments(
+          state
+        )
+          .filter(
+            (assignment) =>
+              assignment.workspaceId ===
+                workspaceId &&
+              isActiveAssignment(
+                assignment
+              )
+          )
+          .map(
+            (assignment) =>
+              String(
+                assignment.leadId ||
+                  ""
+              )
+          )
+          .filter(
+            Boolean
+          )
+      );
+
+    const cutoff =
+      Date.now() -
+      config.recycleAfterHours *
+        60 *
+        60 *
+        1000;
+
+    for (
+      const campaign
+      of state.campaigns ||
+      []
+    ) {
+      if (
+        campaign.workspaceId !==
+        workspaceId
+      ) {
+        continue;
+      }
+
+      if (
+        isSyntheticCampaign(
+          campaign
+        )
+      ) {
+        continue;
+      }
+
+      for (
+        const lead
+        of campaign.leads ||
+        []
+      ) {
+        if (
+          !lead?.id ||
+          excludeLeadIds.has(
+            String(lead.id)
+          ) ||
+          !isRealLead(
+            lead,
+            campaign
+          )
+        ) {
+          continue;
+        }
+
+        const key =
+          leadUniqueKey(
+            lead
+          );
+
+        if (
+          !key ||
+          usedKeys.has(
+            key
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          isTerminalLead(
+            lead
+          )
+        ) {
+          continue;
+        }
+
+        const attempts =
+          getCallAttempts(
+            lead
+          );
+
+        if (
+          attempts >=
+          config.maxCallAttempts
+        ) {
+          continue;
+        }
+
+        const assignedTo =
+          String(
+            lead.assignedTo ||
+              lead.assigneeId ||
+              ""
+          );
+
+        const hasActiveAssignment =
+          activeAssignmentLeadIds.has(
+            String(
+              lead.id
+            )
+          );
+
+        if (
+          !assignedTo &&
+          !hasActiveAssignment
+        ) {
+          usedKeys.add(
+            key
+          );
+
+          items.push({
+            campaignId:
+              campaign.id,
+
+            campaignName:
+              campaign.name ||
+              "",
+
+            leadId:
+              lead.id,
+
+            lead,
+
+            source:
+              "existing-unassigned",
+
+            niche:
+              campaign.niche ||
+              lead.niche ||
+              lead.category ||
+              "",
+
+            location:
+              campaign.location ||
+              lead.dailyLocation ||
+              lead.location ||
+              lead.address ||
+              "",
+
+            resourceType:
+              normalizeResourceType(
+                lead.dailyResourceType ||
+                  campaign.resourceType ||
+                  inferResourceTypeFromLocation(
+                    campaign.location ||
+                      lead.location ||
+                      lead.address ||
+                      "",
+                    campaign.regionCode ||
+                      lead.dailyRegionCode ||
+                      lead.regionCode ||
+                      ""
+                  )
+              ),
+
+            country:
+              lead.dailyCountry ||
+              campaign.country ||
+              lead.country ||
+              "",
+
+            regionCode:
+              String(
+                lead.dailyRegionCode ||
+                  campaign.regionCode ||
+                  lead.regionCode ||
+                  ""
+              )
+                .trim()
+                .toUpperCase(),
+
+            previousAssigneeId:
+              assignedTo ||
+              "",
+
+            priority:
+              calculateLeadPriority(
+                lead
+              ),
+          });
+
+          reusedCount += 1;
+
+          continue;
+        }
+
+        const latestAction =
+          Date.parse(
+            lead.nextActionAt ||
+              lead.callbackAt ||
+              lead.followUpAt ||
+              lead.lastCallAt ||
+              lead.assignedAt ||
+              lead.updatedAt ||
+              lead.createdAt ||
+              0
+          );
+
+        const due =
+          isLeadDue(
+            lead,
+            dateKey,
+            config.timezone
+          );
+
+        const oldEnough =
+          Number.isFinite(
+            latestAction
+          ) &&
+          latestAction <=
+            cutoff;
+
+        const fromPreviousDailyQueue =
+          Boolean(
+            lead.dailyQueueDate &&
+            lead.dailyQueueDate <
+              dateKey
+          );
+
+        if (
+          due ||
+          oldEnough ||
+          fromPreviousDailyQueue
+        ) {
+          usedKeys.add(
+            key
+          );
+
+          items.push({
+            campaignId:
+              campaign.id,
+
+            campaignName:
+              campaign.name ||
+              "",
+
+            leadId:
+              lead.id,
+
+            lead,
+
+            source:
+              due
+                ? "due-follow-up"
+                : fromPreviousDailyQueue
+                  ? "previous-daily-queue"
+                  : "recycled",
+
+            niche:
+              campaign.niche ||
+              lead.dailyNiche ||
+              lead.niche ||
+              lead.category ||
+              "",
+
+            location:
+              campaign.location ||
+              lead.dailyLocation ||
+              lead.location ||
+              lead.address ||
+              "",
+
+            resourceType:
+              normalizeResourceType(
+                lead.dailyResourceType ||
+                  campaign.resourceType ||
+                  inferResourceTypeFromLocation(
+                    campaign.location ||
+                      lead.dailyLocation ||
+                      lead.location ||
+                      lead.address ||
+                      "",
+                    lead.dailyRegionCode ||
+                      campaign.regionCode ||
+                      lead.regionCode ||
+                      ""
+                  )
+              ),
+
+            country:
+              lead.dailyCountry ||
+              campaign.country ||
+              lead.country ||
+              "",
+
+            regionCode:
+              String(
+                lead.dailyRegionCode ||
+                  campaign.regionCode ||
+                  lead.regionCode ||
+                  ""
+              )
+                .trim()
+                .toUpperCase(),
+
+            previousAssigneeId:
+              assignedTo ||
+              "",
+
+            priority:
+              due
+                ? 1000 +
+                  calculateLeadPriority(
+                    lead
+                  )
+                : calculateLeadPriority(
+                    lead
+                  ),
+          });
+
+          recycledCount += 1;
+        }
+      }
+    }
+
+    items.sort(
+      (
+        left,
+        right
+      ) =>
+        right.priority -
+        left.priority
+    );
+
+    return {
+      items,
+      usedKeys,
+      reusedCount,
+      recycledCount,
+    };
+  }
+
+  function finalizePreviousDaySubmissions({
+    workspaceId,
+    dateKey,
+    callers,
+    config,
+    callerIndexById = new Map(),
+  }) {
+    const previousDateKey = addDaysToDateKey(dateKey, -1);
+    const now = new Date().toISOString();
+
+    store.update((draft) => {
+      ensureState(draft);
+
+      for (const caller of callers) {
+        const existing = getCallerSubmission({
+          state: draft,
+          workspaceId,
+          callerId: caller.id,
+          dateKey: previousDateKey,
+        });
+        if (existing) continue;
+
+        const stats = getCallerDayStats({
+          state: draft,
+          workspaceId,
+          callerId: caller.id,
+          dateKey: previousDateKey,
+        });
+        if (!stats.assigned) continue;
+
+        const plan = resolveCallerPlan(
+          config,
+          caller,
+          callerIndexById.get(caller.id) ?? 0
+        );
+
+        draft.dailyCallerSubmissions.unshift({
+          id: crypto.randomUUID(),
+          workspaceId,
+          callerId: caller.id,
+          callerName: caller.name || caller.fullName || caller.email || "Caller",
+          dateKey: previousDateKey,
+          status: "missed_deadline",
+          assigned: stats.assigned,
+          worked: stats.worked,
+          closed: stats.closed,
+          remaining: stats.remaining,
+          submittedAt: "",
+          deadlineAt: zonedDateTimeToUtc({
+            dateKey,
+            hour: plan.assignmentHour,
+            minute: plan.assignmentMinute,
+            timeZone: config.timezone,
+          }).toISOString(),
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    });
+  }
+
+  /* ------------------------------------------------------------------------
+     Google Places generation
+     ------------------------------------------------------------------------ */
+
+  async function generateRealLeads({
+    workspaceId,
+    requestedBy,
+    config,
+    requested,
+    existingKeys,
+    runId,
+    nichesOverride = null,
+    locationsOverride = null,
+    regionCodeOverride = "",
+    resourceType = "international",
+    country = "",
+  }) {
+    const niches =
+      normalizeStringArray(
+        nichesOverride ||
+        config.niches
+      );
+
+    const locations =
+      normalizeStringArray(
+        locationsOverride ||
+        config.locations
+      );
+
+    if (
+      !niches.length ||
+      !locations.length
+    ) {
+      throw httpError(
+        422,
+        "Configure at least one niche and one location before running daily lead automation."
+      );
+    }
+
+    const generated = [];
+    let combinationIndex = 0;
+    let remaining =
+      Math.min(
+        requested,
+        config.maxGenerationPerRun
+      );
+
+    while (
+      remaining > 0 &&
+      generated.length <
+        config.maxGenerationPerRun
+    ) {
+      const niche =
+        niches[
+          combinationIndex %
+            niches.length
+        ];
+
+      const location =
+        locations[
+          Math.floor(
+            combinationIndex /
+              niches.length
+          ) %
+            locations.length
+        ];
+
+      const batchSize =
+        Math.min(
+          remaining,
+          config.generationBatchSize,
+          1000
+        );
+
+      const result =
+        await leadFinder.findLeads({
+          runId:
+            `${runId}-${combinationIndex + 1}`,
+          niche,
+          location,
+          limit:
+            batchSize,
+          radiusKm:
+            config.radiusKm,
+          qualityLevel:
+            config.qualityLevel,
+          regionCode:
+            String(
+              regionCodeOverride ||
+                config.regionCode ||
+                ""
+            )
+              .trim()
+              .toUpperCase(),
+          exact: false,
+        });
+
+      const leads =
+        Array.isArray(
+          result?.leads
+        )
+          ? result.leads
+          : [];
+
+      const inserted =
+        insertGeneratedCampaign({
+          workspaceId,
+          requestedBy,
+          niche,
+          location,
+          leads,
+          existingKeys,
+          runId,
+          resourceType,
+          country,
+          regionCode:
+            String(
+              regionCodeOverride ||
+                config.regionCode ||
+                ""
+            )
+              .trim()
+              .toUpperCase(),
+        });
+
+      generated.push(
+        ...inserted
+      );
+
+      remaining =
+        Math.max(
+          0,
+          requested -
+            generated.length
+        );
+
+      combinationIndex += 1;
+
+      const totalCombinations =
+        niches.length *
+        locations.length;
+
+      if (
+        combinationIndex >=
+          totalCombinations &&
+        inserted.length === 0
+      ) {
+        break;
+      }
+
+      if (
+        combinationIndex >=
+        totalCombinations * 3
+      ) {
+        break;
+      }
+    }
+
+    return generated.slice(
+      0,
+      requested
+    );
+  }
+
+  function insertGeneratedCampaign({
+    workspaceId,
+    requestedBy,
+    niche,
+    location,
+    leads,
+    existingKeys,
+    runId,
+    resourceType = "international",
+    country = "",
+    regionCode = "",
+  }) {
+    const now =
+      new Date().toISOString();
+
+    const accepted = [];
+
+    for (
+      const candidate
+      of leads
+    ) {
+      if (
+        !candidate ||
+        !isUsableGeneratedLead(
+          candidate
+        )
+      ) {
+        continue;
+      }
+
+      const normalizedLead =
+        normalizeGeneratedLead(
+          candidate,
+          now
+        );
+
+      const key =
+        leadUniqueKey(
+          normalizedLead
+        );
+
+      if (
+        !key ||
+        existingKeys.has(
+          key
+        )
+      ) {
+        continue;
+      }
+
+      existingKeys.add(
+        key
+      );
+
+      normalizedLead.dailyResourceType =
+        normalizeResourceType(
+          resourceType
+        );
+      normalizedLead.dailyCountry =
+        cleanMarketValue(
+          country ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "Pakistan"
+              : "")
+        );
+      normalizedLead.dailyRegionCode =
+        String(
+          regionCode ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "PK"
+              : "")
+        )
+          .trim()
+          .toUpperCase();
+
+      accepted.push(
+        normalizedLead
+      );
+    }
+
+    if (!accepted.length) {
+      return [];
+    }
+
+    const campaignId =
+      crypto.randomUUID();
+
+    const campaign = {
+      id:
+        campaignId,
+
+      workspaceId,
+
+      userId:
+        requestedBy ||
+        "",
+
+      ownerId:
+        requestedBy ||
+        "",
+
+      createdBy:
+        requestedBy ||
+        "",
+
+      name:
+        `Daily Google leads · ${niche} · ${location}`,
+
+      niche,
+      location,
+      resourceType:
+        normalizeResourceType(
+          resourceType
+        ),
+      country:
+        cleanMarketValue(
+          country ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "Pakistan"
+              : "")
+        ),
+      regionCode:
+        String(
+          regionCode ||
+            (normalizeResourceType(
+              resourceType
+            ) === "local"
+              ? "PK"
+              : "")
+        )
+          .trim()
+          .toUpperCase(),
+
+      source:
+        "automatic-google-places",
+
+      provider:
+        "google-places",
+
+      automatic:
+        true,
+
+      dailyLeadRunId:
+        runId,
+
+      status:
+        "active",
+
+      pipelineStatus:
+        "ready",
+
+      leadCount:
+        accepted.length,
+
+      leads:
+        accepted,
+
+      createdAt:
+        now,
+
+      updatedAt:
+        now,
+    };
+
+    store.update(
+      (draft) => {
+        ensureState(
+          draft
+        );
+
+        draft.campaigns.push(
+          campaign
+        );
+      }
+    );
+
+    return accepted.map(
+      (lead) => ({
+        campaignId,
+        campaignName:
+          campaign.name,
+        leadId:
+          lead.id,
+        lead,
+        source:
+          "generated-google-places",
+        niche,
+        location,
+        resourceType:
+          campaign.resourceType,
+        country:
+          campaign.country,
+        regionCode:
+          campaign.regionCode,
+        previousAssigneeId:
+          "",
+        priority:
+          calculateLeadPriority(
+            lead
+          ),
+      })
+    );
+  }
+
+  /* ------------------------------------------------------------------------
+     Assignment
+     ------------------------------------------------------------------------ */
+
+  function assignLeadsToCaller({
+    workspaceId,
+    dateKey,
+    caller,
+    candidates,
+    required,
+    campaignMix = null,
+    requestedBy,
+    source,
+    runId,
+    plan,
+  }) {
+    const assignedLeadRefs = [];
+    let assignedCount = 0;
+    let websiteRemaining = Math.max(
+      0,
+      Number(campaignMix?.website || 0)
+    );
+    let gmbRemaining = Math.max(
+      0,
+      Number(campaignMix?.gmb || 0)
+    );
+
+    // Production safety: mutate the complete caller allocation in ONE store
+    // transaction. The old implementation created a tracked store proxy once
+    // per lead, which caused large CPU/heap spikes on 100-lead allocations.
+    store.update((draft) => {
+      ensureState(draft);
+
+      for (const candidate of candidates) {
+        if (assignedCount >= required) break;
+
+        const campaignType =
+          websiteRemaining > 0
+            ? "website"
+            : gmbRemaining > 0
+              ? "gmb"
+              : "website";
+
+        const assigned = assignSingleLeadToDraft({
+          draft,
+          workspaceId,
+          dateKey,
+          caller,
+          candidate,
+          requestedBy,
+          source,
+          runId,
+          plan,
+          campaignType,
+        });
+
+        if (!assigned) continue;
+
+        assignedCount += 1;
+        if (campaignType === "gmb") {
+          gmbRemaining = Math.max(0, gmbRemaining - 1);
+        } else {
+          websiteRemaining = Math.max(0, websiteRemaining - 1);
+        }
+
+        assignedLeadRefs.push({
+          ...candidate,
+          assignedTo: caller.id,
+          niche: plan.niche || candidate.niche || "",
+          location: plan.location || candidate.location || "",
+          resourceType:
+            plan.resourceType ||
+            candidate.resourceType ||
+            "international",
+          campaignType,
+          auditKind: "mini",
+          auditType: "Mini Audit",
+          country: plan.country || candidate.country || "",
+          regionCode: plan.regionCode || candidate.regionCode || "",
+        });
+      }
+    });
+
+    return {
+      assignedCount,
+      shortfall: Math.max(0, required - assignedCount),
+      assignedLeadRefs,
+    };
+  }
+
+  function assignSingleLeadToDraft({
+    draft,
+    workspaceId,
+    dateKey,
+    caller,
+    candidate,
+    requestedBy,
+    source,
+    runId,
+    plan = {},
+    campaignType = "website",
+  }) {
+    const now = new Date().toISOString();
+
+    const campaign = draft.campaigns.find(
+      (item) => item.id === candidate.campaignId
+    );
+    const lead = campaign?.leads?.find(
+      (item) => item.id === candidate.leadId
+    );
+
+    if (!campaign || !lead || isTerminalLead(lead)) return false;
+
+    const duplicate = draft.salesAssignments.some(
+      (assignment) =>
+        assignment.workspaceId === workspaceId &&
+        assignment.leadId === lead.id &&
+        assignment.assignedTo === caller.id &&
+        assignment.assignmentDate === dateKey &&
+        isActiveAssignment(assignment)
+    );
+    if (duplicate) return false;
+
+    for (const assignment of draft.salesAssignments) {
+      if (
+        assignment.workspaceId === workspaceId &&
+        assignment.leadId === lead.id &&
+        isActiveAssignment(assignment)
+      ) {
+        assignment.status = "reassigned";
+        assignment.queueStatus = "removed";
+        assignment.completedAt = now;
+        assignment.updatedAt = now;
+      }
+    }
+
+    const assignmentId = crypto.randomUUID();
+
+    lead.assignedTo = caller.id;
+    lead.assigneeId = caller.id;
+    lead.assignedToName =
+      caller.name || caller.fullName || caller.email || "Caller";
+    lead.assignedBy = requestedBy || "system";
+    lead.assignedAt = now;
+    lead.assignmentDate = dateKey;
+    lead.dailyQueueDate = dateKey;
+    lead.dailyLeadRunId = runId;
+    lead.dailyNiche =
+      plan.niche ||
+      candidate.niche ||
+      campaign.niche ||
+      lead.niche ||
+      lead.category ||
+      "";
+    lead.dailyLocation =
+      plan.location ||
+      candidate.location ||
+      campaign.location ||
+      lead.location ||
+      "";
+    lead.dailyResourceType = normalizeResourceType(
+      plan.resourceType ||
+        candidate.resourceType ||
+        campaign.resourceType ||
+        "international"
+    );
+    lead.dailyCountry = cleanMarketValue(
+      plan.country ||
+        candidate.country ||
+        campaign.country ||
+        (lead.dailyResourceType === "local" ? "Pakistan" : "")
+    );
+    lead.dailyRegionCode = String(
+      plan.regionCode ||
+        candidate.regionCode ||
+        campaign.regionCode ||
+        (lead.dailyResourceType === "local" ? "PK" : "")
+    )
+      .trim()
+      .toUpperCase();
+    lead.dailyCampaignType = normalizeCampaignType(campaignType);
+    lead.campaignType = lead.dailyCampaignType;
+    lead.auditKind = "mini";
+    lead.auditTrack = lead.dailyCampaignType;
+    lead.auditType = lead.dailyCampaignType === "gmb" ? "GMB Mini Audit" : "Website Mini Audit";
+    // Allocation records the DEFAULT Mini contract first; the caller-sized batch queue
+    // creates/reuses the real persisted Mini jobs immediately after this transaction.
+    lead.auditStatus = "not_started";
+    lead.miniAuditStatus = "not_started";
+    lead.auditReport = null;
+    lead.queueStatus = "current";
+
+    if (!lead.status || normalizeStatus(lead.status) === "new") {
+      lead.status = "assigned";
+    }
+
+    lead.updatedAt = now;
+    lead.timeline = Array.isArray(lead.timeline) ? lead.timeline : [];
+    lead.timeline.unshift({
+      id: crypto.randomUUID(),
+      type: "daily_assignment",
+      actorId: requestedBy || "system",
+      assignedTo: caller.id,
+      assignmentDate: dateKey,
+      runId,
+      niche: lead.dailyNiche || "",
+      location: lead.dailyLocation || "",
+      resourceType: lead.dailyResourceType || "international",
+      campaignType: lead.dailyCampaignType || "website",
+      auditType: lead.auditType || (lead.dailyCampaignType === "gmb" ? "GMB Mini Audit" : "Website Mini Audit"),
+      country: lead.dailyCountry || "",
+      regionCode: lead.dailyRegionCode || "",
+      createdAt: now,
+    });
+
+    draft.salesAssignments.unshift({
+      id: assignmentId,
+      workspaceId,
+      campaignId: campaign.id,
+      campaignName: campaign.name || "",
+      leadId: lead.id,
+      userId: caller.id,
+      assignedTo: caller.id,
+      assigneeId: caller.id,
+      assignedToName: lead.assignedToName,
+      assignedBy: requestedBy || "system",
+      assignmentDate: dateKey,
+      dailyQueueDate: dateKey,
+      dailyLeadRunId: runId,
+      niche: lead.dailyNiche || "",
+      location: lead.dailyLocation || "",
+      resourceType: lead.dailyResourceType || "international",
+      campaignType: lead.dailyCampaignType || "website",
+      auditKind: lead.auditKind || "mini",
+      auditType: lead.auditType || (lead.dailyCampaignType === "gmb" ? "GMB Mini Audit" : "Website Mini Audit"),
+      auditTrack: lead.auditTrack || lead.dailyCampaignType || "website",
+      auditStatus: lead.auditStatus || "not_started",
+      miniAuditStatus: lead.miniAuditStatus || "not_started",
+      country: lead.dailyCountry || "",
+      regionCode: lead.dailyRegionCode || "",
+      status: "assigned",
+      queueStatus: "current",
+      priority: normalizePriority(lead.priority),
+      source: source || candidate.source || "daily-automation",
+      nextActionAt: lead.nextActionAt || now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    draft.teamTasks.unshift({
+      id: crypto.randomUUID(),
+      workspaceId,
+      campaignId: campaign.id,
+      campaignName: campaign.name || "",
+      leadId: lead.id,
+      assignmentId,
+      dailyLeadRunId: runId,
+      title: `Call ${lead.business || lead.name || "assigned lead"}`,
+      description:
+        lead.dailyCampaignType === "gmb"
+          ? "Review the default Mini Audit for this GMB lead, contact the lead, record the outcome, and generate Competitor or Full GMB analysis when useful."
+          : "Review the default Mini Audit for this Website lead, contact the lead, record the outcome, and generate Competitor or Full Website analysis when useful.",
+      type: "lead_call",
+      status: "pending",
+      queueStatus: "current",
+      priority: normalizePriority(lead.priority),
+      assignedTo: caller.id,
+      assignedToUserId: caller.id,
+      createdBy: requestedBy || "system",
+      assignmentDate: dateKey,
+      niche: lead.dailyNiche || "",
+      location: lead.dailyLocation || "",
+      resourceType: lead.dailyResourceType || "international",
+      campaignType: lead.dailyCampaignType || "website",
+      auditKind: lead.auditKind || "mini",
+      auditType: lead.auditType || (lead.dailyCampaignType === "gmb" ? "GMB Mini Audit" : "Website Mini Audit"),
+      auditTrack: lead.auditTrack || lead.dailyCampaignType || "website",
+      auditStatus: lead.auditStatus || "not_started",
+      miniAuditStatus: lead.miniAuditStatus || "not_started",
+      country: lead.dailyCountry || "",
+      regionCode: lead.dailyRegionCode || "",
+      dueAt: lead.nextActionAt || now,
+      completedAt: "",
+      source: "daily-automation",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return true;
+  }
+
+  /* ------------------------------------------------------------------------
+     Mini audits
+     ------------------------------------------------------------------------ */
+
+  function queueCampaignAudits(
+    assignedLeadRefs
+  ) {
+    if (!leadAuditService || !Array.isArray(assignedLeadRefs)) {
+      return 0;
+    }
+
+    const grouped = new Map();
+    for (const reference of assignedLeadRefs) {
+      const userId = String(reference?.assignedTo || "").trim();
+      if (!userId) continue;
+      if (!grouped.has(userId)) grouped.set(userId, []);
+      grouped.get(userId).push(reference);
+    }
+
+    let queued = 0;
+
+    for (const [userId, references] of grouped.entries()) {
+      const systemUser = resolveSystemUser(userId);
+      if (!systemUser) continue;
+
+      try {
+        if (typeof leadAuditService.queueMiniBatch === "function") {
+          const result = leadAuditService.queueMiniBatch(systemUser, {
+            leads: references.map((reference) => ({
+              ...(reference.lead || {}),
+              campaignId: reference.campaignId || reference.lead?.campaignId || "",
+              leadId: reference.leadId || reference.lead?.id || "",
+              id: reference.leadId || reference.lead?.id || "",
+              dailyCampaignType: normalizeCampaignType(
+                reference.campaignType || reference.lead?.dailyCampaignType || "website"
+              ),
+              campaignType: normalizeCampaignType(
+                reference.campaignType || reference.lead?.campaignType || "website"
+              ),
+              dailyNiche: reference.niche || reference.lead?.dailyNiche || "",
+              dailyLocation: reference.location || reference.lead?.dailyLocation || "",
+              dailyResourceType: reference.resourceType || reference.lead?.dailyResourceType || "international",
+              dailyCountry: reference.country || reference.lead?.dailyCountry || "",
+              dailyRegionCode: reference.regionCode || reference.lead?.dailyRegionCode || "",
+            })),
+            automatic: true,
+            source: "daily-lead-automation",
+          });
+          queued += Number(result?.accepted || 0);
+          continue;
+        }
+
+        // Compatibility fallback for an older audit service. This path should not
+        // be used by Audit V4, but preserves behavior if files are temporarily mixed.
+        for (const reference of references) {
+          leadAuditService.queueMiniAudit?.(systemUser, {
+            campaignId: reference.campaignId,
+            leadId: reference.leadId,
+            lead: reference.lead,
+            website: reference.lead?.website || "",
+            campaignType: normalizeCampaignType(reference.campaignType || "website"),
+            auditType: normalizeCampaignType(reference.campaignType || "website") === "gmb"
+              ? "GMB Mini Audit"
+              : "Website Mini Audit",
+            niche: reference.niche || reference.lead?.dailyNiche || reference.lead?.category || "",
+            location: reference.location || reference.lead?.dailyLocation || reference.lead?.address || "",
+            resourceType: reference.resourceType || reference.lead?.dailyResourceType || "international",
+            country: reference.country || reference.lead?.dailyCountry || "",
+            regionCode: reference.regionCode || reference.lead?.dailyRegionCode || "",
+            automatic: true,
+            priority: false,
+            source: "daily-lead-automation",
+          });
+          queued += 1;
+        }
+      } catch (error) {
+        for (const reference of references) {
+          markLeadAuditQueueFailure({
+            campaignId: reference.campaignId,
+            leadId: reference.leadId,
+            message: error?.message || String(error),
+          });
+        }
+        console.warn(
+          `[daily-leads] default Mini batch queue failed ${JSON.stringify({
+            userId,
+            leadCount: references.length,
+            message: error?.message || String(error),
+          })}`
+        );
+      }
+    }
+
+    return queued;
+  }
+
+  function markLeadAuditQueueFailure({
+    campaignId,
+    leadId,
+    message,
+  }) {
+    store.update((draft) => {
+      const campaign = (draft.campaigns || []).find(
+        (item) => item.id === campaignId
+      );
+      const lead = campaign?.leads?.find(
+        (item) => item.id === leadId
+      );
+      if (!lead) return;
+      // Report-format customization is never a queue prerequisite.
+      lead.auditStatus = "failed";
+      lead.auditError = String(message || "Audit could not be queued.").slice(0, 1000);
+      lead.updatedAt = new Date().toISOString();
+    });
+  }
+
+  function resolveSystemUser(
+    userId
+  ) {
+    return (
+      store
+        .read()
+        .users
+        ?.find(
+          (user) =>
+            user.id ===
+            userId
+        ) ||
+      null
+    );
+  }
+
+  function scheduleDefaultMiniAuditPrefetch(delayMs = DEFAULT_MINI_PREFETCH_SWEEP_MS) {
+    if (stopped || !DEFAULT_MINI_PREFETCH_ENABLED || !leadAuditService) return;
+    if (defaultMiniPrefetchTimer) clearTimeout(defaultMiniPrefetchTimer);
+
+    defaultMiniPrefetchTimer = setTimeout(async () => {
+      defaultMiniPrefetchTimer = null;
+      try {
+        await prefetchCurrentDefaultMiniAudits();
+      } catch (error) {
+        console.warn(
+          `[daily-leads] default Mini prefetch sweep failed ${JSON.stringify({
+            message: error?.message || String(error),
+          })}`
+        );
+      } finally {
+        if (!stopped) {
+          scheduleDefaultMiniAuditPrefetch(DEFAULT_MINI_PREFETCH_SWEEP_MS);
+        }
+      }
+    }, Math.max(1000, Number(delayMs || DEFAULT_MINI_PREFETCH_SWEEP_MS)));
+    defaultMiniPrefetchTimer.unref?.();
+  }
+
+  async function prefetchCurrentDefaultMiniAudits() {
+    if (
+      defaultMiniPrefetchRunning ||
+      !DEFAULT_MINI_PREFETCH_ENABLED ||
+      !leadAuditService?.queueMiniBatch
+    ) {
+      return { ok: true, skipped: true, queued: 0 };
+    }
+
+    defaultMiniPrefetchRunning = true;
+    let queued = 0;
+    let callerBatches = 0;
+
+    try {
+      const now = new Date();
+
+      for (const workspaceId of getWorkspaceIds()) {
+        const config = getConfig(workspaceId);
+        const dateKey = getBusinessDateKey(now, config);
+        const state = store.read();
+        const callers = getActiveCallers(state, workspaceId);
+        const campaignById = new Map(
+          (state.campaigns || []).map((campaign) => [campaign.id, campaign])
+        );
+
+        for (const caller of callers) {
+          const assignments = (state.salesAssignments || [])
+            .filter((assignment) =>
+              assignment.workspaceId === workspaceId &&
+              assignment.assignedTo === caller.id &&
+              (assignment.assignmentDate === dateKey || assignment.dailyQueueDate === dateKey) &&
+              isActiveAssignment(assignment) &&
+              String(assignment.queueStatus || "current").toLowerCase() !== "removed"
+            )
+            .slice(0, Math.max(1, Number(config.leadsPerCaller || 100)));
+
+          if (!assignments.length) continue;
+
+          const leads = [];
+          for (const assignment of assignments) {
+            const campaign = campaignById.get(assignment.campaignId);
+            const lead = (campaign?.leads || []).find(
+              (item) => item.id === assignment.leadId
+            );
+            if (!lead) continue;
+
+            const campaignType = normalizeCampaignType(
+              assignment.campaignType ||
+                lead.dailyCampaignType ||
+                lead.campaignType ||
+                "website"
+            );
+
+            leads.push({
+              ...lead,
+              campaignId: campaign?.id || assignment.campaignId || "",
+              leadId: lead.id,
+              id: lead.id,
+              dailyCampaignType: campaignType,
+              campaignType,
+              dailyNiche: lead.dailyNiche || assignment.niche || lead.category || "",
+              dailyLocation: lead.dailyLocation || assignment.location || lead.address || "",
+              dailyResourceType: lead.dailyResourceType || assignment.resourceType || "international",
+              dailyCountry: lead.dailyCountry || assignment.country || "",
+              dailyRegionCode: lead.dailyRegionCode || assignment.regionCode || "",
+            });
+          }
+
+          if (!leads.length) continue;
+
+          const result = leadAuditService.queueMiniBatch(caller, {
+            leads,
+            automatic: true,
+            source: "current-daily-queue-prefetch",
+          });
+          queued += Number(result?.accepted || 0);
+          callerBatches += 1;
+        }
+      }
+
+      if (callerBatches) {
+        console.log(
+          `[daily-leads] default Mini prefetch sweep ${JSON.stringify({
+            at: new Date().toISOString(),
+            callerBatches,
+            queued,
+            queue: leadAuditService.getQueueStats?.() || null,
+          })}`
+        );
+      }
+
+      return { ok: true, queued, callerBatches };
+    } finally {
+      defaultMiniPrefetchRunning = false;
+    }
+  }
+
+  /* ------------------------------------------------------------------------
+     Scheduler
+     ------------------------------------------------------------------------ */
+
+  function scheduleNextRun() {
+    if (stopped) return;
+
+    if (schedulerTimer) {
+      clearTimeout(schedulerTimer);
+      schedulerTimer = null;
+    }
+
+    const now = new Date();
+    const state = store.read();
+    const targets = [];
+
+    for (const workspaceId of getWorkspaceIds()) {
+      const config = getConfig(workspaceId);
+      if (!config.enabled) continue;
+
+      const callers = getActiveCallers(state, workspaceId);
+      callers.forEach((caller, index) => {
+        const plan = resolveCallerPlan(config, caller, index);
+        const callerConfig = {
+          ...config,
+          assignmentHour: plan.assignmentHour,
+          assignmentMinute: plan.assignmentMinute,
+        };
+        targets.push({
+          workspaceId,
+          callerId: caller.id,
+          callerName: caller.name || caller.email || "Caller",
+          config,
+          plan,
+          nextRun: getNextScheduledRunDate(now, callerConfig),
+        });
+      });
+    }
+
+    targets.sort(
+      (left, right) => left.nextRun.getTime() - right.nextRun.getTime()
+    );
+
+    if (!targets.length) {
+      schedulerTimer = setTimeout(scheduleNextRun, 60_000);
+      schedulerTimer.unref?.();
+      return;
+    }
+
+    const next = targets[0];
+    const delayMs = Math.max(1000, next.nextRun.getTime() - now.getTime());
+
+    console.log(
+      `[daily-leads] scheduled ${JSON.stringify({
+        at: now.toISOString(),
+        workspaceId: next.workspaceId,
+        callerId: next.callerId,
+        callerName: next.callerName,
+        timeZone: next.config.timezone,
+        hour: next.plan.assignmentHour,
+        minute: next.plan.assignmentMinute,
+        nextRunAt: next.nextRun.toISOString(),
+        delayMs,
+      })}`
+    );
+
+    schedulerTimer = setTimeout(async () => {
+      if (schedulerRunning) {
+        scheduleNextRun();
+        return;
+      }
+
+      schedulerRunning = true;
+      try {
+        const result = await runDueWorkspaces({
+          source: "manager-scheduled-refresh",
+        });
+        console.log(
+          `[daily-leads] completed ${JSON.stringify({
+            at: new Date().toISOString(),
+            source: "manager-scheduled-refresh",
+            result,
+          })}`
+        );
+      } catch (error) {
+        console.error(
+          `[daily-leads] scheduled run failed ${JSON.stringify({
+            at: new Date().toISOString(),
+            message: error?.message || String(error),
+            stack: error?.stack || "",
+          })}`
+        );
+      } finally {
+        schedulerRunning = false;
+        scheduleNextRun();
+      }
+    }, delayMs);
+
+    schedulerTimer.unref?.();
+  }
+
+  /* ------------------------------------------------------------------------
+     Context and events
+     ------------------------------------------------------------------------ */
+
+  function getContext(
+    user
+  ) {
+    return (
+      workspaceService
+        ?.getContext?.(
+          user,
+          store.read()
+        ) || {
+        user,
+
+        workspaceId:
+          user?.workspaceId ||
+          "",
+
+        role:
+          user?.workspaceRole ||
+          user?.role ||
+          "",
+
+        permissions:
+          user?.permissions ||
+          [],
+      }
+    );
+  }
+
+  function emitWorkspaceEvent(
+    workspaceId,
+    eventName,
+    payload
+  ) {
+    try {
+      workspaceEmitter?.(
+        workspaceId,
+        eventName,
+        payload
+      );
+    } catch {
+      // Socket updates must not stop allocation.
+    }
+  }
+
+  return {
+    getConfig,
+    saveConfig,
+    status,
+    getStatus: status,
+    myDay,
+    submitMyDay,
+    runForUser,
+    runWorkspace,
+    runAllWorkspaces,
+    runDueWorkspaces,
+    prefetchCurrentDefaultMiniAudits,
+    startScheduler,
+    reschedule: scheduleNextRun,
+    stop,
+  };
+}
+
+/* ==========================================================================
+   Assignment helpers
+   ========================================================================== */
+
+function getActiveCallers(
+  state,
+  workspaceId
+) {
+  const membershipByUser =
+    new Map();
+
+  for (
+    const membership
+    of state.workspaceMembers ||
+    []
+  ) {
+    if (
+      membership.workspaceId ===
+      workspaceId
+    ) {
+      membershipByUser.set(
+        membership.userId,
+        membership
+      );
+    }
+  }
+
+  return (
+    state.users ||
+    []
+  )
+    .filter(
+      (user) => {
+        if (
+          user.workspaceId !==
+          workspaceId
+        ) {
+          return false;
+        }
+
+        const membership =
+          membershipByUser.get(
+            user.id
+          );
+
+        const role =
+          normalizeRole(
+            membership?.workspaceRole ||
+              membership?.role ||
+              user.workspaceRole ||
+              user.role
+          );
+
+        const active =
+          user.active !==
+            false &&
+          user.isActive !==
+            false &&
+          membership?.active !==
+            false &&
+          membership?.isActive !==
+            false &&
+          membership?.status !==
+            "inactive";
+
+        return (
+          active &&
+          ACTIVE_CALLER_ROLES.has(
+            role
+          )
+        );
+      }
+    )
+    .sort(
+      (left, right) =>
+        String(
+          left.name ||
+            left.email ||
+            ""
+        ).localeCompare(
+          String(
+            right.name ||
+              right.email ||
+              ""
+          )
+        )
+    );
+}
+
+function isReplaceableDailyLead(
+  lead
+) {
+  const status =
+    normalizeStatus(
+      lead?.status
+    );
+
+  return (
+    Number(
+      lead?.callAttempts ||
+        0
+    ) <= 0 &&
+    [
+      "",
+      "new",
+      "assigned",
+      "pending",
+      "ready",
+    ].includes(status)
+  );
+}
+
+function getAssignedDailyLeadIds({
+  state,
+  workspaceId,
+  dateKey,
+  callers,
+}) {
+  const callerIds =
+    new Set(
+      callers.map(
+        (caller) =>
+          caller.id
+      )
+    );
+  const ids =
+    new Set();
+
+  for (
+    const campaign
+    of state.campaigns || []
+  ) {
+    if (
+      campaign.workspaceId !==
+      workspaceId
+    ) {
+      continue;
+    }
+
+    for (
+      const lead
+      of campaign.leads || []
+    ) {
+      const callerId =
+        String(
+          lead.assignedTo ||
+            lead.assigneeId ||
+            ""
+        );
+
+      if (
+        callerIds.has(callerId) &&
+        String(
+          lead.dailyQueueDate ||
+            lead.assignmentDate ||
+            ""
+        ) === dateKey &&
+        lead.id
+      ) {
+        ids.add(
+          String(lead.id)
+        );
+      }
+    }
+  }
+
+  return [...ids];
+}
+
+function countAssignedDailyLeadsByCaller({
+  state,
+  workspaceId,
+  dateKey,
+  callers,
+}) {
+  const callerIds =
+    new Set(
+      callers.map(
+        (caller) =>
+          caller.id
+      )
+    );
+
+  const result =
+    new Map(
+      callers.map(
+        (caller) => [
+          caller.id,
+          0,
+        ]
+      )
+    );
+
+  const seen =
+    new Set();
+
+  for (
+    const campaign
+    of state.campaigns || []
+  ) {
+    if (
+      campaign.workspaceId !==
+      workspaceId
+    ) {
+      continue;
+    }
+
+    for (
+      const lead
+      of campaign.leads || []
+    ) {
+      const callerId =
+        String(
+          lead.assignedTo ||
+            lead.assigneeId ||
+            ""
+        );
+
+      if (
+        !callerIds.has(callerId) ||
+        String(
+          lead.dailyQueueDate ||
+            lead.assignmentDate ||
+            ""
+        ) !== dateKey ||
+        seen.has(
+          `${callerId}:${lead.id}`
+        )
+      ) {
+        continue;
+      }
+
+      seen.add(
+        `${callerId}:${lead.id}`
+      );
+      result.set(
+        callerId,
+        (result.get(callerId) || 0) +
+          1
+      );
+    }
+  }
+
+  return result;
+}
+
+function countCurrentAssignmentsByCaller({
+  state,
+  workspaceId,
+  dateKey,
+  callers,
+}) {
+  const callerIds =
+    new Set(
+      callers.map(
+        (caller) =>
+          caller.id
+      )
+    );
+
+  const result =
+    new Map(
+      callers.map(
+        (caller) => [
+          caller.id,
+          0,
+        ]
+      )
+    );
+
+  const seen =
+    new Set();
+
+  for (
+    const assignment
+    of getAssignments(
+      state
+    )
+  ) {
+    if (
+      assignment.workspaceId !==
+      workspaceId
+    ) {
+      continue;
+    }
+
+    const callerId =
+      String(
+        assignment.assignedTo ||
+          assignment.assigneeId ||
+          assignment.userId ||
+          ""
+      );
+
+    if (
+      !callerIds.has(
+        callerId
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !isActiveAssignment(
+        assignment
+      )
+    ) {
+      continue;
+    }
+
+    const assignmentDate =
+      assignment.assignmentDate ||
+      assignment.dailyQueueDate ||
+      "";
+
+    if (
+      assignmentDate &&
+      assignmentDate !==
+        dateKey
+    ) {
+      continue;
+    }
+
+    const key =
+      `${callerId}:${assignment.leadId}`;
+
+    if (
+      seen.has(
+        key
+      )
+    ) {
+      continue;
+    }
+
+    seen.add(
+      key
+    );
+
+    result.set(
+      callerId,
+      (
+        result.get(
+          callerId
+        ) ||
+        0
+      ) + 1
+    );
+  }
+
+  return result;
+}
+
+function getAssignments(
+  state
+) {
+  if (
+    Array.isArray(
+      state.salesAssignments
+    )
+  ) {
+    return state.salesAssignments;
+  }
+
+  if (
+    Array.isArray(
+      state.leadAssignments
+    )
+  ) {
+    return state.leadAssignments;
+  }
+
+  return [];
+}
+
+function isActiveAssignment(
+  assignment
+) {
+  const status =
+    normalizeStatus(
+      assignment?.queueStatus ||
+      assignment?.status
+    );
+
+  return (
+    ACTIVE_ASSIGNMENT_STATUSES.has(
+      status
+    ) &&
+    !assignment?.completedAt
+  );
+}
+
+/* ==========================================================================
+   Lead helpers
+   ========================================================================== */
+
+function isRealLead(
+  lead,
+  campaign
+) {
+  if (
+    lead.synthetic ===
+      true ||
+    lead.seeded ===
+      true ||
+    lead.automaticSeed ===
+      true
+  ) {
+    return false;
+  }
+
+  if (
+    isSyntheticCampaign(
+      campaign
+    )
+  ) {
+    return false;
+  }
+
+  const source =
+    normalizeStatus(
+      lead.source ||
+      campaign.source
+    );
+
+  if (
+    [
+      "test_seed",
+      "synthetic_seed",
+      "demo_seed",
+      "seed",
+    ].includes(
+      source
+    )
+  ) {
+    return false;
+  }
+
+  return Boolean(
+    lead.placeId ||
+    lead.googlePlaceId ||
+    lead.website ||
+    lead.phone ||
+    lead.email ||
+    lead.address
+  );
+}
+
+function isSyntheticCampaign(
+  campaign
+) {
+  const source =
+    normalizeStatus(
+      campaign?.source
+    );
+
+  if (
+    [
+      "test_seed",
+      "synthetic_seed",
+      "demo_seed",
+      "seed",
+    ].includes(
+      source
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    campaign?.seeded ===
+      true ||
+    campaign?.automaticSeed ===
+      true
+  ) {
+    return true;
+  }
+
+  const name =
+    String(
+      campaign?.name ||
+        ""
+    ).toLowerCase();
+
+  return (
+    name.includes(
+      "seed business"
+    ) ||
+    name.includes(
+      "daily calling queue ·"
+    )
+  );
+}
+
+function isTerminalLead(
+  lead
+) {
+  if (
+    lead?.doNotCall ===
+    true
+  ) {
+    return true;
+  }
+
+  const status =
+    normalizeStatus(
+      lead?.status ||
+      lead?.queueStatus
+    );
+
+  return TERMINAL_LEAD_STATUSES.has(
+    status
+  );
+}
+
+function isLeadDue(
+  lead,
+  dateKey,
+  timeZone
+) {
+  const dueValue =
+    lead.nextActionAt ||
+    lead.callbackAt ||
+    lead.followUpAt ||
+    lead.nextFollowUpAt ||
+    "";
+
+  if (!dueValue) {
+    return false;
+  }
+
+  const timestamp =
+    Date.parse(
+      dueValue
+    );
+
+  if (
+    !Number.isFinite(
+      timestamp
+    )
+  ) {
+    return false;
+  }
+
+  const dueDateKey =
+    getDateKey(
+      new Date(
+        timestamp
+      ),
+      timeZone
+    );
+
+  return (
+    dueDateKey <=
+    dateKey
+  );
+}
+
+function getCallAttempts(
+  lead
+) {
+  const direct =
+    Number(
+      lead.callAttempts ||
+      lead.attempts ||
+      0
+    );
+
+  if (
+    Number.isFinite(
+      direct
+    ) &&
+    direct > 0
+  ) {
+    return direct;
+  }
+
+  if (
+    Array.isArray(
+      lead.calls
+    )
+  ) {
+    return lead.calls.length;
+  }
+
+  if (
+    Array.isArray(
+      lead.callHistory
+    )
+  ) {
+    return lead.callHistory.length;
+  }
+
+  return 0;
+}
+
+function calculateLeadPriority(
+  lead
+) {
+  let score =
+    Number(
+      lead.qualityScore ||
+      lead.score ||
+      0
+    );
+
+  const priority =
+    normalizePriority(
+      lead.priority
+    );
+
+  if (
+    priority ===
+    "high"
+  ) {
+    score += 300;
+  }
+
+  if (
+    priority ===
+    "urgent"
+  ) {
+    score += 500;
+  }
+
+  if (
+    lead.phone
+  ) {
+    score += 100;
+  }
+
+  if (
+    lead.website
+  ) {
+    score += 50;
+  }
+
+  if (
+    lead.email
+  ) {
+    score += 25;
+  }
+
+  const status =
+    normalizeStatus(
+      lead.status
+    );
+
+  if (
+    [
+      "callback",
+      "follow_up",
+    ].includes(
+      status
+    )
+  ) {
+    score += 400;
+  }
+
+  return score;
+}
+
+function leadUniqueKey(
+  lead
+) {
+  const placeId =
+    String(
+      lead?.placeId ||
+      lead?.googlePlaceId ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (placeId) {
+    return `place:${placeId}`;
+  }
+
+  const website =
+    normalizeWebsite(
+      lead?.website ||
+      lead?.websiteUri
+    );
+
+  if (website) {
+    return `web:${website}`;
+  }
+
+  const phone =
+    normalizePhone(
+      lead?.phone ||
+      lead?.phoneNumber
+    );
+
+  if (phone) {
+    return `phone:${phone}`;
+  }
+
+  const email =
+    String(
+      lead?.email ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (email) {
+    return `email:${email}`;
+  }
+
+  const name =
+    String(
+      lead?.business ||
+      lead?.name ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const address =
+    String(
+      lead?.address ||
+      lead?.formattedAddress ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (
+    name ||
+    address
+  ) {
+    return `name:${name}|${address}`;
+  }
+
+  return "";
+}
+
+function isUsableGeneratedLead(
+  lead
+) {
+  return Boolean(
+    lead?.phone ||
+    lead?.phoneNumber ||
+    lead?.website ||
+    lead?.websiteUri ||
+    lead?.email
+  );
+}
+
+function normalizeGeneratedLead(
+  lead,
+  now
+) {
+  const business =
+    String(
+      lead.business ||
+      lead.name ||
+      lead.displayName ||
+      "Business"
+    ).trim();
+
+  return {
+    ...lead,
+
+    id:
+      lead.id ||
+      crypto.randomUUID(),
+
+    business,
+
+    name:
+      business,
+
+    placeId:
+      lead.placeId ||
+      lead.googlePlaceId ||
+      "",
+
+    phone:
+      lead.phone ||
+      lead.phoneNumber ||
+      lead.internationalPhoneNumber ||
+      lead.nationalPhoneNumber ||
+      "",
+
+    website:
+      lead.website ||
+      lead.websiteUri ||
+      "",
+
+    address:
+      lead.address ||
+      lead.formattedAddress ||
+      "",
+
+    source:
+      "google-places",
+
+    provider:
+      "google-places",
+
+    status:
+      "new",
+
+    queueStatus:
+      "ready",
+
+    assignedTo:
+      "",
+
+    assigneeId:
+      "",
+
+    callAttempts:
+      Number(
+        lead.callAttempts ||
+        0
+      ),
+
+    timeline:
+      Array.isArray(
+        lead.timeline
+      )
+        ? lead.timeline
+        : [],
+
+    createdAt:
+      lead.createdAt ||
+      now,
+
+    updatedAt:
+      now,
+  };
+}
+
+/* ==========================================================================
+   State helpers
+   ========================================================================== */
+
+function ensureState(
+  draft
+) {
+  const arrays = [
+    "users",
+    "workspaces",
+    "workspaceMembers",
+    "campaigns",
+    "salesAssignments",
+    "leadAssignments",
+    "calls",
+    "callRecords",
+    "teamTasks",
+    "dailyLeadRuns",
+    "dailyCallerSubmissions",
+    "auditReports",
+    "leadAuditReports",
+    "activity",
+  ];
+
+  for (
+    const key
+    of arrays
+  ) {
+    if (
+      !Array.isArray(
+        draft[key]
+      )
+    ) {
+      draft[key] = [];
+    }
+  }
+
+  if (
+    !draft.workspaceSettings ||
+    typeof draft.workspaceSettings !==
+      "object" ||
+    Array.isArray(
+      draft.workspaceSettings
+    )
+  ) {
+    draft.workspaceSettings =
+      {};
+  }
+}
+
+function findTodayRun(
+  state,
+  workspaceId,
+  dateKey
+) {
+  return (
+    state.dailyLeadRuns
+      ?.filter(
+        (run) =>
+          run.workspaceId ===
+            workspaceId &&
+          run.dateKey ===
+            dateKey
+      )
+      .sort(
+        (left, right) =>
+          Date.parse(
+            right.createdAt ||
+              0
+          ) -
+          Date.parse(
+            left.createdAt ||
+              0
+          )
+      )[0] ||
+    null
+  );
+}
+
+function resolveCallerPlan(
+  config,
+  caller,
+  index = 0
+) {
+  const stored = config.callerPlans?.[caller?.id] || {};
+  const fallbackNiche = config.niches.length
+    ? config.niches[index % config.niches.length]
+    : "";
+  const fallbackLocation = config.locations.length
+    ? config.locations[index % config.locations.length]
+    : "";
+  const resourceType = normalizeResourceType(
+    stored.resourceType || "international"
+  );
+  const localLocations = config.localPakistanLocations?.length
+    ? config.localPakistanLocations
+    : DEFAULT_LOCAL_PAKISTAN_LOCATIONS;
+  const automaticPakistanLocation = localLocations.length
+    ? localLocations[index % localLocations.length]
+    : "Pakistan";
+  const location = resourceType === "local"
+    ? String(stored.location || automaticPakistanLocation || "Pakistan").trim()
+    : String(stored.location || fallbackLocation || "").trim();
+
+  const callMix = normalizeCallMix(stored, config.leadsPerCaller);
+
+  return {
+    niche: String(stored.niche || fallbackNiche || "").trim(),
+    resourceType,
+    location,
+    country:
+      resourceType === "local"
+        ? "Pakistan"
+        : cleanMarketValue(stored.country || ""),
+    regionCode:
+      resourceType === "local"
+        ? "PK"
+        : String(stored.regionCode || config.regionCode || "US")
+            .trim()
+            .toUpperCase(),
+    assignmentHour: isValidHour(stored.assignmentHour)
+      ? Number(stored.assignmentHour)
+      : config.assignmentHour,
+    assignmentMinute: isValidMinute(stored.assignmentMinute)
+      ? Number(stored.assignmentMinute)
+      : config.assignmentMinute,
+    websiteCalls: callMix.websiteCalls,
+    gmbCalls: callMix.gmbCalls,
+  };
+}
+
+function normalizeCallerPlans(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const result = {};
+
+  for (const [callerId, plan] of Object.entries(value)) {
+    const id = String(callerId || "").trim();
+    if (!id) continue;
+
+    const normalized = {
+      niche: String(plan?.niche || "").trim(),
+      resourceType: normalizeResourceType(plan?.resourceType || "international"),
+      location: String(plan?.location || "").trim(),
+      country: cleanMarketValue(plan?.country || ""),
+      regionCode: String(plan?.regionCode || "").trim().toUpperCase(),
+    };
+
+    if (isValidCallCount(plan?.websiteCalls)) {
+      normalized.websiteCalls = Number(plan.websiteCalls);
+    }
+    if (isValidCallCount(plan?.gmbCalls)) {
+      normalized.gmbCalls = Number(plan.gmbCalls);
+    }
+
+    if (isValidHour(plan?.assignmentHour)) {
+      normalized.assignmentHour = Number(plan.assignmentHour);
+    }
+    if (isValidMinute(plan?.assignmentMinute)) {
+      normalized.assignmentMinute = Number(plan.assignmentMinute);
+    }
+
+    result[id] = normalized;
+  }
+
+  return result;
+}
+
+function isValidCallCount(value) {
+  if (value === "" || value === null || value === undefined) return false;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 5000;
+}
+
+function normalizeCallMix(plan = {}, totalInput = 100) {
+  const total = Math.max(1, Math.min(5000, Number(totalInput || 100)));
+  let websiteCalls = isValidCallCount(plan.websiteCalls)
+    ? Number(plan.websiteCalls)
+    : Math.round(total * 0.8);
+  let gmbCalls = isValidCallCount(plan.gmbCalls)
+    ? Number(plan.gmbCalls)
+    : Math.max(0, total - websiteCalls);
+
+  websiteCalls = Math.max(0, Math.min(total, websiteCalls));
+  gmbCalls = Math.max(0, Math.min(total, gmbCalls));
+
+  const sum = websiteCalls + gmbCalls;
+  if (sum !== total) {
+    // Keep the manager's Website value authoritative and balance GMB to the
+    // caller's daily target. This makes a 50/50 entry exactly 50 + 50 for 100.
+    gmbCalls = Math.max(0, total - websiteCalls);
+  }
+
+  return { websiteCalls, gmbCalls };
+}
+
+function normalizeCampaignType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "_");
+  return ["gmb", "google_business_profile", "google_business", "local_visibility"].includes(normalized)
+    ? "gmb"
+    : "website";
+}
+
+function isValidHour(value) {
+  if (value === "" || value === null || value === undefined) return false;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 23;
+}
+
+function isValidMinute(value) {
+  if (value === "" || value === null || value === undefined) return false;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 59;
+}
+
+function getWorkspaceNextScheduledRunDate({
+  state,
+  workspaceId,
+  config,
+  now = new Date(),
+}) {
+  const callers = getActiveCallers(state, workspaceId);
+  if (!callers.length) return getNextScheduledRunDate(now, config);
+
+  return callers
+    .map((caller, index) => {
+      const plan = resolveCallerPlan(config, caller, index);
+      return getNextScheduledRunDate(now, {
+        ...config,
+        assignmentHour: plan.assignmentHour,
+        assignmentMinute: plan.assignmentMinute,
+      });
+    })
+    .sort((left, right) => left.getTime() - right.getTime())[0];
+}
+
+function normalizeResourceType(
+  value
+) {
+  const normalized =
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_-]+/g, "_");
+
+  return [
+    "local",
+    "pakistan",
+    "pk",
+    "domestic",
+  ].includes(normalized)
+    ? "local"
+    : "international";
+}
+
+function cleanMarketValue(
+  value
+) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function inferResourceTypeFromLocation(
+  location,
+  regionCode = ""
+) {
+  const region =
+    String(regionCode || "")
+      .trim()
+      .toUpperCase();
+
+  if (region === "PK") {
+    return "local";
+  }
+
+  const text =
+    String(location || "")
+      .toLowerCase();
+
+  const pakistanMarkers = [
+    "pakistan",
+    "karachi",
+    "lahore",
+    "islamabad",
+    "rawalpindi",
+    "faisalabad",
+    "multan",
+    "peshawar",
+    "sialkot",
+    "gujranwala",
+    "quetta",
+    "hyderabad, sindh",
+  ];
+
+  return pakistanMarkers.some(
+    (marker) =>
+      text.includes(marker)
+  )
+    ? "local"
+    : "international";
+}
+
+function resourceTypeMatches(
+  candidate = {},
+  plan = {}
+) {
+  const requested =
+    normalizeResourceType(
+      plan.resourceType ||
+        "international"
+    );
+
+  const actual =
+    normalizeResourceType(
+      candidate.resourceType ||
+        inferResourceTypeFromLocation(
+          candidate.location ||
+            candidate.lead?.dailyLocation ||
+            candidate.lead?.address ||
+            "",
+          candidate.regionCode ||
+            candidate.lead?.dailyRegionCode ||
+            candidate.lead?.regionCode ||
+            ""
+        )
+    );
+
+  return requested === actual;
+}
+
+function normalizeNicheKey(
+  value
+) {
+  return String(
+    value ||
+    ""
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\b(services?|business|company|companies)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/s\b/g, "")
+    .trim();
+}
+
+function nicheMatches(
+  candidate,
+  requested
+) {
+  const left =
+    normalizeNicheKey(candidate);
+  const right =
+    normalizeNicheKey(requested);
+
+  if (!right) return true;
+  if (!left) return false;
+
+  return (
+    left === right ||
+    left.includes(right) ||
+    right.includes(left)
+  );
+}
+
+function takeCandidatesForCaller({
+  available,
+  caller,
+  plan,
+  limit,
+}) {
+  const ranked = [];
+
+  for (
+    let index = 0;
+    index < available.length;
+    index += 1
+  ) {
+    const candidate =
+      available[index];
+
+    if (
+      !nicheMatches(
+        candidate.niche,
+        plan.niche
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !resourceTypeMatches(
+        candidate,
+        plan
+      )
+    ) {
+      continue;
+    }
+
+    ranked.push({
+      index,
+      candidate,
+      sameCaller:
+        candidate.previousAssigneeId ===
+        caller.id,
+    });
+  }
+
+  ranked.sort(
+    (left, right) =>
+      Number(right.sameCaller) -
+        Number(left.sameCaller) ||
+      Number(
+        right.candidate.priority ||
+        0
+      ) -
+        Number(
+          left.candidate.priority ||
+          0
+        )
+  );
+
+  const chosen =
+    ranked.slice(
+      0,
+      limit
+    );
+
+  const selectedIndexes =
+    new Set(
+      chosen.map(
+        (item) =>
+          item.index
+      )
+    );
+
+  const selected =
+    chosen.map(
+      (item) =>
+        item.candidate
+    );
+
+  for (
+    let index =
+      available.length - 1;
+    index >= 0;
+    index -= 1
+  ) {
+    if (
+      selectedIndexes.has(
+        index
+      )
+    ) {
+      available.splice(
+        index,
+        1
+      );
+    }
+  }
+
+  return selected;
+}
+
+function getBusinessDateKey(
+  date,
+  config
+) {
+  const local =
+    getZonedDateParts(
+      date,
+      config.timezone
+    );
+
+  let dateKey =
+    getDateKey(
+      date,
+      config.timezone
+    );
+
+  const beforeCutoff =
+    local.hour <
+      config.assignmentHour ||
+    (
+      local.hour ===
+        config.assignmentHour &&
+      local.minute <
+        config.assignmentMinute
+    );
+
+  if (beforeCutoff) {
+    dateKey =
+      addDaysToDateKey(
+        dateKey,
+        -1
+      );
+  }
+
+  return dateKey;
+}
+
+function getNextScheduledRunDate(
+  now,
+  config
+) {
+  const delayMs =
+    millisecondsUntilNextRun({
+      timeZone:
+        config.timezone,
+      hour:
+        config.assignmentHour,
+      minute:
+        config.assignmentMinute,
+    });
+
+  return new Date(
+    now.getTime() +
+      delayMs
+  );
+}
+
+function getCallerDayStats({
+  state,
+  workspaceId,
+  callerId,
+  dateKey,
+}) {
+  const leads = [];
+
+  for (
+    const campaign
+    of state.campaigns ||
+    []
+  ) {
+    if (
+      campaign.workspaceId !==
+      workspaceId
+    ) {
+      continue;
+    }
+
+    for (
+      const lead
+      of campaign.leads ||
+      []
+    ) {
+      const assignedTo =
+        String(
+          lead.assignedTo ||
+          lead.assigneeId ||
+          ""
+        );
+
+      if (
+        assignedTo !==
+        callerId ||
+        String(
+          lead.dailyQueueDate ||
+          lead.assignmentDate ||
+          ""
+        ) !== dateKey
+      ) {
+        continue;
+      }
+
+      leads.push(lead);
+    }
+  }
+
+  const worked =
+    leads.filter(
+      (lead) => {
+        const status =
+          normalizeStatus(
+            lead.status
+          );
+
+        return (
+          Number(
+            lead.callAttempts ||
+            0
+          ) > 0 ||
+          ![
+            "",
+            "new",
+            "assigned",
+            "pending",
+            "ready",
+          ].includes(status)
+        );
+      }
+    ).length;
+
+  const closed =
+    leads.filter(
+      (lead) =>
+        isTerminalLead(lead)
+    ).length;
+
+  const niches =
+    leads
+      .map(
+        (lead) =>
+          lead.dailyNiche ||
+          lead.niche ||
+          lead.category ||
+          ""
+      )
+      .filter(Boolean);
+
+  const niche =
+    mostCommonString(niches);
+
+  const resourceType =
+    mostCommonString(
+      leads
+        .map(
+          (lead) =>
+            normalizeResourceType(
+              lead.dailyResourceType ||
+                inferResourceTypeFromLocation(
+                  lead.dailyLocation ||
+                    lead.address ||
+                    "",
+                  lead.dailyRegionCode ||
+                    lead.regionCode ||
+                    ""
+                )
+            )
+        )
+        .filter(Boolean)
+    );
+
+  const location =
+    mostCommonString(
+      leads
+        .map(
+          (lead) =>
+            lead.dailyLocation ||
+            lead.location ||
+            lead.address ||
+            ""
+        )
+        .filter(Boolean)
+    );
+
+  const country =
+    mostCommonString(
+      leads
+        .map(
+          (lead) =>
+            lead.dailyCountry ||
+            lead.country ||
+            (normalizeResourceType(
+              lead.dailyResourceType
+            ) === "local"
+              ? "Pakistan"
+              : "")
+        )
+        .filter(Boolean)
+    );
+
+  const isWorkedLead = (lead) => {
+    const status = normalizeStatus(lead.status);
+    return (
+      Number(lead.callAttempts || 0) > 0 ||
+      !["", "new", "assigned", "pending", "ready"].includes(status)
+    );
+  };
+  const websiteLeads = leads.filter(
+    (lead) => normalizeCampaignType(lead.dailyCampaignType || lead.campaignType || lead.auditKind) === "website"
+  );
+  const gmbLeads = leads.filter(
+    (lead) => normalizeCampaignType(lead.dailyCampaignType || lead.campaignType || lead.auditKind) === "gmb"
+  );
+
+  return {
+    assigned:
+      leads.length,
+    worked,
+    closed,
+    remaining:
+      Math.max(
+        0,
+        leads.length -
+          worked
+      ),
+    niche,
+    resourceType,
+    location,
+    country,
+    websiteAssigned: websiteLeads.length,
+    gmbAssigned: gmbLeads.length,
+    websiteWorked: websiteLeads.filter(isWorkedLead).length,
+    gmbWorked: gmbLeads.filter(isWorkedLead).length,
+  };
+}
+
+function mostCommonString(
+  values
+) {
+  const counts =
+    new Map();
+
+  for (const value of values) {
+    const key =
+      String(value || "").trim();
+    if (!key) continue;
+    counts.set(
+      key,
+      (counts.get(key) || 0) + 1
+    );
+  }
+
+  return (
+    [...counts.entries()]
+      .sort(
+        (left, right) =>
+          right[1] - left[1]
+      )[0]?.[0] ||
+    ""
+  );
+}
+
+function getCallerSubmission({
+  state,
+  workspaceId,
+  callerId,
+  dateKey,
+}) {
+  return (
+    (
+      state.dailyCallerSubmissions ||
+      []
+    ).find(
+      (item) =>
+        item.workspaceId ===
+          workspaceId &&
+        item.callerId ===
+          callerId &&
+        item.dateKey ===
+          dateKey
+    ) ||
+    null
+  );
+}
+
+/* ==========================================================================
+   Configuration
+   ========================================================================== */
+
+function normalizeConfig(
+  value
+) {
+  return {
+    enabled:
+      value.enabled ===
+      true,
+
+    leadsPerCaller:
+      clampInteger(
+        value.leadsPerCaller,
+        DEFAULT_LEADS_PER_CALLER,
+        1,
+        5000
+      ),
+
+    timezone:
+      String(
+        value.timezone ||
+        DEFAULT_TIMEZONE
+      ).trim(),
+
+    assignmentHour:
+      clampInteger(
+        value.assignmentHour,
+        DEFAULT_ASSIGNMENT_HOUR,
+        0,
+        23
+      ),
+
+    assignmentMinute:
+      clampInteger(
+        value.assignmentMinute,
+        DEFAULT_ASSIGNMENT_MINUTE,
+        0,
+        59
+      ),
+
+    recycleAfterHours:
+      clampInteger(
+        value.recycleAfterHours,
+        DEFAULT_RECYCLE_AFTER_HOURS,
+        1,
+        24 * 365
+      ),
+
+    maxCallAttempts:
+      clampInteger(
+        value.maxCallAttempts,
+        DEFAULT_MAX_CALL_ATTEMPTS,
+        1,
+        100
+      ),
+
+    generationBatchSize:
+      clampInteger(
+        value.generationBatchSize,
+        DEFAULT_GENERATION_BATCH_SIZE,
+        1,
+        1000
+      ),
+
+    maxGenerationPerRun:
+      clampInteger(
+        value.maxGenerationPerRun,
+        DEFAULT_MAX_GENERATION_PER_RUN,
+        1,
+        100000
+      ),
+
+    niches:
+      normalizeStringArray(
+        value.niches
+      ),
+
+    locations:
+      normalizeStringArray(
+        value.locations
+      ),
+
+    localPakistanLocations:
+      normalizeStringArray(
+        value.localPakistanLocations?.length
+          ? value.localPakistanLocations
+          : DEFAULT_LOCAL_PAKISTAN_LOCATIONS
+      ),
+
+    regionCode:
+      String(
+        value.regionCode ||
+        DEFAULT_REGION_CODE
+      )
+        .trim()
+        .toUpperCase(),
+
+    radiusKm:
+      clampNumber(
+        value.radiusKm,
+        DEFAULT_RADIUS_KM,
+        1,
+        500
+      ),
+
+    qualityLevel:
+      String(
+        value.qualityLevel ||
+        DEFAULT_QUALITY_LEVEL
+      ).trim(),
+
+    autoMiniAudit:
+      value.autoMiniAudit !==
+      false,
+
+    callerPlans:
+      normalizeCallerPlans(
+        value.callerPlans
+      ),
+
+    staleRunMinutes:
+      clampInteger(
+        value.staleRunMinutes,
+        DEFAULT_STALE_RUN_MINUTES,
+        1,
+        24 * 60
+      ),
+  };
+}
+
+/* ==========================================================================
+   Timezone scheduler helpers
+   ========================================================================== */
+
+function millisecondsUntilNextRun({
+  timeZone,
+  hour,
+  minute,
+}) {
+  const now =
+    new Date();
+
+  const local =
+    getZonedDateParts(
+      now,
+      timeZone
+    );
+
+  let dateKey =
+    [
+      local.year,
+      String(
+        local.month
+      ).padStart(
+        2,
+        "0"
+      ),
+      String(
+        local.day
+      ).padStart(
+        2,
+        "0"
+      ),
+    ].join("-");
+
+  const passed =
+    local.hour > hour ||
+    (
+      local.hour ===
+        hour &&
+      local.minute >=
+        minute
+    );
+
+  if (passed) {
+    dateKey =
+      addDaysToDateKey(
+        dateKey,
+        1
+      );
+  }
+
+  const target =
+    zonedDateTimeToUtc({
+      dateKey,
+      hour,
+      minute,
+      timeZone,
+    });
+
+  return Math.max(
+    1000,
+    target.getTime() -
+      now.getTime()
+  );
+}
+
+function getDateKey(
+  date,
+  timeZone =
+    DEFAULT_TIMEZONE
+) {
+  const parts =
+    getZonedDateParts(
+      date,
+      timeZone
+    );
+
+  return [
+    parts.year,
+
+    String(
+      parts.month
+    ).padStart(
+      2,
+      "0"
+    ),
+
+    String(
+      parts.day
+    ).padStart(
+      2,
+      "0"
+    ),
+  ].join("-");
+}
+
+function getZonedDateParts(
+  date,
+  timeZone
+) {
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone,
+        year:
+          "numeric",
+        month:
+          "2-digit",
+        day:
+          "2-digit",
+        hour:
+          "2-digit",
+        minute:
+          "2-digit",
+        second:
+          "2-digit",
+        hourCycle:
+          "h23",
+      }
+    ).formatToParts(
+      date
+    );
+
+  const values =
+    Object.fromEntries(
+      parts.map(
+        ({
+          type,
+          value,
+        }) => [
+          type,
+          value,
+        ]
+      )
+    );
+
+  return {
+    year:
+      Number(
+        values.year
+      ),
+
+    month:
+      Number(
+        values.month
+      ),
+
+    day:
+      Number(
+        values.day
+      ),
+
+    hour:
+      Number(
+        values.hour
+      ),
+
+    minute:
+      Number(
+        values.minute
+      ),
+
+    second:
+      Number(
+        values.second
+      ),
+  };
+}
+
+function zonedDateTimeToUtc({
+  dateKey,
+  hour,
+  minute,
+  timeZone,
+}) {
+  const [
+    year,
+    month,
+    day,
+  ] =
+    dateKey
+      .split("-")
+      .map(
+        Number
+      );
+
+  let estimate =
+    new Date(
+      Date.UTC(
+        year,
+        month - 1,
+        day,
+        hour,
+        minute,
+        0,
+        0
+      )
+    );
+
+  for (
+    let index = 0;
+    index < 4;
+    index += 1
+  ) {
+    const represented =
+      getZonedDateParts(
+        estimate,
+        timeZone
+      );
+
+    const representedUtc =
+      Date.UTC(
+        represented.year,
+        represented.month -
+          1,
+        represented.day,
+        represented.hour,
+        represented.minute,
+        represented.second
+      );
+
+    const expectedUtc =
+      Date.UTC(
+        year,
+        month - 1,
+        day,
+        hour,
+        minute,
+        0
+      );
+
+    estimate =
+      new Date(
+        estimate.getTime() +
+        expectedUtc -
+        representedUtc
+      );
+  }
+
+  return estimate;
+}
+
+function addDaysToDateKey(
+  dateKey,
+  days
+) {
+  const [
+    year,
+    month,
+    day,
+  ] =
+    dateKey
+      .split("-")
+      .map(
+        Number
+      );
+
+  return new Date(
+    Date.UTC(
+      year,
+      month - 1,
+      day + days
+    )
+  )
+    .toISOString()
+    .slice(
+      0,
+      10
+    );
+}
+
+/* ==========================================================================
+   General utilities
+   ========================================================================== */
+
+function requireManager(
+  context
+) {
+  const role =
+    normalizeRole(
+      context?.role ||
+      context?.user
+        ?.workspaceRole ||
+      context?.user
+        ?.role
+    );
+
+  if (
+    ![
+      "owner",
+      "admin",
+      "manager",
+    ].includes(
+      role
+    )
+  ) {
+    throw httpError(
+      403,
+      "Manager access is required."
+    );
+  }
+}
+
+function normalizeRole(
+  value
+) {
+  const role =
+    normalizeStatus(
+      value
+    );
+
+  if (
+    role.includes(
+      "owner"
+    )
+  ) {
+    return "owner";
+  }
+
+  if (
+    role.includes(
+      "admin"
+    )
+  ) {
+    return "admin";
+  }
+
+  if (
+    role.includes(
+      "manager"
+    )
+  ) {
+    return "manager";
+  }
+
+  if (
+    role.includes(
+      "caller"
+    )
+  ) {
+    return "caller";
+  }
+
+  return role;
+}
+
+function normalizeStatus(
+  value
+) {
+  return String(
+    value ||
+      ""
+  )
+    .trim()
+    .toLowerCase()
+    .replace(
+      /[\s-]+/g,
+      "_"
+    );
+}
+
+function normalizePriority(
+  value
+) {
+  if (
+    typeof value ===
+    "number"
+  ) {
+    if (
+      value >= 90
+    ) {
+      return "urgent";
+    }
+
+    if (
+      value >= 70
+    ) {
+      return "high";
+    }
+
+    return "normal";
+  }
+
+  const priority =
+    normalizeStatus(
+      value
+    );
+
+  if (
+    [
+      "urgent",
+      "high",
+      "normal",
+      "low",
+    ].includes(
+      priority
+    )
+  ) {
+    return priority;
+  }
+
+  return "normal";
+}
+
+function normalizeWebsite(
+  value
+) {
+  const raw =
+    String(
+      value ||
+        ""
+    ).trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const url =
+      new URL(
+        raw.startsWith(
+          "http"
+        )
+          ? raw
+          : `https://${raw}`
+      );
+
+    return url.hostname
+      .replace(
+        /^www\./,
+        ""
+      )
+      .toLowerCase();
+  } catch {
+    return raw
+      .replace(
+        /^https?:\/\//i,
+        ""
+      )
+      .replace(
+        /^www\./i,
+        ""
+      )
+      .split("/")[0]
+      .toLowerCase();
+  }
+}
+
+function normalizePhone(
+  value
+) {
+  return String(
+    value ||
+      ""
+  ).replace(
+    /[^\d+]/g,
+    ""
+  );
+}
+
+function normalizeStringArray(
+  value
+) {
+  const source =
+    Array.isArray(
+      value
+    )
+      ? value
+      : parseCsv(
+          value
+        );
+
+  return [
+    ...new Set(
+      source
+        .map(
+          (item) =>
+            String(
+              item ||
+                ""
+            ).trim()
+        )
+        .filter(
+          Boolean
+        )
+    ),
+  ];
+}
+
+function parseCsv(
+  value
+) {
+  return String(
+    value ||
+      ""
+  )
+    .split(",")
+    .map(
+      (item) =>
+        item.trim()
+    )
+    .filter(
+      Boolean
+    );
+}
+
+function clampInteger(
+  value,
+  fallback,
+  minimum,
+  maximum
+) {
+  const parsed =
+    Number.parseInt(
+      value,
+      10
+    );
+
+  if (
+    !Number.isFinite(
+      parsed
+    )
+  ) {
+    return fallback;
+  }
+
+  return Math.min(
+    maximum,
+    Math.max(
+      minimum,
+      parsed
+    )
+  );
+}
+
+function clampNumber(
+  value,
+  fallback,
+  minimum,
+  maximum
+) {
+  const parsed =
+    Number(
+      value
+    );
+
+  if (
+    !Number.isFinite(
+      parsed
+    )
+  ) {
+    return fallback;
+  }
+
+  return Math.min(
+    maximum,
+    Math.max(
+      minimum,
+      parsed
+    )
+  );
+}
+
+function envFlag(
+  name,
+  fallback = false
+) {
+  const value =
+    String(
+      process.env[
+        name
+      ] ??
+        ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (!value) {
+    return fallback;
+  }
+
+  return [
+    "1",
+    "true",
+    "yes",
+    "on",
+  ].includes(
+    value
+  );
+}
+
+function httpError(
+  statusCode,
+  message
+) {
+  const error =
+    new Error(
+      message
+    );
+
+  error.statusCode =
+    statusCode;
+
+  return error;
+}

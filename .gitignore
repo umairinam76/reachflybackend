@@ -1,7 +1,17 @@
-node_modules/
+
+# Environment / secrets
 .env
-src/.env
-data/
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Logs
 *.log
-dist/
-coverage/
+
+# Private keys
+*.pem
+*.key
+*.p12
+*.pfx

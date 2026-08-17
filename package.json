@@ -1,0 +1,33 @@
+{
+  "name": "reachfly-production-api",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "migrate:supabase": "node src/migrate-state-to-supabase.js",
+    "verify:supabase": "node src/verify-supabase.js"
+  },
+  "dependencies": {
+    "@sfpy/node-core": "^0.3.5",
+    "@vonage/server-sdk": "^3.0.0",
+    "axios": "^1.19.0",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0",
+    "google-auth-library": "^10.9.1",
+    "helmet": "^7.0.0",
+    "imapflow": "^1.0.0",
+    "mailparser": "^3.7.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.0",
+    "openai": "^4.0.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.0",
+    "ws": "^8.18.0"
+  }
+}

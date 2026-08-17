@@ -1,0 +1,2015 @@
+import crypto from "node:crypto";
+
+const CODESYNC_WORKSPACE_ID = "codesync-labs-workspace";
+const TEST_CREDIT_GRANT = 1000;
+const AI_CALL_TEST_CREDIT_GRANT = 30;
+const AI_CALL_SIGNUP_FREE_CREDITS_DEFAULT = 10;
+const AI_CALL_CONNECTED_CREDIT_COST = 1;
+const AI_CALL_DEFAULT_PRICE_MINOR = 100;
+const AI_CALL_DEFAULT_CURRENCY = "USD";
+const AI_CALL_DEFAULT_PACK_CREDITS = [25, 50, 100];
+const DEFAULT_ENVIRONMENT = "sandbox";
+
+const DEFAULT_RATE_CARD = [
+  {
+    feature: "lead_generated",
+    label: "Lead generated",
+    unit: "lead",
+    creditsPerUnit: 1,
+    billable: true,
+    description: "Charged only for leads actually returned by ReachFly lead discovery.",
+  },
+  {
+    feature: "website_mini_audit",
+    label: "Website Mini Audit",
+    unit: "audit",
+    creditsPerUnit: 6,
+    billable: true,
+    description: "Fast verified Website Mini Audit, including its Fable refinement when available.",
+  },
+  {
+    feature: "gmb_mini_audit",
+    label: "GMB Mini Audit",
+    unit: "audit",
+    creditsPerUnit: 6,
+    billable: true,
+    description: "Fast verified Google Business Profile Mini Audit, including its Fable refinement when available.",
+  },
+  {
+    feature: "competitor_analysis",
+    label: "Competitor Analysis",
+    unit: "report",
+    creditsPerUnit: 18,
+    billable: true,
+    description: "Competitor analysis report using verified public evidence.",
+  },
+  {
+    feature: "full_audit",
+    label: "Full Audit",
+    unit: "report",
+    creditsPerUnit: 35,
+    billable: true,
+    description: "Full internal Website or GMB audit.",
+  },
+  {
+    feature: "ai_personalization",
+    label: "AI personalization",
+    unit: "generation",
+    creditsPerUnit: 2,
+    billable: false,
+    description: "Rate hook reserved for future ReachFly AI personalization metering; no credits are charged until the feature is explicitly integrated.",
+  },
+  {
+    feature: "reachfly_ai_message",
+    label: "ReachFly AI",
+    unit: "message",
+    creditsPerUnit: 2,
+    billable: true,
+    description: "Charged only after a successful ReachFly AI command response.",
+  },
+];
+
+const DEFAULT_CREDIT_PACKS = [
+  {
+    id: "credits-1000-pkr",
+    label: "1,000 credits",
+    credits: 1000,
+    currency: "PKR",
+    amountMinor: null,
+    active: false,
+    market: "PAKISTAN",
+  },
+  {
+    id: "credits-5000-pkr",
+    label: "5,000 credits",
+    credits: 5000,
+    currency: "PKR",
+    amountMinor: null,
+    active: false,
+    market: "PAKISTAN",
+  },
+  {
+    id: "credits-1000-usd",
+    label: "1,000 credits",
+    credits: 1000,
+    currency: "USD",
+    amountMinor: null,
+    active: false,
+    market: "GLOBAL",
+  },
+  {
+    id: "credits-5000-usd",
+    label: "5,000 credits",
+    credits: 5000,
+    currency: "USD",
+    amountMinor: null,
+    active: false,
+    market: "GLOBAL",
+  },
+];
+
+export function createCreditBillingService({ store, workspaceService, externalSafepayHandler = null } = {}) {
+  if (!store?.read || !store?.update) {
+    throw new Error("createCreditBillingService requires a store exposing read() and update().");
+  }
+
+  function getWorkspaceContext(user, state = store.read()) {
+    const serviceContext = workspaceService?.getContext?.(user);
+    const workspaceId = clean(
+      serviceContext?.workspaceId || user?.workspaceId || user?.companyId || user?.id
+    );
+    const workspace = serviceContext?.workspace || (state.workspaces || []).find(
+      (item) => item.id === workspaceId
+    ) || null;
+    const role = normalizeStatus(
+      serviceContext?.role || user?.workspaceRole || user?.role || "owner"
+    );
+    return {
+      workspaceId,
+      workspace,
+      role,
+      accountType: normalizeStatus(
+        user?.accountType || user?.workspaceType || workspace?.accountType || workspace?.workspaceType
+      ) || (workspace ? "company" : "individual"),
+    };
+  }
+
+  function ensureStateShape(draft) {
+    if (!Array.isArray(draft.creditWallets)) draft.creditWallets = [];
+    if (!Array.isArray(draft.creditLedger)) draft.creditLedger = [];
+    if (!Array.isArray(draft.creditReservations)) draft.creditReservations = [];
+    if (!Array.isArray(draft.creditUsageEvents)) draft.creditUsageEvents = [];
+    if (!Array.isArray(draft.creditPurchases)) draft.creditPurchases = [];
+    if (!draft.creditRateCard || typeof draft.creditRateCard !== "object" || Array.isArray(draft.creditRateCard)) {
+      draft.creditRateCard = {};
+    }
+    if (!Array.isArray(draft.creditPacks)) draft.creditPacks = [];
+    if (!Array.isArray(draft.billingWebhookEvents)) draft.billingWebhookEvents = [];
+    if (!Array.isArray(draft.billingPayments)) draft.billingPayments = [];
+
+    // AI calling uses a separate unit wallet so the existing ReachFly
+    // prepaid wallet and the launch/test-call allowance cannot be confused.
+    if (!Array.isArray(draft.aiCallCreditWallets)) draft.aiCallCreditWallets = [];
+    if (!Array.isArray(draft.aiCallCreditLedger)) draft.aiCallCreditLedger = [];
+    if (!Array.isArray(draft.aiCallCreditUsageEvents)) draft.aiCallCreditUsageEvents = [];
+    if (!Array.isArray(draft.aiCallCreditPurchases)) draft.aiCallCreditPurchases = [];
+
+    if (!Array.isArray(draft.activity)) draft.activity = [];
+  }
+
+  function appendActivity(draft, activity) {
+    ensureStateShape(draft);
+    draft.activity.unshift({
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+      ...activity,
+    });
+    if (draft.activity.length > 5000) draft.activity.splice(5000);
+  }
+
+  function ensureWorkspaceWallet(workspaceId, actorId = "system") {
+    const id = clean(workspaceId);
+    if (!id) throw httpError(400, "Workspace is required for credit billing.", "WORKSPACE_REQUIRED");
+
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      let wallet = draft.creditWallets.find((item) => item.workspaceId === id);
+      const now = new Date().toISOString();
+      if (!wallet) {
+        wallet = {
+          id: crypto.randomUUID(),
+          workspaceId: id,
+          balance: 0,
+          reserved: 0,
+          debt: 0,
+          totalGranted: 0,
+          totalPurchased: 0,
+          totalConsumed: 0,
+          createdAt: now,
+          updatedAt: now,
+        };
+        draft.creditWallets.push(wallet);
+      }
+
+      if (!wallet.testGrantAppliedAt && isTestGrantEnabled()) {
+        wallet.balance = creditNumber(wallet.balance) + TEST_CREDIT_GRANT;
+        wallet.totalGranted = creditNumber(wallet.totalGranted) + TEST_CREDIT_GRANT;
+        wallet.testGrantAppliedAt = now;
+        wallet.updatedAt = now;
+        draft.creditLedger.unshift({
+          id: crypto.randomUUID(),
+          workspaceId: id,
+          type: "test_grant",
+          delta: TEST_CREDIT_GRANT,
+          balanceAfter: wallet.balance,
+          reservedAfter: creditNumber(wallet.reserved),
+          actorId: clean(actorId) || "system",
+          description: "One-time ReachFly test credit grant",
+          createdAt: now,
+        });
+      }
+      output = { ...wallet };
+    });
+    return output;
+  }
+
+  function getAiCallPolicy() {
+    const configuredDuration = Number(process.env.AI_CALL_MAX_CONNECTED_SECONDS);
+    const maxConnectedSeconds = Number.isFinite(configuredDuration) && configuredDuration > 0
+      ? Math.round(configuredDuration)
+      : null;
+    const configuredPrice = Number(process.env.AI_CALL_CONNECTED_PRICE_MINOR);
+    const connectedCallPriceMinor = Number.isFinite(configuredPrice) && configuredPrice > 0
+      ? Math.round(configuredPrice)
+      : AI_CALL_DEFAULT_PRICE_MINOR;
+    const currency = clean(process.env.AI_CALL_CONNECTED_CURRENCY || AI_CALL_DEFAULT_CURRENCY).toUpperCase();
+
+    return {
+      walletType: "ai_call_credits",
+      billingUnit: "connected_call",
+      creditsPerConnectedCall: AI_CALL_CONNECTED_CREDIT_COST,
+      signupFreeCredits: getAiCallSignupFreeCredits(),
+      testCreditGrant: isAiCallTestGrantEnabled() ? AI_CALL_TEST_CREDIT_GRANT : 0,
+      testCreditGrantEnabled: isAiCallTestGrantEnabled(),
+      connectedCallPriceMinor,
+      currency,
+      maxConnectedSeconds,
+      durationPolicyConfigured: Boolean(maxConnectedSeconds),
+      chargingRule: "One AI call credit is consumed only after a completed call has positive duration and evidence that the prospect participated.",
+    };
+  }
+
+  function getAiCallSignupFreeCredits() {
+    const configured = Number(process.env.AI_CALL_SIGNUP_FREE_CREDITS);
+    if (Number.isFinite(configured) && configured >= 0) {
+      return Math.round(configured);
+    }
+    return AI_CALL_SIGNUP_FREE_CREDITS_DEFAULT;
+  }
+
+  function ensureAiCallCreditWallet(workspaceId) {
+    const id = clean(workspaceId);
+    if (!id) throw httpError(400, "Workspace is required for AI call credits.", "WORKSPACE_REQUIRED");
+
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      let wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === id);
+      const now = new Date().toISOString();
+      if (!wallet) {
+        wallet = {
+          id: crypto.randomUUID(),
+          workspaceId: id,
+          balance: 0,
+          totalGranted: 0,
+          totalPurchased: 0,
+          totalConsumed: 0,
+          debt: 0,
+          testGrantAppliedAt: "",
+          signupGrantAppliedAt: "",
+          createdAt: now,
+          updatedAt: now,
+        };
+        draft.aiCallCreditWallets.push(wallet);
+      }
+      output = { ...wallet };
+    });
+    return publicAiCallWallet(output);
+  }
+
+  function grantAiCallSignupCredits(workspaceId, actorId = "system") {
+    const id = clean(workspaceId);
+    const credits = getAiCallSignupFreeCredits();
+    ensureAiCallCreditWallet(id);
+
+    if (credits <= 0) {
+      return ensureAiCallCreditWallet(id);
+    }
+
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === id);
+      if (!wallet) throw httpError(500, "AI call credit wallet could not be initialized.");
+
+      if (wallet.signupGrantAppliedAt) {
+        output = { ...wallet, reused: true };
+        return;
+      }
+
+      const now = new Date().toISOString();
+      wallet.balance = wholeCredits(wallet.balance) + credits;
+      wallet.totalGranted = wholeCredits(wallet.totalGranted) + credits;
+      wallet.signupGrantAppliedAt = now;
+      wallet.updatedAt = now;
+
+      draft.aiCallCreditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        type: "signup_grant",
+        delta: credits,
+        balanceAfter: wallet.balance,
+        actorId: clean(actorId) || "system",
+        description: `${credits} free AI calling credits included with signup`,
+        createdAt: now,
+      });
+      if (draft.aiCallCreditLedger.length > 5000) draft.aiCallCreditLedger.splice(5000);
+
+      appendActivity(draft, {
+        workspaceId: id,
+        actorId: clean(actorId) || "system",
+        type: "ai_call_signup_credits_granted",
+        title: `${credits} free AI call credits added`,
+        detail: "New-workspace Voice Agent starter balance",
+      });
+
+      output = { ...wallet };
+    });
+
+    return publicAiCallWallet(output);
+  }
+
+  function grantAiCallTestCredits(workspaceId, actorId = "system") {
+    if (!isAiCallTestGrantEnabled()) {
+      throw httpError(
+        403,
+        "Free AI call credits are disabled. Purchase an AI calling credit pack to activate paid voice calling.",
+        "AI_CALL_TEST_GRANT_DISABLED"
+      );
+    }
+    const id = clean(workspaceId);
+    ensureAiCallCreditWallet(id);
+    let output = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === id);
+      if (!wallet) throw httpError(500, "AI call credit wallet could not be initialized.");
+
+      if (wallet.testGrantAppliedAt) {
+        output = { ...wallet, reused: true };
+        return;
+      }
+
+      const now = new Date().toISOString();
+      wallet.balance = wholeCredits(wallet.balance) + AI_CALL_TEST_CREDIT_GRANT;
+      wallet.totalGranted = wholeCredits(wallet.totalGranted) + AI_CALL_TEST_CREDIT_GRANT;
+      wallet.testGrantAppliedAt = now;
+      wallet.updatedAt = now;
+
+      draft.aiCallCreditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        type: "test_grant",
+        delta: AI_CALL_TEST_CREDIT_GRANT,
+        balanceAfter: wallet.balance,
+        actorId: clean(actorId) || "system",
+        description: `One-time ${AI_CALL_TEST_CREDIT_GRANT}-credit AI calling test grant`,
+        createdAt: now,
+      });
+      if (draft.aiCallCreditLedger.length > 5000) draft.aiCallCreditLedger.splice(5000);
+
+      appendActivity(draft, {
+        workspaceId: id,
+        actorId: clean(actorId) || "system",
+        type: "ai_call_test_credits_granted",
+        title: `${AI_CALL_TEST_CREDIT_GRANT} AI call test credits granted`,
+      });
+
+      output = { ...wallet };
+    });
+
+    return publicAiCallWallet(output);
+  }
+
+  function consumeConnectedAiCall({
+    workspaceId,
+    callId,
+    durationSeconds = 0,
+    actorId = "system",
+    metadata = {},
+  } = {}) {
+    const id = clean(workspaceId);
+    const normalizedCallId = clean(callId);
+    if (!id) throw httpError(400, "Workspace is required for AI call credits.", "WORKSPACE_REQUIRED");
+    if (!normalizedCallId) throw httpError(400, "callId is required for AI call credit settlement.", "CALL_ID_REQUIRED");
+    ensureAiCallCreditWallet(id);
+
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const existing = draft.aiCallCreditUsageEvents.find(
+        (item) => item.workspaceId === id && item.callId === normalizedCallId
+      );
+      if (existing) {
+        output = { ...existing, reused: true };
+        return;
+      }
+
+      const wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === id);
+      if (!wallet) throw httpError(500, "AI call credit wallet not found.");
+      if (wholeCredits(wallet.balance) < AI_CALL_CONNECTED_CREDIT_COST) {
+        throw httpError(
+          402,
+          `Not enough AI call credits. ${AI_CALL_CONNECTED_CREDIT_COST} credit is required for a connected call; ${wholeCredits(wallet.balance)} are available.`,
+          "INSUFFICIENT_AI_CALL_CREDITS",
+          { requiredCredits: AI_CALL_CONNECTED_CREDIT_COST, availableCredits: wholeCredits(wallet.balance) }
+        );
+      }
+
+      const policy = getAiCallPolicy();
+      const duration = Math.max(0, Math.round(Number(durationSeconds) || 0));
+      const now = new Date().toISOString();
+      wallet.balance = wholeCredits(wallet.balance) - AI_CALL_CONNECTED_CREDIT_COST;
+      wallet.totalConsumed = wholeCredits(wallet.totalConsumed) + AI_CALL_CONNECTED_CREDIT_COST;
+      wallet.updatedAt = now;
+
+      const usage = {
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        callId: normalizedCallId,
+        unit: "connected_call",
+        credits: AI_CALL_CONNECTED_CREDIT_COST,
+        durationSeconds: duration,
+        overDurationPolicy: Boolean(policy.maxConnectedSeconds && duration > policy.maxConnectedSeconds),
+        metadata: sanitizeMetadata(metadata),
+        actorId: clean(actorId) || "system",
+        createdAt: now,
+      };
+      draft.aiCallCreditUsageEvents.unshift(usage);
+      if (draft.aiCallCreditUsageEvents.length > 5000) draft.aiCallCreditUsageEvents.splice(5000);
+
+      draft.aiCallCreditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        callId: normalizedCallId,
+        type: "connected_call",
+        delta: -AI_CALL_CONNECTED_CREDIT_COST,
+        balanceAfter: wallet.balance,
+        durationSeconds: duration,
+        createdAt: now,
+      });
+      if (draft.aiCallCreditLedger.length > 5000) draft.aiCallCreditLedger.splice(5000);
+
+      appendActivity(draft, {
+        workspaceId: id,
+        actorId: clean(actorId) || "system",
+        type: "ai_call_credit_consumed",
+        title: "AI call credit consumed",
+        detail: `Connected call ${normalizedCallId}`,
+      });
+
+      output = { ...usage, balance: wallet.balance };
+    });
+
+    return output;
+  }
+
+  function getAiCallCreditPacks() {
+    const policy = getAiCallPolicy();
+    const configured = clean(process.env.AI_CALL_CREDIT_PACKS_JSON);
+    if (configured) {
+      try {
+        const parsed = JSON.parse(configured);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .map((item, index) => {
+              const credits = wholeCredits(item?.credits);
+              const amountMinor = Math.round(Number(item?.amountMinor || 0));
+              const currency = clean(item?.currency || policy.currency).toUpperCase();
+              if (!credits || !Number.isFinite(amountMinor) || amountMinor <= 0 || !currency) return null;
+              return {
+                id: clean(item?.id) || `ai-calls-${credits}-${index + 1}`,
+                label: clean(item?.label) || `${credits} AI call credits`,
+                credits,
+                amountMinor,
+                currency,
+                active: item?.active !== false,
+                walletType: "ai_call_credits",
+              };
+            })
+            .filter(Boolean);
+        }
+      } catch {
+        // Invalid override is ignored; the server-owned default catalog remains available.
+      }
+    }
+
+    const configuredOptions = String(process.env.AI_CALL_CREDIT_PACK_OPTIONS || "")
+      .split(",")
+      .map((value) => wholeCredits(value))
+      .filter(Boolean);
+    const options = configuredOptions.length ? uniqueNumbers(configuredOptions) : AI_CALL_DEFAULT_PACK_CREDITS;
+    return options.map((credits) => ({
+      id: `ai-calls-${credits}`,
+      label: `${credits} AI call credits`,
+      credits,
+      amountMinor: credits * policy.connectedCallPriceMinor,
+      currency: policy.currency,
+      active: true,
+      walletType: "ai_call_credits",
+    }));
+  }
+
+  function assertAiCallCreditAvailable({ workspaceId, requiredCredits = AI_CALL_CONNECTED_CREDIT_COST } = {}) {
+    const id = clean(workspaceId);
+    if (!id) throw httpError(400, "Workspace is required for AI call credits.", "WORKSPACE_REQUIRED");
+    const wallet = ensureAiCallCreditWallet(id);
+    const required = Math.max(1, wholeCredits(requiredCredits));
+    const available = wholeCredits(wallet.balance);
+    if (available < required) {
+      throw httpError(
+        402,
+        `Not enough AI call credits. ${required} credit${required === 1 ? "" : "s"} required; ${available} available.`,
+        "INSUFFICIENT_AI_CALL_CREDITS",
+        { requiredCredits: required, availableCredits: available }
+      );
+    }
+    return { ok: true, requiredCredits: required, availableCredits: available, wallet };
+  }
+
+  function getAiCallCreditSnapshot(user) {
+    const state = store.read();
+    const ctx = getWorkspaceContext(user, state);
+    if (!ctx.workspaceId) throw httpError(401, "AI calling workspace could not be resolved.");
+    let wallet = ensureAiCallCreditWallet(ctx.workspaceId);
+    if (
+      isAiCallSignupBackfillEnabled() &&
+      ctx.workspaceId !== CODESYNC_WORKSPACE_ID &&
+      !wallet.signupGrantAppliedAt &&
+      wholeCredits(wallet.totalGranted) === 0 &&
+      wholeCredits(wallet.totalPurchased) === 0 &&
+      wholeCredits(wallet.totalConsumed) === 0
+    ) {
+      wallet = grantAiCallSignupCredits(ctx.workspaceId, user?.id || "system");
+    }
+    const latest = store.read();
+    const ownerLike = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
+    const codesyncWorkspace = ctx.workspaceId === CODESYNC_WORKSPACE_ID;
+    const hasActivePurchasedNumber =
+      codesyncWorkspace ||
+      (latest.voicePhoneNumbers || []).some(
+        (item) =>
+          item.workspaceId === ctx.workspaceId &&
+          normalizeStatus(item.status) === "active" &&
+          (
+            clean(item.orderId) ||
+            item.ownershipVerified === true ||
+            clean(item.source) === "existing_number"
+          )
+      );
+    return {
+      wallet,
+      policy: getAiCallPolicy(),
+      requiresPurchasedNumber: !codesyncWorkspace,
+      hasActivePurchasedNumber,
+      packs: getAiCallCreditPacks().filter((item) => item.active),
+      purchases: (latest.aiCallCreditPurchases || [])
+        .filter((item) => item.workspaceId === ctx.workspaceId)
+        .sort(byNewest)
+        .slice(0, 50)
+        .map(publicAiCallPurchase),
+      canPurchase: ownerLike,
+      signupFreeCredits: getAiCallSignupFreeCredits(),
+      signupGrantApplied: Boolean(wallet.signupGrantAppliedAt),
+      testGrantAvailable: Boolean(isAiCallTestGrantEnabled() && !wallet.testGrantAppliedAt),
+      usage: (latest.aiCallCreditUsageEvents || [])
+        .filter((item) => item.workspaceId === ctx.workspaceId)
+        .sort(byNewest)
+        .slice(0, 100),
+      ledger: (latest.aiCallCreditLedger || [])
+        .filter((item) => item.workspaceId === ctx.workspaceId)
+        .sort(byNewest)
+        .slice(0, 100),
+    };
+  }
+
+  function getRateCard() {
+    const state = store.read();
+    const overrides = state.creditRateCard && typeof state.creditRateCard === "object"
+      ? state.creditRateCard
+      : {};
+    return DEFAULT_RATE_CARD.map((base) => {
+      const saved = overrides[base.feature] || {};
+      return {
+        ...base,
+        creditsPerUnit: positiveNumber(saved.creditsPerUnit, base.creditsPerUnit),
+        billable: saved.billable === undefined ? base.billable : Boolean(saved.billable),
+        label: clean(saved.label) || base.label,
+        description: clean(saved.description) || base.description,
+        updatedAt: saved.updatedAt || "",
+      };
+    });
+  }
+
+  function getRate(feature) {
+    const normalized = normalizeStatus(feature);
+    const rate = getRateCard().find((item) => item.feature === normalized);
+    if (!rate) throw httpError(400, `Unsupported billable feature: ${normalized}.`, "UNKNOWN_BILLING_FEATURE");
+    return rate;
+  }
+
+  function getCreditPacks() {
+    const state = store.read();
+    const savedById = new Map(
+      (state.creditPacks || []).map((item) => [clean(item.id), item])
+    );
+    return DEFAULT_CREDIT_PACKS.map((base) => {
+      const saved = savedById.get(base.id) || {};
+      const amountMinorRaw = saved.amountMinor ?? base.amountMinor;
+      const amountMinor = Number.isFinite(Number(amountMinorRaw)) && Number(amountMinorRaw) > 0
+        ? Math.round(Number(amountMinorRaw))
+        : null;
+      return {
+        ...base,
+        ...saved,
+        id: base.id,
+        credits: Math.max(1, Math.round(Number(saved.credits || base.credits))),
+        currency: clean(saved.currency || base.currency).toUpperCase(),
+        amountMinor,
+        active: Boolean(saved.active && amountMinor),
+        market: clean(saved.market || base.market).toUpperCase(),
+      };
+    });
+  }
+
+  function reserveUsage({
+    workspaceId,
+    feature,
+    quantity = 1,
+    idempotencyKey = "",
+    metadata = {},
+    actorId = "system",
+  } = {}) {
+    const id = clean(workspaceId);
+    ensureWorkspaceWallet(id, actorId);
+    const rate = getRate(feature);
+    const qty = positiveNumber(quantity, 1);
+    const credits = rate.billable ? roundCredits(rate.creditsPerUnit * qty) : 0;
+    const key = clean(idempotencyKey);
+    let output = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      if (key) {
+        const existing = draft.creditReservations.find(
+          (item) => item.workspaceId === id && item.idempotencyKey === key
+        );
+        if (existing) {
+          output = { ...existing, reused: true };
+          return;
+        }
+      }
+
+      const wallet = draft.creditWallets.find((item) => item.workspaceId === id);
+      if (!wallet) throw httpError(500, "Credit wallet could not be initialized.");
+      if (creditNumber(wallet.balance) < credits) {
+        throw httpError(
+          402,
+          `Not enough ReachFly credits. ${credits} credits are required; ${creditNumber(wallet.balance)} are available.`,
+          "INSUFFICIENT_CREDITS",
+          {
+            requiredCredits: credits,
+            availableCredits: creditNumber(wallet.balance),
+            feature: rate.feature,
+          }
+        );
+      }
+
+      const now = new Date().toISOString();
+      wallet.balance = roundCredits(creditNumber(wallet.balance) - credits);
+      wallet.reserved = roundCredits(creditNumber(wallet.reserved) + credits);
+      wallet.updatedAt = now;
+      const reservation = {
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        feature: rate.feature,
+        unit: rate.unit,
+        quantity: qty,
+        creditsPerUnit: rate.creditsPerUnit,
+        credits,
+        status: "reserved",
+        idempotencyKey: key,
+        metadata: sanitizeMetadata(metadata),
+        actorId: clean(actorId) || "system",
+        createdAt: now,
+        updatedAt: now,
+      };
+      draft.creditReservations.push(reservation);
+      draft.creditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        type: "reserve",
+        delta: -credits,
+        balanceAfter: wallet.balance,
+        reservedAfter: wallet.reserved,
+        feature: rate.feature,
+        quantity: qty,
+        creditsPerUnit: rate.creditsPerUnit,
+        reservationId: reservation.id,
+        idempotencyKey: key,
+        actorId: reservation.actorId,
+        createdAt: now,
+      });
+      output = { ...reservation };
+    });
+
+    return output;
+  }
+
+  function commitUsage(reservationId, { actualQuantity, metadata = {} } = {}) {
+    const reservationKey = clean(reservationId);
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const reservation = draft.creditReservations.find((item) => item.id === reservationKey);
+      if (!reservation) throw httpError(404, "Credit reservation not found.", "CREDIT_RESERVATION_NOT_FOUND");
+      if (reservation.status === "committed") {
+        output = { ...reservation, reused: true };
+        return;
+      }
+      if (reservation.status !== "reserved") {
+        throw httpError(409, "Credit reservation is no longer active.", "CREDIT_RESERVATION_CLOSED");
+      }
+
+      const wallet = draft.creditWallets.find((item) => item.workspaceId === reservation.workspaceId);
+      if (!wallet) throw httpError(500, "Credit wallet not found.");
+      const qty = actualQuantity === undefined
+        ? creditNumber(reservation.quantity)
+        : Math.max(0, creditNumber(actualQuantity));
+      const actualCredits = roundCredits(qty * creditNumber(reservation.creditsPerUnit));
+      if (actualCredits > creditNumber(reservation.credits)) {
+        throw httpError(409, "Actual usage exceeds the reserved credit amount.", "CREDIT_RESERVATION_TOO_SMALL");
+      }
+      const unused = roundCredits(creditNumber(reservation.credits) - actualCredits);
+      const now = new Date().toISOString();
+      wallet.reserved = roundCredits(Math.max(0, creditNumber(wallet.reserved) - creditNumber(reservation.credits)));
+      if (unused > 0) wallet.balance = roundCredits(creditNumber(wallet.balance) + unused);
+      wallet.totalConsumed = roundCredits(creditNumber(wallet.totalConsumed) + actualCredits);
+      wallet.updatedAt = now;
+      reservation.status = "committed";
+      reservation.actualQuantity = qty;
+      reservation.actualCredits = actualCredits;
+      reservation.releasedCredits = unused;
+      reservation.metadata = {
+        ...reservation.metadata,
+        ...sanitizeMetadata(metadata),
+      };
+      reservation.updatedAt = now;
+      reservation.committedAt = now;
+
+      const usage = {
+        id: crypto.randomUUID(),
+        workspaceId: reservation.workspaceId,
+        feature: reservation.feature,
+        unit: reservation.unit,
+        quantity: qty,
+        creditsPerUnit: reservation.creditsPerUnit,
+        credits: actualCredits,
+        reservationId: reservation.id,
+        idempotencyKey: reservation.idempotencyKey,
+        metadata: reservation.metadata,
+        createdAt: now,
+      };
+      draft.creditUsageEvents.unshift(usage);
+      draft.creditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: reservation.workspaceId,
+        type: "usage",
+        delta: unused,
+        balanceAfter: wallet.balance,
+        reservedAfter: wallet.reserved,
+        feature: reservation.feature,
+        quantity: qty,
+        creditsPerUnit: reservation.creditsPerUnit,
+        creditsConsumed: actualCredits,
+        reservationId: reservation.id,
+        idempotencyKey: reservation.idempotencyKey,
+        actorId: reservation.actorId,
+        createdAt: now,
+      });
+      output = { ...reservation, usage };
+    });
+    return output;
+  }
+
+  function releaseUsage(reservationId, reason = "released") {
+    const reservationKey = clean(reservationId);
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const reservation = draft.creditReservations.find((item) => item.id === reservationKey);
+      if (!reservation) return;
+      if (reservation.status !== "reserved") {
+        output = { ...reservation, reused: true };
+        return;
+      }
+      const wallet = draft.creditWallets.find((item) => item.workspaceId === reservation.workspaceId);
+      if (!wallet) return;
+      const now = new Date().toISOString();
+      wallet.balance = roundCredits(creditNumber(wallet.balance) + creditNumber(reservation.credits));
+      wallet.reserved = roundCredits(Math.max(0, creditNumber(wallet.reserved) - creditNumber(reservation.credits)));
+      wallet.updatedAt = now;
+      reservation.status = "released";
+      reservation.releaseReason = clean(reason).slice(0, 500);
+      reservation.updatedAt = now;
+      reservation.releasedAt = now;
+      draft.creditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: reservation.workspaceId,
+        type: "release",
+        delta: creditNumber(reservation.credits),
+        balanceAfter: wallet.balance,
+        reservedAfter: wallet.reserved,
+        feature: reservation.feature,
+        reservationId: reservation.id,
+        idempotencyKey: reservation.idempotencyKey,
+        description: reservation.releaseReason,
+        actorId: reservation.actorId,
+        createdAt: now,
+      });
+      output = { ...reservation };
+    });
+    return output;
+  }
+
+  function consumeUsage(input = {}) {
+    const reservation = reserveUsage(input);
+    return commitUsage(reservation.id, {
+      actualQuantity: input.quantity,
+      metadata: input.metadata,
+    });
+  }
+
+  function getBillingDashboard(user) {
+    const state = store.read();
+    const ctx = getWorkspaceContext(user, state);
+    if (!ctx.workspaceId) throw httpError(401, "Billing workspace could not be resolved.");
+    const wallet = ensureWorkspaceWallet(ctx.workspaceId, user?.id);
+    const latest = store.read();
+    const ownerLike = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
+    return {
+      wallet: publicWallet(wallet),
+      freeTestCredits: isTestGrantEnabled() ? TEST_CREDIT_GRANT : 0,
+      testGrantEnabled: isTestGrantEnabled(),
+      rateCard: getRateCard(),
+      packs: getCreditPacks(),
+      purchases: (latest.creditPurchases || [])
+        .filter((item) => item.workspaceId === ctx.workspaceId)
+        .sort(byNewest)
+        .slice(0, 50)
+        .map(publicPurchase),
+      usage: (latest.creditUsageEvents || [])
+        .filter((item) => item.workspaceId === ctx.workspaceId)
+        .sort(byNewest)
+        .slice(0, 100)
+        .map(publicUsage),
+      ledger: (latest.creditLedger || [])
+        .filter((item) => item.workspaceId === ctx.workspaceId)
+        .sort(byNewest)
+        .slice(0, 100),
+      aiCalling: getAiCallCreditSnapshot(user),
+      canPurchase: ownerLike,
+      safepay: {
+        configured: Boolean(clean(process.env.SAFEPAY_SECRET_KEY) && clean(process.env.SAFEPAY_PUBLIC_KEY)),
+        environment: getSafepayEnvironment(),
+      },
+    };
+  }
+
+  async function createCreditCheckout(user, input = {}) {
+    const state = store.read();
+    const ctx = getWorkspaceContext(user, state);
+    if (!ctx.workspaceId) throw httpError(401, "Billing workspace could not be resolved.");
+    const canPurchase = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
+    if (!canPurchase) {
+      throw httpError(403, "Only a workspace owner or administrator can purchase credits.");
+    }
+    ensureWorkspaceWallet(ctx.workspaceId, user?.id);
+
+    const packId = clean(input.packId);
+    const pack = getCreditPacks().find((item) => item.id === packId);
+    if (!pack || !pack.active || !pack.amountMinor) {
+      throw httpError(422, "This credit pack is not configured for checkout yet.", "CREDIT_PACK_NOT_CONFIGURED");
+    }
+
+    const now = new Date().toISOString();
+    const purchase = {
+      id: crypto.randomUUID(),
+      workspaceId: ctx.workspaceId,
+      userId: clean(user?.id),
+      packId: pack.id,
+      credits: pack.credits,
+      amountMinor: pack.amountMinor,
+      currency: pack.currency,
+      market: pack.market,
+      provider: "safepay",
+      providerTracker: "",
+      status: "creating",
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.creditPurchases.unshift(purchase);
+    });
+
+    try {
+      const safepay = await getSafepayClient();
+      const publicKey = requireEnv("SAFEPAY_PUBLIC_KEY");
+      const sessionResponse = await safepay.payments.session.setup({
+        merchant_api_key: publicKey,
+        intent: clean(process.env.SAFEPAY_PAYMENT_INTENT) || "CYBERSOURCE",
+        mode: "payment",
+        entry_mode: "raw",
+        currency: pack.currency,
+        amount: pack.amountMinor,
+        include_fees: false,
+      });
+      const tracker = clean(
+        sessionResponse?.data?.tracker?.token || sessionResponse?.tracker?.token || sessionResponse?.data?.token
+      );
+      if (!tracker) throw new Error("Safepay did not return a payment tracker.");
+      // @sfpy/node-core exposes Passport under client.passport and its
+      // checkout URL helper under checkout.createCheckoutUrl.
+      const passportResponse = await safepay.client.passport.create();
+      const tbt = clean(
+        passportResponse?.data?.token ||
+        passportResponse?.token ||
+        (typeof passportResponse?.data === "string" ? passportResponse.data : "")
+      );
+      if (!tbt) throw new Error("Safepay did not return an authentication token.");
+      const checkoutUrl = clean(
+        safepay.checkout.createCheckoutUrl({
+          env: getSafepayEnvironment(),
+          tracker,
+          tbt,
+          source: "hosted",
+          order_id: purchase.id,
+          redirect_url: `${getAppUrl()}/app/billing?payment=success&purchase=${encodeURIComponent(purchase.id)}`,
+          cancel_url: `${getAppUrl()}/app/billing?payment=cancelled&purchase=${encodeURIComponent(purchase.id)}`,
+        })
+      );
+      if (!checkoutUrl || !/^https?:\/\//i.test(checkoutUrl)) {
+        throw new Error("Safepay did not return a valid checkout URL.");
+      }
+
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.creditPurchases.find((item) => item.id === purchase.id);
+        if (!target) return;
+        target.providerTracker = tracker;
+        target.status = "pending";
+        target.checkoutCreatedAt = new Date().toISOString();
+        target.updatedAt = target.checkoutCreatedAt;
+      });
+
+      return {
+        ok: true,
+        checkoutUrl,
+        purchase: publicPurchase({ ...purchase, providerTracker: tracker, status: "pending" }),
+      };
+    } catch (error) {
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.creditPurchases.find((item) => item.id === purchase.id);
+        if (!target) return;
+        target.status = "failed";
+        target.error = clean(error?.message || String(error)).slice(0, 1000);
+        target.updatedAt = new Date().toISOString();
+      });
+      throw httpError(
+        error?.statusCode || 502,
+        error?.message || "Could not create Safepay credit checkout.",
+        "SAFEPAY_CHECKOUT_FAILED"
+      );
+    }
+  }
+
+  async function createAiCallCreditCheckout(user, input = {}) {
+    const state = store.read();
+    const ctx = getWorkspaceContext(user, state);
+    if (!ctx.workspaceId) throw httpError(401, "Billing workspace could not be resolved.");
+    const canPurchase = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
+    if (!canPurchase) {
+      throw httpError(403, "Only a workspace owner or administrator can purchase AI call credits.");
+    }
+
+    const codesyncWorkspace = ctx.workspaceId === CODESYNC_WORKSPACE_ID;
+    const hasActivePurchasedNumber =
+      codesyncWorkspace ||
+      (state.voicePhoneNumbers || []).some(
+        (item) =>
+          item.workspaceId === ctx.workspaceId &&
+          normalizeStatus(item.status) === "active" &&
+          (
+            clean(item.orderId) ||
+            item.ownershipVerified === true ||
+            clean(item.source) === "existing_number"
+          )
+      );
+
+    // Codesync already has a working preconfigured ElevenLabs/Telnyx calling
+    // identity. It is intentionally not required to own a Voice Commerce
+    // order row before purchasing optional AI call-credit packs.
+    if (!hasActivePurchasedNumber) {
+      throw httpError(
+        409,
+        "Buy and activate a ReachFly business number before purchasing AI call credits.",
+        "VOICE_NUMBER_REQUIRED"
+      );
+    }
+
+    ensureAiCallCreditWallet(ctx.workspaceId);
+
+    const packId = clean(input.packId);
+    const pack = getAiCallCreditPacks().find((item) => item.id === packId);
+    if (!pack || !pack.active || !pack.amountMinor || !pack.credits) {
+      throw httpError(422, "This AI call-credit pack is not configured for checkout.", "AI_CALL_PACK_NOT_CONFIGURED");
+    }
+
+    const now = new Date().toISOString();
+    const purchase = {
+      id: crypto.randomUUID(),
+      workspaceId: ctx.workspaceId,
+      userId: clean(user?.id),
+      packId: pack.id,
+      credits: wholeCredits(pack.credits),
+      amountMinor: Math.round(Number(pack.amountMinor)),
+      currency: clean(pack.currency).toUpperCase(),
+      walletType: "ai_call_credits",
+      provider: "safepay",
+      providerTracker: "",
+      status: "creating",
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.aiCallCreditPurchases.unshift(purchase);
+    });
+
+    try {
+      const safepay = await getSafepayClient();
+      const publicKey = requireEnv("SAFEPAY_PUBLIC_KEY");
+      const sessionResponse = await safepay.payments.session.setup({
+        merchant_api_key: publicKey,
+        intent: clean(process.env.SAFEPAY_PAYMENT_INTENT) || "CYBERSOURCE",
+        mode: "payment",
+        entry_mode: "raw",
+        currency: purchase.currency,
+        amount: purchase.amountMinor,
+        include_fees: false,
+      });
+      const tracker = clean(
+        sessionResponse?.data?.tracker?.token || sessionResponse?.tracker?.token || sessionResponse?.data?.token
+      );
+      if (!tracker) throw new Error("Safepay did not return a payment tracker.");
+      const passportResponse = await safepay.client.passport.create();
+      const tbt = clean(
+        passportResponse?.data?.token ||
+          passportResponse?.token ||
+          (typeof passportResponse?.data === "string" ? passportResponse.data : "")
+      );
+      if (!tbt) throw new Error("Safepay did not return an authentication token.");
+      const voiceReturnPath = normalizeCheckoutReturnPath(
+        input.returnPath,
+        "/app/billing"
+      );
+      const checkoutUrl = clean(
+        safepay.checkout.createCheckoutUrl({
+          env: getSafepayEnvironment(),
+          tracker,
+          tbt,
+          source: "hosted",
+          order_id: purchase.id,
+          redirect_url: buildCheckoutReturnUrl(
+            voiceReturnPath,
+            { voicePayment: "success", purchase: purchase.id }
+          ),
+          cancel_url: buildCheckoutReturnUrl(
+            voiceReturnPath,
+            { voicePayment: "cancelled", purchase: purchase.id }
+          ),
+        })
+      );
+      if (!checkoutUrl || !/^https?:\/\//i.test(checkoutUrl)) {
+        throw new Error("Safepay did not return a valid checkout URL.");
+      }
+
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.aiCallCreditPurchases.find((item) => item.id === purchase.id);
+        if (!target) return;
+        target.providerTracker = tracker;
+        target.status = "pending";
+        target.checkoutCreatedAt = new Date().toISOString();
+        target.updatedAt = target.checkoutCreatedAt;
+      });
+
+      return {
+        ok: true,
+        checkoutUrl,
+        purchase: publicAiCallPurchase({ ...purchase, providerTracker: tracker, status: "pending" }),
+      };
+    } catch (error) {
+      store.update((draft) => {
+        ensureStateShape(draft);
+        const target = draft.aiCallCreditPurchases.find((item) => item.id === purchase.id);
+        if (!target) return;
+        target.status = "failed";
+        target.error = clean(error?.message || String(error)).slice(0, 1000);
+        target.updatedAt = new Date().toISOString();
+      });
+      throw httpError(
+        error?.statusCode || 502,
+        error?.message || "Could not create Safepay AI call-credit checkout.",
+        "SAFEPAY_AI_CALL_CHECKOUT_FAILED"
+      );
+    }
+  }
+
+  async function handleSafepayWebhook({ rawBody = "", headers = {}, body = {} } = {}) {
+    const webhookSecret = requireEnv("SAFEPAY_WEBHOOK_SECRET");
+    const signature = clean(headers["x-sfpy-signature"] || headers["X-SFPY-SIGNATURE"]);
+    if (!signature) throw httpError(400, "Missing Safepay webhook signature.", "SAFEPAY_SIGNATURE_MISSING");
+    const payloadText = typeof rawBody === "string" && rawBody ? rawBody : JSON.stringify(body || {});
+    const calculated = crypto
+      .createHmac("sha512", webhookSecret)
+      .update(Buffer.from(payloadText))
+      .digest("hex");
+    if (!safeEqualHex(calculated, signature)) {
+      throw httpError(400, "Invalid Safepay webhook signature.", "SAFEPAY_SIGNATURE_INVALID");
+    }
+
+    const event = body && typeof body === "object" ? body : JSON.parse(payloadText || "{}");
+    const eventId = clean(event.token || event.id);
+    const eventType = normalizeEventType(event.type);
+    if (!eventId || !eventType) {
+      throw httpError(400, "Safepay webhook is missing event identity.", "SAFEPAY_EVENT_INVALID");
+    }
+
+    const state = store.read();
+    const existing = (state.billingWebhookEvents || []).find(
+      (item) => item.provider === "safepay" && item.eventId === eventId
+    );
+    if (existing?.processed) {
+      return { ok: true, duplicate: true, eventId, eventType };
+    }
+
+    const receivedAt = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const duplicate = draft.billingWebhookEvents.find(
+        (item) => item.provider === "safepay" && item.eventId === eventId
+      );
+      if (!duplicate) {
+        draft.billingWebhookEvents.unshift({
+          id: crypto.randomUUID(),
+          provider: "safepay",
+          eventId,
+          eventType,
+          tracker: clean(event?.data?.tracker),
+          processed: false,
+          receivedAt,
+          createdAt: receivedAt,
+        });
+      }
+    });
+
+    let processingResult = { matched: false };
+    if (eventType === "payment.succeeded") {
+      processingResult = applySuccessfulPurchase(event);
+    } else if (eventType === "payment.failed") {
+      processingResult = applyFailedPurchase(event);
+    } else if (eventType === "payment.refunded") {
+      processingResult = applyRefundedPurchase(event);
+    }
+
+    if (!processingResult?.matched && typeof externalSafepayHandler === "function") {
+      const externalResult = await externalSafepayHandler({
+        event,
+        eventId,
+        eventType,
+      });
+      if (externalResult?.matched) processingResult = externalResult;
+    }
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const target = draft.billingWebhookEvents.find(
+        (item) => item.provider === "safepay" && item.eventId === eventId
+      );
+      if (!target) return;
+      target.processed = true;
+      target.processedAt = new Date().toISOString();
+      target.result = processingResult;
+    });
+
+    return {
+      ok: true,
+      eventId,
+      eventType,
+      ...processingResult,
+    };
+  }
+
+  function findAiCallPurchase(draft, event) {
+    const data = event?.data || {};
+    const metadata = data.metadata || {};
+    const tracker = clean(data.tracker);
+    const purchaseId = clean(metadata.purchase_id || metadata.purchaseId);
+    return (draft.aiCallCreditPurchases || []).find(
+      (item) => (purchaseId && item.id === purchaseId) || (tracker && item.providerTracker === tracker)
+    );
+  }
+
+  function applySuccessfulAiCallPurchase(event) {
+    const data = event?.data || {};
+    const tracker = clean(data.tracker);
+    let output = { matched: false, tracker, walletType: "ai_call_credits" };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const purchase = findAiCallPurchase(draft, event);
+      if (!purchase) return;
+      output.matched = true;
+      output.purchaseId = purchase.id;
+      if (purchase.status === "succeeded" && purchase.creditsGrantedAt) {
+        output.duplicatePurchase = true;
+        return;
+      }
+      if (Number(data.amount) && Number(data.amount) !== Number(purchase.amountMinor)) {
+        throw httpError(409, "Safepay amount does not match the ReachFly AI call-credit purchase.", "SAFEPAY_AMOUNT_MISMATCH");
+      }
+      if (clean(data.currency).toUpperCase() && clean(data.currency).toUpperCase() !== clean(purchase.currency).toUpperCase()) {
+        throw httpError(409, "Safepay currency does not match the ReachFly AI call-credit purchase.", "SAFEPAY_CURRENCY_MISMATCH");
+      }
+
+      let wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === purchase.workspaceId);
+      const now = new Date().toISOString();
+      if (!wallet) {
+        wallet = {
+          id: crypto.randomUUID(),
+          workspaceId: purchase.workspaceId,
+          balance: 0,
+          debt: 0,
+          totalGranted: 0,
+          totalPurchased: 0,
+          totalConsumed: 0,
+          testGrantAppliedAt: "",
+          createdAt: now,
+          updatedAt: now,
+        };
+        draft.aiCallCreditWallets.push(wallet);
+      }
+      const purchasedCredits = wholeCredits(purchase.credits);
+      const debt = wholeCredits(wallet.debt);
+      const debtPaid = Math.min(debt, purchasedCredits);
+      const availableGrant = purchasedCredits - debtPaid;
+      wallet.debt = debt - debtPaid;
+      wallet.balance = wholeCredits(wallet.balance) + availableGrant;
+      wallet.totalPurchased = wholeCredits(wallet.totalPurchased) + purchasedCredits;
+      wallet.updatedAt = now;
+
+      purchase.status = "succeeded";
+      purchase.paidAt = now;
+      purchase.creditsGrantedAt = now;
+      purchase.providerEventId = clean(event.token || event.id);
+      purchase.providerAmountMinor = Number(data.amount || purchase.amountMinor);
+      purchase.providerCurrency = clean(data.currency || purchase.currency).toUpperCase();
+      purchase.updatedAt = now;
+
+      draft.aiCallCreditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: purchase.workspaceId,
+        purchaseId: purchase.id,
+        type: "purchase",
+        delta: availableGrant,
+        balanceAfter: wallet.balance,
+        provider: "safepay",
+        providerTracker: tracker,
+        description: `${purchasedCredits} AI call credits purchased${debtPaid ? `; ${debtPaid} applied to AI call-credit debt` : ""}`,
+        createdAt: now,
+      });
+      if (draft.aiCallCreditLedger.length > 5000) draft.aiCallCreditLedger.splice(5000);
+
+      draft.billingPayments.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: purchase.workspaceId,
+        userId: purchase.userId,
+        provider: "safepay",
+        providerTransactionId: tracker,
+        purchaseId: purchase.id,
+        productType: "ai_call_credits",
+        amountCents: Number(purchase.amountMinor || 0),
+        amountMinor: Number(purchase.amountMinor || 0),
+        currency: purchase.currency,
+        status: "succeeded",
+        paidAt: now,
+        createdAt: now,
+      });
+      appendActivity(draft, {
+        workspaceId: purchase.workspaceId,
+        actorId: purchase.userId,
+        type: "ai_call_credit_purchase_succeeded",
+        title: `${purchasedCredits} AI call credits purchased`,
+        detail: `${purchase.currency} ${Number(purchase.amountMinor || 0) / 100}`,
+        createdAt: now,
+      });
+      output.creditsGranted = availableGrant;
+      output.balance = wallet.balance;
+    });
+    return output;
+  }
+
+  function applyFailedAiCallPurchase(event) {
+    const data = event?.data || {};
+    const tracker = clean(data.tracker);
+    let output = { matched: false, tracker, walletType: "ai_call_credits" };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const purchase = findAiCallPurchase(draft, event);
+      if (!purchase) return;
+      output.matched = true;
+      output.purchaseId = purchase.id;
+      if (purchase.status !== "succeeded") purchase.status = "failed";
+      purchase.error = clean(data.message || data.category || "Safepay payment failed.").slice(0, 1000);
+      purchase.updatedAt = new Date().toISOString();
+    });
+    return output;
+  }
+
+  function applyRefundedAiCallPurchase(event) {
+    const data = event?.data || {};
+    const tracker = clean(data.tracker);
+    let output = { matched: false, tracker, walletType: "ai_call_credits" };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const purchase = findAiCallPurchase(draft, event);
+      if (!purchase) return;
+      output.matched = true;
+      output.purchaseId = purchase.id;
+      if (purchase.refundProcessedAt) {
+        output.duplicateRefund = true;
+        return;
+      }
+      const wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === purchase.workspaceId);
+      if (!wallet) return;
+      const now = new Date().toISOString();
+      const refundableCredits = wholeCredits(purchase.credits);
+      const removed = Math.min(wholeCredits(wallet.balance), refundableCredits);
+      const debt = refundableCredits - removed;
+      wallet.balance = wholeCredits(wallet.balance) - removed;
+      wallet.debt = wholeCredits(wallet.debt) + debt;
+      wallet.updatedAt = now;
+      purchase.status = "refunded";
+      purchase.refundProcessedAt = now;
+      purchase.refundAmountMinor = Number(data.refund_amount || 0);
+      purchase.updatedAt = now;
+      draft.aiCallCreditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: purchase.workspaceId,
+        purchaseId: purchase.id,
+        type: "refund",
+        delta: -removed,
+        balanceAfter: wallet.balance,
+        provider: "safepay",
+        providerTracker: tracker,
+        description: debt
+          ? `${removed} AI call credits removed; ${debt} recorded as AI call-credit debt.`
+          : `${removed} AI call credits removed after refund.`,
+        createdAt: now,
+      });
+      if (draft.aiCallCreditLedger.length > 5000) draft.aiCallCreditLedger.splice(5000);
+      output.creditsRemoved = removed;
+      output.creditDebt = wallet.debt;
+    });
+    return output;
+  }
+
+  function applySuccessfulPurchase(event) {
+    const aiCallResult = applySuccessfulAiCallPurchase(event);
+    if (aiCallResult.matched) return aiCallResult;
+    const data = event?.data || {};
+    const tracker = clean(data.tracker);
+    const metadata = data.metadata || {};
+    const purchaseId = clean(metadata.purchase_id || metadata.purchaseId);
+    let output = { matched: false, tracker };
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const purchase = draft.creditPurchases.find(
+        (item) => (purchaseId && item.id === purchaseId) || (tracker && item.providerTracker === tracker)
+      );
+      if (!purchase) return;
+      output.matched = true;
+      output.purchaseId = purchase.id;
+      if (purchase.status === "succeeded" && purchase.creditsGrantedAt) {
+        output.duplicatePurchase = true;
+        return;
+      }
+      if (Number(data.amount) && Number(data.amount) !== Number(purchase.amountMinor)) {
+        throw httpError(409, "Safepay amount does not match the ReachFly credit purchase.", "SAFEPAY_AMOUNT_MISMATCH");
+      }
+      if (clean(data.currency).toUpperCase() && clean(data.currency).toUpperCase() !== clean(purchase.currency).toUpperCase()) {
+        throw httpError(409, "Safepay currency does not match the ReachFly credit purchase.", "SAFEPAY_CURRENCY_MISMATCH");
+      }
+
+      let wallet = draft.creditWallets.find((item) => item.workspaceId === purchase.workspaceId);
+      const now = new Date().toISOString();
+      if (!wallet) {
+        wallet = {
+          id: crypto.randomUUID(),
+          workspaceId: purchase.workspaceId,
+          balance: 0,
+          reserved: 0,
+          debt: 0,
+          totalGranted: 0,
+          totalPurchased: 0,
+          totalConsumed: 0,
+          createdAt: now,
+          updatedAt: now,
+        };
+        draft.creditWallets.push(wallet);
+      }
+      const debt = creditNumber(wallet.debt);
+      const purchasedCredits = creditNumber(purchase.credits);
+      const debtPaid = Math.min(debt, purchasedCredits);
+      const availableGrant = roundCredits(purchasedCredits - debtPaid);
+      wallet.debt = roundCredits(debt - debtPaid);
+      wallet.balance = roundCredits(creditNumber(wallet.balance) + availableGrant);
+      wallet.totalPurchased = roundCredits(creditNumber(wallet.totalPurchased) + purchasedCredits);
+      wallet.updatedAt = now;
+      purchase.status = "succeeded";
+      purchase.paidAt = now;
+      purchase.creditsGrantedAt = now;
+      purchase.providerEventId = clean(event.token || event.id);
+      purchase.providerAmountMinor = Number(data.amount || purchase.amountMinor);
+      purchase.providerCurrency = clean(data.currency || purchase.currency).toUpperCase();
+      purchase.updatedAt = now;
+
+      draft.creditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: purchase.workspaceId,
+        type: "purchase",
+        delta: availableGrant,
+        balanceAfter: wallet.balance,
+        reservedAfter: creditNumber(wallet.reserved),
+        purchaseId: purchase.id,
+        provider: "safepay",
+        providerTracker: tracker,
+        description: `${purchasedCredits} credits purchased${debtPaid ? `; ${debtPaid} applied to credit debt` : ""}`,
+        createdAt: now,
+      });
+      draft.billingPayments.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: purchase.workspaceId,
+        userId: purchase.userId,
+        provider: "safepay",
+        providerTransactionId: tracker,
+        purchaseId: purchase.id,
+        amountCents: Number(purchase.amountMinor || 0),
+        amountMinor: Number(purchase.amountMinor || 0),
+        currency: purchase.currency,
+        status: "succeeded",
+        paidAt: now,
+        createdAt: now,
+      });
+      appendActivity(draft, {
+        workspaceId: purchase.workspaceId,
+        actorId: purchase.userId,
+        type: "credit_purchase_succeeded",
+        title: `${purchasedCredits} ReachFly credits purchased`,
+        detail: `${purchase.currency} ${Number(purchase.amountMinor || 0) / 100}`,
+        createdAt: now,
+      });
+      output.creditsGranted = availableGrant;
+      output.balance = wallet.balance;
+    });
+
+    return output;
+  }
+
+  function applyFailedPurchase(event) {
+    const aiCallResult = applyFailedAiCallPurchase(event);
+    if (aiCallResult.matched) return aiCallResult;
+    const data = event?.data || {};
+    const tracker = clean(data.tracker);
+    let output = { matched: false, tracker };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const purchase = draft.creditPurchases.find((item) => item.providerTracker === tracker);
+      if (!purchase) return;
+      output.matched = true;
+      output.purchaseId = purchase.id;
+      if (purchase.status !== "succeeded") purchase.status = "failed";
+      purchase.error = clean(data.message || data.category || "Safepay payment failed.").slice(0, 1000);
+      purchase.updatedAt = new Date().toISOString();
+    });
+    return output;
+  }
+
+  function applyRefundedPurchase(event) {
+    const aiCallResult = applyRefundedAiCallPurchase(event);
+    if (aiCallResult.matched) return aiCallResult;
+    const data = event?.data || {};
+    const tracker = clean(data.tracker);
+    let output = { matched: false, tracker };
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const purchase = draft.creditPurchases.find((item) => item.providerTracker === tracker);
+      if (!purchase) return;
+      output.matched = true;
+      output.purchaseId = purchase.id;
+      if (purchase.refundProcessedAt) {
+        output.duplicateRefund = true;
+        return;
+      }
+      const wallet = draft.creditWallets.find((item) => item.workspaceId === purchase.workspaceId);
+      if (!wallet) return;
+      const now = new Date().toISOString();
+      const refundableCredits = creditNumber(purchase.credits);
+      const removed = Math.min(creditNumber(wallet.balance), refundableCredits);
+      const debt = roundCredits(refundableCredits - removed);
+      wallet.balance = roundCredits(creditNumber(wallet.balance) - removed);
+      wallet.debt = roundCredits(creditNumber(wallet.debt) + debt);
+      wallet.updatedAt = now;
+      purchase.status = "refunded";
+      purchase.refundProcessedAt = now;
+      purchase.refundAmountMinor = Number(data.refund_amount || 0);
+      purchase.updatedAt = now;
+      draft.creditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: purchase.workspaceId,
+        type: "refund",
+        delta: -removed,
+        balanceAfter: wallet.balance,
+        reservedAfter: creditNumber(wallet.reserved),
+        purchaseId: purchase.id,
+        provider: "safepay",
+        providerTracker: tracker,
+        description: debt
+          ? `${removed} credits removed; ${debt} credits recorded as debt because they had already been consumed.`
+          : `${removed} purchased credits removed after refund.`,
+        createdAt: now,
+      });
+      appendActivity(draft, {
+        workspaceId: purchase.workspaceId,
+        actorId: purchase.userId,
+        type: "credit_purchase_refunded",
+        title: `Safepay credit purchase refunded`,
+        detail: `${removed} available credits removed${debt ? `; ${debt} credit debt recorded` : ""}.`,
+        createdAt: now,
+      });
+      output.creditsRemoved = removed;
+      output.creditDebt = wallet.debt;
+    });
+    return output;
+  }
+
+  function updateRate(feature, input = {}, actorId = "system") {
+    const normalized = normalizeStatus(feature);
+    const base = DEFAULT_RATE_CARD.find((item) => item.feature === normalized);
+    if (!base) throw httpError(404, "Credit rate not found.");
+    const value = Number(input.creditsPerUnit);
+    if (!Number.isFinite(value) || value < 0 || value > 100000) {
+      throw httpError(400, "creditsPerUnit must be a non-negative number.");
+    }
+    const now = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      draft.creditRateCard[normalized] = {
+        ...(draft.creditRateCard[normalized] || {}),
+        creditsPerUnit: roundCredits(value),
+        billable: input.billable === undefined
+          ? draft.creditRateCard[normalized]?.billable ?? base.billable
+          : Boolean(input.billable),
+        updatedBy: clean(actorId),
+        updatedAt: now,
+      };
+      appendActivity(draft, {
+        workspaceId: CODESYNC_WORKSPACE_ID,
+        actorId: clean(actorId),
+        type: "credit_rate_updated",
+        title: `${base.label} credit rate updated to ${roundCredits(value)} credits per ${base.unit}`,
+        createdAt: now,
+      });
+    });
+    return getRate(normalized);
+  }
+
+  function updatePack(packId, input = {}, actorId = "system") {
+    const id = clean(packId);
+    const base = DEFAULT_CREDIT_PACKS.find((item) => item.id === id);
+    if (!base) throw httpError(404, "Credit pack not found.");
+    const amountMinor = Number(input.amountMinor);
+    const credits = Number(input.credits ?? base.credits);
+    if (!Number.isFinite(credits) || credits <= 0) throw httpError(400, "Pack credits must be greater than zero.");
+    if (input.active === true && (!Number.isFinite(amountMinor) || amountMinor <= 0)) {
+      throw httpError(400, "Configure a positive Safepay amount before activating a credit pack.");
+    }
+    const now = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+      let target = draft.creditPacks.find((item) => item.id === id);
+      if (!target) {
+        target = { id };
+        draft.creditPacks.push(target);
+      }
+      Object.assign(target, {
+        credits: Math.round(credits),
+        amountMinor: Number.isFinite(amountMinor) && amountMinor > 0 ? Math.round(amountMinor) : null,
+        currency: clean(input.currency || base.currency).toUpperCase(),
+        market: clean(input.market || base.market).toUpperCase(),
+        active: Boolean(input.active),
+        updatedBy: clean(actorId),
+        updatedAt: now,
+      });
+      appendActivity(draft, {
+        workspaceId: CODESYNC_WORKSPACE_ID,
+        actorId: clean(actorId),
+        type: "credit_pack_updated",
+        title: `${id} credit pack ${target.active ? "activated/updated" : "updated/disabled"}`,
+        createdAt: now,
+      });
+    });
+    return getCreditPacks().find((item) => item.id === id);
+  }
+
+  function adjustWorkspaceCredits(workspaceId, input = {}, actorId = "system") {
+    const id = clean(workspaceId);
+    ensureWorkspaceWallet(id, actorId);
+    const delta = Number(input.delta);
+    if (!Number.isFinite(delta) || delta === 0 || Math.abs(delta) > 1_000_000) {
+      throw httpError(400, "Credit adjustment delta must be a non-zero number within the allowed range.");
+    }
+    const reason = clean(input.reason);
+    if (!reason) throw httpError(400, "A reason is required for manual credit adjustments.");
+    let output = null;
+    store.update((draft) => {
+      ensureStateShape(draft);
+      const wallet = draft.creditWallets.find((item) => item.workspaceId === id);
+      if (!wallet) throw httpError(404, "Credit wallet not found.");
+      if (delta < 0 && creditNumber(wallet.balance) + delta < 0) {
+        throw httpError(409, "This adjustment would make the available credit balance negative.");
+      }
+      const now = new Date().toISOString();
+      wallet.balance = roundCredits(creditNumber(wallet.balance) + delta);
+      if (delta > 0) wallet.totalGranted = roundCredits(creditNumber(wallet.totalGranted) + delta);
+      wallet.updatedAt = now;
+      draft.creditLedger.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: id,
+        type: "admin_adjustment",
+        delta: roundCredits(delta),
+        balanceAfter: wallet.balance,
+        reservedAfter: creditNumber(wallet.reserved),
+        actorId: clean(actorId),
+        description: reason.slice(0, 1000),
+        createdAt: now,
+      });
+      appendActivity(draft, {
+        workspaceId: CODESYNC_WORKSPACE_ID,
+        actorId: clean(actorId),
+        targetWorkspaceId: id,
+        type: "credit_balance_adjusted",
+        title: `Workspace ${id} credits adjusted by ${roundCredits(delta)}`,
+        detail: reason.slice(0, 1000),
+        createdAt: now,
+      });
+      output = { ...wallet };
+    });
+    return publicWallet(output);
+  }
+
+  function getAdminSnapshot(accounts = []) {
+    const latest = store.read();
+    const accountByWorkspace = new Map(accounts.map((item) => [item.workspaceId, item]));
+    const storedWallets = new Map(
+      (latest.creditWallets || []).map((wallet) => [wallet.workspaceId, wallet])
+    );
+    const wallets = accounts
+      .filter((account) => account.workspaceId)
+      .map((account) => {
+        const wallet = storedWallets.get(account.workspaceId);
+        return {
+          ...publicWallet(wallet || { workspaceId: account.workspaceId }),
+          accountName: account.displayName || account.workspaceId,
+          testGrantPending: Boolean(!wallet?.testGrantAppliedAt && isTestGrantEnabled()),
+        };
+      });
+    const purchases = (latest.creditPurchases || []).map((purchase) => ({
+      ...publicPurchase(purchase),
+      accountName: accountByWorkspace.get(purchase.workspaceId)?.displayName || purchase.workspaceId,
+    }));
+    const usage = (latest.creditUsageEvents || []).map((item) => ({
+      ...publicUsage(item),
+      accountName: accountByWorkspace.get(item.workspaceId)?.displayName || item.workspaceId,
+    }));
+    const revenueByCurrency = {};
+    for (const purchase of purchases.filter((item) => item.status === "succeeded")) {
+      const currency = clean(purchase.currency || "USD").toUpperCase();
+      revenueByCurrency[currency] = (revenueByCurrency[currency] || 0) + Number(purchase.amountMinor || 0);
+    }
+    const usageByFeature = new Map();
+    for (const item of usage) {
+      const current = usageByFeature.get(item.feature) || { feature: item.feature, quantity: 0, credits: 0 };
+      current.quantity += Number(item.quantity || 0);
+      current.credits += Number(item.credits || 0);
+      usageByFeature.set(item.feature, current);
+    }
+    const aiCallWallets = (latest.aiCallCreditWallets || []).map(publicAiCallWallet);
+    const aiCallUsage = (latest.aiCallCreditUsageEvents || []).map((item) => ({ ...item }));
+
+    return {
+      freeTestCredits: isTestGrantEnabled() ? TEST_CREDIT_GRANT : 0,
+      aiCallTestCredits: AI_CALL_TEST_CREDIT_GRANT,
+      aiCallSignupFreeCredits: getAiCallSignupFreeCredits(),
+      aiCallPolicy: getAiCallPolicy(),
+      aiCallWallets,
+      aiCallUsage: aiCallUsage.sort(byNewest).slice(0, 500),
+      totalAiCallCreditsAvailable: aiCallWallets.reduce((sum, item) => sum + wholeCredits(item.balance), 0),
+      totalAiCallCreditsConsumed: aiCallWallets.reduce((sum, item) => sum + wholeCredits(item.totalConsumed), 0),
+      testGrantEnabled: isTestGrantEnabled(),
+      wallets: wallets.sort((a, b) => b.balance - a.balance),
+      purchases: purchases.sort(byNewest).slice(0, 300),
+      usage: usage.sort(byNewest).slice(0, 500),
+      rateCard: getRateCard(),
+      packs: getCreditPacks(),
+      revenueByCurrency,
+      totalAvailableCredits: roundCredits(wallets.reduce((sum, item) => sum + Number(item.balance || 0), 0)),
+      totalReservedCredits: roundCredits(wallets.reduce((sum, item) => sum + Number(item.reserved || 0), 0)),
+      totalPurchasedCredits: roundCredits(wallets.reduce((sum, item) => sum + Number(item.totalPurchased || 0), 0)),
+      totalConsumedCredits: roundCredits(wallets.reduce((sum, item) => sum + Number(item.totalConsumed || 0), 0)),
+      walletsWithDebt: wallets.filter((item) => Number(item.debt || 0) > 0).length,
+      successfulPurchases: purchases.filter((item) => item.status === "succeeded").length,
+      usageByFeature: [...usageByFeature.values()].sort((a, b) => b.credits - a.credits),
+      safepayConfigured: Boolean(clean(process.env.SAFEPAY_SECRET_KEY) && clean(process.env.SAFEPAY_PUBLIC_KEY)),
+      environment: getSafepayEnvironment(),
+    };
+  }
+
+  return {
+    getBillingDashboard,
+    getAiCallCreditSnapshot,
+    getAiCallCreditPacks,
+    getAiCallSignupFreeCredits,
+    ensureAiCallCreditWallet,
+    grantAiCallSignupCredits,
+    assertAiCallCreditAvailable,
+    grantAiCallTestCredits,
+    consumeConnectedAiCall,
+    createCreditCheckout,
+    createAiCallCreditCheckout,
+    handleSafepayWebhook,
+    ensureWorkspaceWallet,
+    reserveUsage,
+    commitUsage,
+    releaseUsage,
+    consumeUsage,
+    getRateCard,
+    getRate,
+    getCreditPacks,
+    updateRate,
+    updatePack,
+    adjustWorkspaceCredits,
+    getAdminSnapshot,
+  };
+}
+
+async function getSafepayClient() {
+  const secretKey = requireEnv("SAFEPAY_SECRET_KEY");
+  const host = clean(process.env.SAFEPAY_HOST) || (
+    getSafepayEnvironment() === "production"
+      ? "https://api.getsafepay.com"
+      : "https://sandbox.api.getsafepay.com"
+  );
+  let imported;
+  try {
+    imported = await import("@sfpy/node-core");
+  } catch (error) {
+    throw httpError(
+      503,
+      "Safepay SDK is not installed. Run npm install @sfpy/node-core on the ReachFly API.",
+      "SAFEPAY_SDK_MISSING"
+    );
+  }
+  const factory = imported?.default || imported;
+  if (typeof factory !== "function") {
+    throw httpError(503, "Safepay SDK could not be initialized.", "SAFEPAY_SDK_INVALID");
+  }
+  return factory(secretKey, { authType: "secret", host });
+}
+
+function requireEnv(name) {
+  const value = clean(process.env[name]);
+  if (!value) throw httpError(503, `${name} is required for Safepay billing.`, "BILLING_NOT_CONFIGURED");
+  return value;
+}
+
+
+function isTestGrantEnabled() {
+  const configured = String(process.env.CREDIT_TEST_GRANT_ENABLED ?? "").trim().toLowerCase();
+  if (configured) return ["1", "true", "yes", "on"].includes(configured);
+  return getSafepayEnvironment() !== "production";
+}
+
+function isAiCallSignupBackfillEnabled() {
+  const configured = String(
+    process.env.AI_CALL_SIGNUP_FREE_CREDITS_BACKFILL ?? ""
+  ).trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(configured);
+}
+
+function isAiCallTestGrantEnabled() {
+  const configured = String(process.env.AI_CALL_TEST_GRANT_ENABLED ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(configured);
+}
+
+function getSafepayEnvironment() {
+  return normalizeStatus(process.env.SAFEPAY_ENV || DEFAULT_ENVIRONMENT) === "production"
+    ? "production"
+    : "sandbox";
+}
+
+function normalizeCheckoutReturnPath(value, fallback = "/app/billing") {
+  const raw = clean(value);
+  if (!raw) return fallback;
+  if (!raw.startsWith("/") || raw.startsWith("//")) return fallback;
+  if (/^[\s\u0000-\u001f]*javascript:/i.test(raw)) return fallback;
+  return raw.slice(0, 500);
+}
+
+function buildCheckoutReturnUrl(path, params = {}) {
+  const base = new URL(normalizeCheckoutReturnPath(path), `${getAppUrl()}/`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && String(value) !== "") {
+      base.searchParams.set(key, String(value));
+    }
+  }
+  return base.toString();
+}
+
+function getAppUrl() {
+  return String(process.env.APP_URL || "https://www.reachflyai.com").trim().replace(/\/+$/, "");
+}
+
+function safeEqualHex(left, right) {
+  const a = Buffer.from(String(left || "").trim().toLowerCase(), "utf8");
+  const b = Buffer.from(String(right || "").trim().toLowerCase(), "utf8");
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+
+function normalizeEventType(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function publicWallet(wallet = {}) {
+  return {
+    id: wallet.id || "",
+    workspaceId: wallet.workspaceId || "",
+    balance: creditNumber(wallet.balance),
+    reserved: creditNumber(wallet.reserved),
+    debt: creditNumber(wallet.debt),
+    totalGranted: creditNumber(wallet.totalGranted),
+    totalPurchased: creditNumber(wallet.totalPurchased),
+    totalConsumed: creditNumber(wallet.totalConsumed),
+    testGrantAppliedAt: wallet.testGrantAppliedAt || "",
+    updatedAt: wallet.updatedAt || "",
+  };
+}
+
+function publicAiCallWallet(wallet = {}) {
+  return {
+    id: wallet.id || "",
+    workspaceId: wallet.workspaceId || "",
+    balance: wholeCredits(wallet.balance),
+    totalGranted: wholeCredits(wallet.totalGranted),
+    totalPurchased: wholeCredits(wallet.totalPurchased),
+    totalConsumed: wholeCredits(wallet.totalConsumed),
+    debt: wholeCredits(wallet.debt),
+    testGrantAppliedAt: wallet.testGrantAppliedAt || "",
+    signupGrantAppliedAt: wallet.signupGrantAppliedAt || "",
+    createdAt: wallet.createdAt || "",
+    updatedAt: wallet.updatedAt || "",
+  };
+}
+
+function publicPurchase(item = {}) {
+  return {
+    id: item.id || "",
+    workspaceId: item.workspaceId || "",
+    packId: item.packId || "",
+    credits: creditNumber(item.credits),
+    amountMinor: Number(item.amountMinor || 0),
+    currency: clean(item.currency || "USD").toUpperCase(),
+    status: normalizeStatus(item.status || "unknown"),
+    provider: item.provider || "safepay",
+    providerTracker: item.providerTracker || "",
+    createdAt: item.createdAt || "",
+    paidAt: item.paidAt || "",
+    error: item.error || "",
+  };
+}
+
+function publicAiCallPurchase(item = {}) {
+  return {
+    id: item.id || "",
+    workspaceId: item.workspaceId || "",
+    packId: item.packId || "",
+    credits: wholeCredits(item.credits),
+    amountMinor: Number(item.amountMinor || 0),
+    currency: clean(item.currency || AI_CALL_DEFAULT_CURRENCY).toUpperCase(),
+    status: normalizeStatus(item.status || "unknown"),
+    provider: item.provider || "safepay",
+    providerTracker: item.providerTracker || "",
+    createdAt: item.createdAt || "",
+    paidAt: item.paidAt || "",
+    error: item.error || "",
+  };
+}
+
+function publicUsage(item = {}) {
+  return {
+    id: item.id || "",
+    workspaceId: item.workspaceId || "",
+    feature: item.feature || "",
+    unit: item.unit || "",
+    quantity: creditNumber(item.quantity),
+    creditsPerUnit: creditNumber(item.creditsPerUnit),
+    credits: creditNumber(item.credits),
+    createdAt: item.createdAt || "",
+    metadata: item.metadata || {},
+  };
+}
+
+function sanitizeMetadata(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const output = {};
+  for (const [key, raw] of Object.entries(value).slice(0, 30)) {
+    const safeKey = clean(key).slice(0, 80);
+    if (!safeKey) continue;
+    if (raw == null || ["string", "number", "boolean"].includes(typeof raw)) {
+      output[safeKey] = typeof raw === "string" ? raw.slice(0, 1000) : raw;
+    }
+  }
+  return output;
+}
+
+function positiveNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
+function uniqueNumbers(values = []) {
+  return [...new Set(values.map((value) => wholeCredits(value)).filter(Boolean))];
+}
+
+function wholeCredits(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
+}
+
+function creditNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? roundCredits(number) : 0;
+}
+
+function roundCredits(value) {
+  return Math.round(Number(value || 0) * 1000) / 1000;
+}
+
+function byNewest(left, right) {
+  return String(right.createdAt || right.updatedAt || "").localeCompare(
+    String(left.createdAt || left.updatedAt || "")
+  );
+}
+
+function clean(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeStatus(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function httpError(statusCode, message, code = "", details = null) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  if (code) error.code = code;
+  if (details) error.details = details;
+  return error;
+}
+
+export const CREDIT_BILLING_DEFAULTS = {
+  testCreditGrant: TEST_CREDIT_GRANT,
+  aiCallTestCreditGrant: AI_CALL_TEST_CREDIT_GRANT,
+  aiCallConnectedCreditCost: AI_CALL_CONNECTED_CREDIT_COST,
+  aiCallDefaultPriceMinor: AI_CALL_DEFAULT_PRICE_MINOR,
+  aiCallDefaultCurrency: AI_CALL_DEFAULT_CURRENCY,
+  aiCallDefaultPackCredits: AI_CALL_DEFAULT_PACK_CREDITS,
+  rateCard: DEFAULT_RATE_CARD,
+  packs: DEFAULT_CREDIT_PACKS,
+  codesyncWorkspaceId: CODESYNC_WORKSPACE_ID,
+};
