@@ -4034,9 +4034,20 @@ export function createTelnyxAIAgentService({
             ACTIVE_CALL_STATUSES.has(normalizeStatus(item.status)) &&
             !item.aiCallCreditSettledAt
         ).length;
+        const creditsPerConnectedMinute = Math.max(
+          1,
+          Number(
+            process.env
+              .AI_CALL_CONNECTED_CREDITS_PER_MINUTE ||
+              10
+          ) || 10
+        );
+
         creditBillingService.assertAiCallCreditAvailable({
           workspaceId: ctx.workspaceId,
-          requiredCredits: unsettledActiveCalls + 1,
+          requiredCredits:
+            (unsettledActiveCalls + 1) *
+            creditsPerConnectedMinute,
         });
       } catch (error) {
         return failQueueItem(queueItem.id, error.message);

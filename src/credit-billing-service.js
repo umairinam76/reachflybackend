@@ -4,11 +4,21 @@ const CODESYNC_WORKSPACE_ID = "codesync-labs-workspace";
 const TEST_CREDIT_GRANT = 1000;
 const AI_CALL_TEST_CREDIT_GRANT = 30;
 const AI_CALL_SIGNUP_FREE_CREDITS_DEFAULT = 10;
-const AI_CALL_CONNECTED_CREDIT_COST = 1;
+const AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT = 10;
+const AI_CALL_CONNECTED_CREDIT_COST =
+  AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT;
 const AI_CALL_DEFAULT_PRICE_MINOR = 100;
 const AI_CALL_DEFAULT_CURRENCY = "USD";
 const AI_CALL_DEFAULT_PACK_CREDITS = [25, 50, 100];
 const DEFAULT_ENVIRONMENT = "sandbox";
+
+const UNIFIED_CREDIT_STANDARD_PRICE_MINOR_DEFAULT = 4;
+const UNIFIED_CREDIT_GROWTH_PRICE_MINOR_DEFAULT = 3;
+const UNIFIED_CREDIT_SCALE_PRICE_MINOR_DEFAULT = 2;
+const UNIFIED_CREDIT_GROWTH_THRESHOLD_DEFAULT = 2500;
+const UNIFIED_CREDIT_SCALE_THRESHOLD_DEFAULT = 5000;
+const UNIFIED_CREDIT_MIN_PURCHASE_DEFAULT = 100;
+const UNIFIED_CREDIT_MAX_PURCHASE_DEFAULT = 100000;
 
 const DEFAULT_RATE_CARD = [
   {
@@ -66,6 +76,14 @@ const DEFAULT_RATE_CARD = [
     creditsPerUnit: 2,
     billable: true,
     description: "Charged only after a successful ReachFly AI command response.",
+  },
+  {
+    feature: "ai_connected_call",
+    label: "AI calling",
+    unit: "connected_minute",
+    creditsPerUnit: AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT,
+    billable: true,
+    description: "Connected AI calling is billed from the shared ReachFly balance by connected time.",
   },
 ];
 
@@ -215,28 +233,61 @@ export function createCreditBillingService({ store, workspaceService, externalSa
   }
 
   function getAiCallPolicy() {
-    const configuredDuration = Number(process.env.AI_CALL_MAX_CONNECTED_SECONDS);
-    const maxConnectedSeconds = Number.isFinite(configuredDuration) && configuredDuration > 0
-      ? Math.round(configuredDuration)
-      : null;
-    const configuredPrice = Number(process.env.AI_CALL_CONNECTED_PRICE_MINOR);
-    const connectedCallPriceMinor = Number.isFinite(configuredPrice) && configuredPrice > 0
-      ? Math.round(configuredPrice)
-      : AI_CALL_DEFAULT_PRICE_MINOR;
-    const currency = clean(process.env.AI_CALL_CONNECTED_CURRENCY || AI_CALL_DEFAULT_CURRENCY).toUpperCase();
+    const configuredDuration = Number(
+      process.env.AI_CALL_MAX_CONNECTED_SECONDS
+    );
+
+    const maxConnectedSeconds =
+      Number.isFinite(configuredDuration) &&
+      configuredDuration > 0
+        ? Math.round(configuredDuration)
+        : null;
+
+    const configuredCreditsPerMinute = Number(
+      process.env.AI_CALL_CONNECTED_CREDITS_PER_MINUTE
+    );
+
+    const creditsPerConnectedMinute =
+      Number.isFinite(configuredCreditsPerMinute) &&
+      configuredCreditsPerMinute > 0
+        ? roundCredits(configuredCreditsPerMinute)
+        : AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT;
+
+    const configuredPrice = Number(
+      process.env.AI_CALL_CONNECTED_PRICE_MINOR
+    );
+
+    const connectedCallPriceMinor =
+      Number.isFinite(configuredPrice) &&
+      configuredPrice > 0
+        ? Math.round(configuredPrice)
+        : AI_CALL_DEFAULT_PRICE_MINOR;
+
+    const currency = clean(
+      process.env.AI_CALL_CONNECTED_CURRENCY ||
+      AI_CALL_DEFAULT_CURRENCY
+    ).toUpperCase();
 
     return {
-      walletType: "ai_call_credits",
-      billingUnit: "connected_call",
-      creditsPerConnectedCall: AI_CALL_CONNECTED_CREDIT_COST,
+      walletType: "workspace_credits",
+      billingUnit: "connected_minute",
+      creditsPerConnectedMinute,
+      creditsPerConnectedCall:
+        creditsPerConnectedMinute,
       signupFreeCredits: getAiCallSignupFreeCredits(),
-      testCreditGrant: isAiCallTestGrantEnabled() ? AI_CALL_TEST_CREDIT_GRANT : 0,
-      testCreditGrantEnabled: isAiCallTestGrantEnabled(),
+      testCreditGrant:
+        isAiCallTestGrantEnabled()
+          ? AI_CALL_TEST_CREDIT_GRANT
+          : 0,
+      testCreditGrantEnabled:
+        isAiCallTestGrantEnabled(),
       connectedCallPriceMinor,
       currency,
       maxConnectedSeconds,
-      durationPolicyConfigured: Boolean(maxConnectedSeconds),
-      chargingRule: "One AI call credit is consumed only after a completed call has positive duration and evidence that the prospect participated.",
+      durationPolicyConfigured:
+        Boolean(maxConnectedSeconds),
+      chargingRule:
+        `${creditsPerConnectedMinute} ReachFly credits per connected minute, prorated by connected seconds and settled after a completed conversation.`,
     };
   }
 
@@ -392,75 +443,217 @@ export function createCreditBillingService({ store, workspaceService, externalSa
   } = {}) {
     const id = clean(workspaceId);
     const normalizedCallId = clean(callId);
-    if (!id) throw httpError(400, "Workspace is required for AI call credits.", "WORKSPACE_REQUIRED");
-    if (!normalizedCallId) throw httpError(400, "callId is required for AI call credit settlement.", "CALL_ID_REQUIRED");
-    ensureAiCallCreditWallet(id);
+
+    if (!id) {
+      throw httpError(
+        400,
+        "Workspace is required for AI calling credits.",
+        "WORKSPACE_REQUIRED"
+      );
+    }
+
+    if (!normalizedCallId) {
+      throw httpError(
+        400,
+        "callId is required for AI call credit settlement.",
+        "CALL_ID_REQUIRED"
+      );
+    }
+
+    migrateLegacyAiBalance(id, actorId);
+
+    const rate =
+      getRate("ai_connected_call");
+
+    const duration = Math.max(
+      0,
+      Math.round(
+        Number(durationSeconds) ||
+        0
+      )
+    );
+
+    const connectedMinutes =
+      roundCredits(
+        duration / 60
+      );
+
+    const creditsPerMinute =
+      Math.max(
+        AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT,
+        creditNumber(
+          rate.creditsPerUnit
+        )
+      );
+
+    const required =
+      rate.billable
+        ? roundCredits(
+            connectedMinutes *
+            creditsPerMinute
+          )
+        : 0;
 
     let output = null;
+
     store.update((draft) => {
       ensureStateShape(draft);
-      const existing = draft.aiCallCreditUsageEvents.find(
-        (item) => item.workspaceId === id && item.callId === normalizedCallId
-      );
+
+      const existing =
+        draft.creditUsageEvents.find(
+          (item) =>
+            item.workspaceId === id &&
+            item.feature === "ai_connected_call" &&
+            item.metadata?.callId === normalizedCallId
+        );
+
       if (existing) {
-        output = { ...existing, reused: true };
+        const wallet =
+          draft.creditWallets.find(
+            (item) => item.workspaceId === id
+          );
+
+        output = {
+          ...existing,
+          reused: true,
+          balance:
+            creditNumber(wallet?.balance),
+        };
+
         return;
       }
 
-      const wallet = draft.aiCallCreditWallets.find((item) => item.workspaceId === id);
-      if (!wallet) throw httpError(500, "AI call credit wallet not found.");
-      if (wholeCredits(wallet.balance) < AI_CALL_CONNECTED_CREDIT_COST) {
+      const wallet =
+        draft.creditWallets.find(
+          (item) => item.workspaceId === id
+        );
+
+      if (!wallet) {
         throw httpError(
-          402,
-          `Not enough AI call credits. ${AI_CALL_CONNECTED_CREDIT_COST} credit is required for a connected call; ${wholeCredits(wallet.balance)} are available.`,
-          "INSUFFICIENT_AI_CALL_CREDITS",
-          { requiredCredits: AI_CALL_CONNECTED_CREDIT_COST, availableCredits: wholeCredits(wallet.balance) }
+          500,
+          "Unified credit wallet not found."
         );
       }
 
-      const policy = getAiCallPolicy();
-      const duration = Math.max(0, Math.round(Number(durationSeconds) || 0));
-      const now = new Date().toISOString();
-      wallet.balance = wholeCredits(wallet.balance) - AI_CALL_CONNECTED_CREDIT_COST;
-      wallet.totalConsumed = wholeCredits(wallet.totalConsumed) + AI_CALL_CONNECTED_CREDIT_COST;
+      if (
+        creditNumber(wallet.balance) <
+        required
+      ) {
+        throw httpError(
+          402,
+          `Not enough ReachFly credits. ${required} credits required for ${connectedMinutes} connected minute${connectedMinutes === 1 ? "" : "s"}; ${creditNumber(wallet.balance)} available.`,
+          "INSUFFICIENT_CREDITS",
+          {
+            requiredCredits:
+              required,
+            availableCredits:
+              creditNumber(
+                wallet.balance
+              ),
+            feature:
+              "ai_connected_call",
+            durationSeconds:
+              duration,
+            connectedMinutes,
+            creditsPerConnectedMinute:
+              creditsPerMinute,
+          }
+        );
+      }
+
+      const now =
+        new Date().toISOString();
+
+      wallet.balance =
+        roundCredits(
+          creditNumber(
+            wallet.balance
+          ) -
+          required
+        );
+
+      wallet.totalConsumed =
+        roundCredits(
+          creditNumber(
+            wallet.totalConsumed
+          ) +
+          required
+        );
+
       wallet.updatedAt = now;
 
       const usage = {
         id: crypto.randomUUID(),
         workspaceId: id,
-        callId: normalizedCallId,
-        unit: "connected_call",
-        credits: AI_CALL_CONNECTED_CREDIT_COST,
-        durationSeconds: duration,
-        overDurationPolicy: Boolean(policy.maxConnectedSeconds && duration > policy.maxConnectedSeconds),
-        metadata: sanitizeMetadata(metadata),
-        actorId: clean(actorId) || "system",
+        feature: "ai_connected_call",
+        unit: "connected_minute",
+        quantity: connectedMinutes,
+        creditsPerUnit:
+          creditsPerMinute,
+        credits: required,
+        metadata: {
+          ...sanitizeMetadata(metadata),
+          callId:
+            normalizedCallId,
+          durationSeconds:
+            duration,
+          connectedMinutes,
+        },
+        actorId:
+          clean(actorId) ||
+          "system",
         createdAt: now,
       };
-      draft.aiCallCreditUsageEvents.unshift(usage);
-      if (draft.aiCallCreditUsageEvents.length > 5000) draft.aiCallCreditUsageEvents.splice(5000);
 
-      draft.aiCallCreditLedger.unshift({
+      draft.creditUsageEvents.unshift(
+        usage
+      );
+
+      draft.creditLedger.unshift({
         id: crypto.randomUUID(),
         workspaceId: id,
-        callId: normalizedCallId,
-        type: "connected_call",
-        delta: -AI_CALL_CONNECTED_CREDIT_COST,
-        balanceAfter: wallet.balance,
-        durationSeconds: duration,
+        callId:
+          normalizedCallId,
+        type: "usage",
+        feature:
+          "ai_connected_call",
+        delta: -required,
+        balanceAfter:
+          wallet.balance,
+        reservedAfter:
+          creditNumber(
+            wallet.reserved
+          ),
+        quantity:
+          connectedMinutes,
+        creditsPerUnit:
+          creditsPerMinute,
+        creditsConsumed:
+          required,
+        actorId:
+          clean(actorId) ||
+          "system",
         createdAt: now,
       });
-      if (draft.aiCallCreditLedger.length > 5000) draft.aiCallCreditLedger.splice(5000);
 
       appendActivity(draft, {
         workspaceId: id,
-        actorId: clean(actorId) || "system",
-        type: "ai_call_credit_consumed",
-        title: "AI call credit consumed",
-        detail: `Connected call ${normalizedCallId}`,
+        actorId:
+          clean(actorId) ||
+          "system",
+        type:
+          "ai_call_credit_consumed",
+        title:
+          "ReachFly credits consumed for connected AI calling",
+        detail:
+          `${connectedMinutes} connected minute${connectedMinutes === 1 ? "" : "s"} · ${required} credits`,
       });
 
-      output = { ...usage, balance: wallet.balance };
+      output = {
+        ...usage,
+        balance:
+          wallet.balance,
+      };
     });
 
     return output;
@@ -512,41 +705,83 @@ export function createCreditBillingService({ store, workspaceService, externalSa
     }));
   }
 
-  function assertAiCallCreditAvailable({ workspaceId, requiredCredits = AI_CALL_CONNECTED_CREDIT_COST } = {}) {
+  function assertAiCallCreditAvailable({
+    workspaceId,
+    requiredCredits = AI_CALL_CONNECTED_CREDIT_COST,
+  } = {}) {
     const id = clean(workspaceId);
-    if (!id) throw httpError(400, "Workspace is required for AI call credits.", "WORKSPACE_REQUIRED");
-    const wallet = ensureAiCallCreditWallet(id);
-    const required = Math.max(1, wholeCredits(requiredCredits));
-    const available = wholeCredits(wallet.balance);
+
+    if (!id) {
+      throw httpError(
+        400,
+        "Workspace is required for AI calling credits.",
+        "WORKSPACE_REQUIRED"
+      );
+    }
+
+    migrateLegacyAiBalance(id, "system");
+
+    const wallet = ensureWorkspaceWallet(id);
+    const required = Math.max(
+      AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT,
+      creditNumber(requiredCredits)
+    );
+    const available = creditNumber(wallet.balance);
+
     if (available < required) {
       throw httpError(
         402,
-        `Not enough AI call credits. ${required} credit${required === 1 ? "" : "s"} required; ${available} available.`,
-        "INSUFFICIENT_AI_CALL_CREDITS",
-        { requiredCredits: required, availableCredits: available }
+        `Not enough ReachFly credits. ${required} credit${required === 1 ? "" : "s"} required; ${available} available.`,
+        "INSUFFICIENT_CREDITS",
+        {
+          requiredCredits: required,
+          availableCredits: available,
+          feature: "ai_connected_call",
+        }
       );
     }
-    return { ok: true, requiredCredits: required, availableCredits: available, wallet };
+
+    return {
+      ok: true,
+      unified: true,
+      requiredCredits: required,
+      availableCredits: available,
+      wallet: publicWallet(wallet),
+    };
   }
 
   function getAiCallCreditSnapshot(user) {
     const state = store.read();
     const ctx = getWorkspaceContext(user, state);
-    if (!ctx.workspaceId) throw httpError(401, "AI calling workspace could not be resolved.");
-    let wallet = ensureAiCallCreditWallet(ctx.workspaceId);
-    if (
-      isAiCallSignupBackfillEnabled() &&
-      ctx.workspaceId !== CODESYNC_WORKSPACE_ID &&
-      !wallet.signupGrantAppliedAt &&
-      wholeCredits(wallet.totalGranted) === 0 &&
-      wholeCredits(wallet.totalPurchased) === 0 &&
-      wholeCredits(wallet.totalConsumed) === 0
-    ) {
-      wallet = grantAiCallSignupCredits(ctx.workspaceId, user?.id || "system");
+
+    if (!ctx.workspaceId) {
+      throw httpError(
+        401,
+        "AI calling workspace could not be resolved."
+      );
     }
+
+    const migration = migrateLegacyAiBalance(
+      ctx.workspaceId,
+      user?.id || "system"
+    );
+
     const latest = store.read();
-    const ownerLike = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
-    const codesyncWorkspace = ctx.workspaceId === CODESYNC_WORKSPACE_ID;
+    const wallet = publicWallet(
+      latest.creditWallets.find(
+        (item) => item.workspaceId === ctx.workspaceId
+      ) ||
+        migration?.wallet ||
+        {}
+    );
+
+    const ownerLike =
+      ["owner", "admin"].includes(ctx.role) ||
+      ctx.accountType === "individual";
+
+    const codesyncWorkspace =
+      ctx.workspaceId === CODESYNC_WORKSPACE_ID;
+
     const hasActivePurchasedNumber =
       codesyncWorkspace ||
       (latest.voicePhoneNumbers || []).some(
@@ -559,30 +794,308 @@ export function createCreditBillingService({ store, workspaceService, externalSa
             clean(item.source) === "existing_number"
           )
       );
+
     return {
+      unified: true,
       wallet,
-      policy: getAiCallPolicy(),
+      policy: {
+        ...getAiCallPolicy(),
+        walletType: "workspace_credits",
+        unified: true,
+      },
       requiresPurchasedNumber: !codesyncWorkspace,
       hasActivePurchasedNumber,
-      packs: getAiCallCreditPacks().filter((item) => item.active),
-      purchases: (latest.aiCallCreditPurchases || [])
-        .filter((item) => item.workspaceId === ctx.workspaceId)
-        .sort(byNewest)
-        .slice(0, 50)
-        .map(publicAiCallPurchase),
+      packs: [],
+      purchases: [],
       canPurchase: ownerLike,
-      signupFreeCredits: getAiCallSignupFreeCredits(),
-      signupGrantApplied: Boolean(wallet.signupGrantAppliedAt),
-      testGrantAvailable: Boolean(isAiCallTestGrantEnabled() && !wallet.testGrantAppliedAt),
-      usage: (latest.aiCallCreditUsageEvents || [])
-        .filter((item) => item.workspaceId === ctx.workspaceId)
+      signupFreeCredits: 0,
+      signupGrantApplied: true,
+      testGrantAvailable: false,
+      usage: (latest.creditUsageEvents || [])
+        .filter(
+          (item) =>
+            item.workspaceId === ctx.workspaceId &&
+            item.feature === "ai_connected_call"
+        )
         .sort(byNewest)
         .slice(0, 100),
-      ledger: (latest.aiCallCreditLedger || [])
-        .filter((item) => item.workspaceId === ctx.workspaceId)
+      ledger: (latest.creditLedger || [])
+        .filter(
+          (item) =>
+            item.workspaceId === ctx.workspaceId &&
+            item.feature === "ai_connected_call"
+        )
         .sort(byNewest)
         .slice(0, 100),
+      legacyConsumed: migration?.legacyConsumed || 0,
     };
+  }
+
+  function getUnifiedCreditPricing() {
+    const standardConfigured = Number(
+      process.env.UNIFIED_CREDIT_STANDARD_PRICE_MINOR ||
+      process.env.UNIFIED_CREDIT_REGULAR_PRICE_MINOR
+    );
+
+    const growthConfigured = Number(
+      process.env.UNIFIED_CREDIT_GROWTH_PRICE_MINOR
+    );
+
+    const scaleConfigured = Number(
+      process.env.UNIFIED_CREDIT_SCALE_PRICE_MINOR
+    );
+
+    const growthThresholdConfigured = Number(
+      process.env.UNIFIED_CREDIT_GROWTH_THRESHOLD
+    );
+
+    const scaleThresholdConfigured = Number(
+      process.env.UNIFIED_CREDIT_SCALE_THRESHOLD
+    );
+
+    const standardUnitPriceMinor =
+      Number.isFinite(standardConfigured) &&
+      standardConfigured > 0
+        ? Math.round(standardConfigured)
+        : UNIFIED_CREDIT_STANDARD_PRICE_MINOR_DEFAULT;
+
+    const growthUnitPriceMinor =
+      Number.isFinite(growthConfigured) &&
+      growthConfigured > 0
+        ? Math.round(growthConfigured)
+        : UNIFIED_CREDIT_GROWTH_PRICE_MINOR_DEFAULT;
+
+    const scaleUnitPriceMinor =
+      Number.isFinite(scaleConfigured) &&
+      scaleConfigured > 0
+        ? Math.round(scaleConfigured)
+        : UNIFIED_CREDIT_SCALE_PRICE_MINOR_DEFAULT;
+
+    const growthThreshold =
+      Number.isFinite(growthThresholdConfigured) &&
+      growthThresholdConfigured > 0
+        ? Math.round(growthThresholdConfigured)
+        : UNIFIED_CREDIT_GROWTH_THRESHOLD_DEFAULT;
+
+    const scaleThreshold =
+      Number.isFinite(scaleThresholdConfigured) &&
+      scaleThresholdConfigured > growthThreshold
+        ? Math.round(scaleThresholdConfigured)
+        : UNIFIED_CREDIT_SCALE_THRESHOLD_DEFAULT;
+
+    const minConfigured = Number(
+      process.env.UNIFIED_CREDIT_MIN_PURCHASE
+    );
+
+    const maxConfigured = Number(
+      process.env.UNIFIED_CREDIT_MAX_PURCHASE
+    );
+
+    const minPurchase =
+      Number.isFinite(minConfigured) &&
+      minConfigured > 0
+        ? Math.round(minConfigured)
+        : UNIFIED_CREDIT_MIN_PURCHASE_DEFAULT;
+
+    const maxPurchase =
+      Number.isFinite(maxConfigured) &&
+      maxConfigured > 0
+        ? Math.round(maxConfigured)
+        : UNIFIED_CREDIT_MAX_PURCHASE_DEFAULT;
+
+    const discountFor = (
+      unitPriceMinor
+    ) =>
+      Math.max(
+        0,
+        Math.round(
+          (
+            1 -
+            unitPriceMinor /
+              standardUnitPriceMinor
+          ) *
+            100
+        )
+      );
+
+    return {
+      currency: clean(
+        process.env.UNIFIED_CREDIT_CURRENCY ||
+        "USD"
+      ).toUpperCase(),
+      standardUnitPriceMinor,
+      regularUnitPriceMinor:
+        standardUnitPriceMinor,
+      minPurchase,
+      maxPurchase,
+      maxDiscountPercent:
+        discountFor(
+          scaleUnitPriceMinor
+        ),
+      tiers: [
+        {
+          id: "standard",
+          label: "Standard",
+          minCredits:
+            minPurchase,
+          maxCredits:
+            Math.max(
+              minPurchase,
+              growthThreshold - 1
+            ),
+          unitPriceMinor:
+            standardUnitPriceMinor,
+          discountPercent: 0,
+        },
+        {
+          id: "growth",
+          label: "Growth",
+          minCredits:
+            growthThreshold,
+          maxCredits:
+            scaleThreshold - 1,
+          unitPriceMinor:
+            growthUnitPriceMinor,
+          discountPercent:
+            discountFor(
+              growthUnitPriceMinor
+            ),
+        },
+        {
+          id: "scale",
+          label: "Scale",
+          minCredits:
+            scaleThreshold,
+          maxCredits:
+            maxPurchase,
+          unitPriceMinor:
+            scaleUnitPriceMinor,
+          discountPercent:
+            discountFor(
+              scaleUnitPriceMinor
+            ),
+        },
+      ],
+    };
+  }
+
+  function quoteUnifiedCreditPurchase(
+    credits,
+    pricing =
+      getUnifiedCreditPricing()
+  ) {
+    const quantity = Math.max(
+      pricing.minPurchase,
+      Math.min(
+        pricing.maxPurchase,
+        Math.round(
+          Number(credits) ||
+          0
+        )
+      )
+    );
+
+    let selected =
+      pricing.tiers[0];
+
+    for (
+      const tier of
+        pricing.tiers
+    ) {
+      if (
+        quantity >=
+        tier.minCredits
+      ) {
+        selected =
+          tier;
+      }
+    }
+
+    return {
+      credits:
+        quantity,
+      currency:
+        pricing.currency,
+      amountMinor:
+        quantity *
+        selected.unitPriceMinor,
+      unitPriceMinor:
+        selected.unitPriceMinor,
+      discountPercent:
+        selected.discountPercent,
+      tierId:
+        selected.id,
+      tierLabel:
+        selected.label,
+    };
+  }
+
+  function migrateLegacyAiBalance(workspaceId, actorId = "system") {
+    const id = clean(workspaceId);
+    if (!id) return null;
+
+    ensureWorkspaceWallet(id, actorId);
+    let output = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+
+      const wallet = draft.creditWallets.find(
+        (item) => item.workspaceId === id
+      );
+      const legacy = draft.aiCallCreditWallets.find(
+        (item) => item.workspaceId === id
+      );
+
+      if (!wallet) return;
+
+      if (!legacy || legacy.unifiedMigratedAt) {
+        output = {
+          wallet: { ...wallet },
+          migrated: 0,
+          legacyConsumed: wholeCredits(legacy?.totalConsumed),
+        };
+        return;
+      }
+
+      const available = wholeCredits(legacy.balance);
+      const now = new Date().toISOString();
+
+      if (available > 0) {
+        wallet.balance = roundCredits(
+          creditNumber(wallet.balance) + available
+        );
+        wallet.totalGranted = roundCredits(
+          creditNumber(wallet.totalGranted) + available
+        );
+        wallet.updatedAt = now;
+
+        draft.creditLedger.unshift({
+          id: crypto.randomUUID(),
+          workspaceId: id,
+          type: "legacy_ai_wallet_migration",
+          feature: "ai_connected_call",
+          delta: available,
+          balanceAfter: wallet.balance,
+          reservedAfter: creditNumber(wallet.reserved),
+          actorId: clean(actorId) || "system",
+          description: `${available} legacy AI call credits moved into the unified ReachFly credit balance`,
+          createdAt: now,
+        });
+      }
+
+      legacy.balance = 0;
+      legacy.unifiedMigratedAt = now;
+      legacy.updatedAt = now;
+
+      output = {
+        wallet: { ...wallet },
+        migrated: available,
+        legacyConsumed: wholeCredits(legacy.totalConsumed),
+      };
+    });
+
+    return output;
   }
 
   function getRateCard() {
@@ -592,13 +1105,55 @@ export function createCreditBillingService({ store, workspaceService, externalSa
       : {};
     return DEFAULT_RATE_CARD.map((base) => {
       const saved = overrides[base.feature] || {};
+
+      const configuredCallRate = Number(
+        process.env.AI_CALL_CONNECTED_CREDITS_PER_MINUTE
+      );
+
+      const baseCreditsPerUnit =
+        base.feature === "ai_connected_call"
+          ? (
+              Number.isFinite(configuredCallRate) &&
+              configuredCallRate > 0
+                ? roundCredits(configuredCallRate)
+                : AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT
+            )
+          : base.creditsPerUnit;
+
+      const savedCreditsPerUnit =
+        positiveNumber(
+          saved.creditsPerUnit,
+          baseCreditsPerUnit
+        );
+
+      const creditsPerUnit =
+        base.feature === "ai_connected_call"
+          ? Math.max(
+              baseCreditsPerUnit,
+              savedCreditsPerUnit
+            )
+          : savedCreditsPerUnit;
+
       return {
         ...base,
-        creditsPerUnit: positiveNumber(saved.creditsPerUnit, base.creditsPerUnit),
-        billable: saved.billable === undefined ? base.billable : Boolean(saved.billable),
-        label: clean(saved.label) || base.label,
-        description: clean(saved.description) || base.description,
-        updatedAt: saved.updatedAt || "",
+        unit:
+          base.feature === "ai_connected_call"
+            ? "connected_minute"
+            : base.unit,
+        creditsPerUnit,
+        billable:
+          saved.billable === undefined
+            ? base.billable
+            : Boolean(saved.billable),
+        label:
+          clean(saved.label) ||
+          base.label,
+        description:
+          clean(saved.description) ||
+          base.description,
+        updatedAt:
+          saved.updatedAt ||
+          "",
       };
     });
   }
@@ -846,8 +1401,12 @@ export function createCreditBillingService({ store, workspaceService, externalSa
     const state = store.read();
     const ctx = getWorkspaceContext(user, state);
     if (!ctx.workspaceId) throw httpError(401, "Billing workspace could not be resolved.");
-    const wallet = ensureWorkspaceWallet(ctx.workspaceId, user?.id);
+    ensureWorkspaceWallet(ctx.workspaceId, user?.id);
+    migrateLegacyAiBalance(ctx.workspaceId, user?.id || "system");
     const latest = store.read();
+    const wallet =
+      latest.creditWallets.find((item) => item.workspaceId === ctx.workspaceId) ||
+      ensureWorkspaceWallet(ctx.workspaceId, user?.id);
     const ownerLike = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
     return {
       wallet: publicWallet(wallet),
@@ -870,6 +1429,22 @@ export function createCreditBillingService({ store, workspaceService, externalSa
         .sort(byNewest)
         .slice(0, 100),
       aiCalling: getAiCallCreditSnapshot(user),
+      unifiedCredits: true,
+      legacyAiConsumed: wholeCredits(
+        (latest.aiCallCreditWallets || []).find(
+          (item) => item.workspaceId === ctx.workspaceId
+        )?.totalConsumed
+      ),
+      creditPricing: getUnifiedCreditPricing(),
+      creditPurposes: [
+        "lead_generated",
+        "ai_connected_call",
+        "website_mini_audit",
+        "gmb_mini_audit",
+        "competitor_analysis",
+        "full_audit",
+        "reachfly_ai_message",
+      ],
       canPurchase: ownerLike,
       safepay: {
         configured: Boolean(clean(process.env.SAFEPAY_SECRET_KEY) && clean(process.env.SAFEPAY_PUBLIC_KEY)),
@@ -889,9 +1464,61 @@ export function createCreditBillingService({ store, workspaceService, externalSa
     ensureWorkspaceWallet(ctx.workspaceId, user?.id);
 
     const packId = clean(input.packId);
-    const pack = getCreditPacks().find((item) => item.id === packId);
+    const requestedCredits = Math.round(Number(input.credits || 0));
+    const pricing = getUnifiedCreditPricing();
+
+    let pack = packId
+      ? getCreditPacks().find((item) => item.id === packId)
+      : null;
+
+    if (requestedCredits > 0) {
+      if (
+        requestedCredits < pricing.minPurchase ||
+        requestedCredits > pricing.maxPurchase
+      ) {
+        throw httpError(
+          422,
+          `Credit purchase must be between ${pricing.minPurchase} and ${pricing.maxPurchase} credits.`,
+          "CREDIT_AMOUNT_OUT_OF_RANGE"
+        );
+      }
+
+      const quote =
+        quoteUnifiedCreditPurchase(
+          requestedCredits,
+          pricing
+        );
+
+      pack = {
+        id:
+          `custom-${requestedCredits}`,
+        label:
+          `${requestedCredits} ReachFly credits`,
+        credits:
+          requestedCredits,
+        currency:
+          quote.currency,
+        amountMinor:
+          quote.amountMinor,
+        market:
+          "GLOBAL",
+        active: true,
+        custom: true,
+        discountPercent:
+          quote.discountPercent,
+        unitPriceMinor:
+          quote.unitPriceMinor,
+        pricingTier:
+          quote.tierId,
+      };
+    }
+
     if (!pack || !pack.active || !pack.amountMinor) {
-      throw httpError(422, "This credit pack is not configured for checkout yet.", "CREDIT_PACK_NOT_CONFIGURED");
+      throw httpError(
+        422,
+        "This credit purchase is not configured for checkout yet.",
+        "CREDIT_PACK_NOT_CONFIGURED"
+      );
     }
 
     const now = new Date().toISOString();
@@ -904,6 +1531,27 @@ export function createCreditBillingService({ store, workspaceService, externalSa
       amountMinor: pack.amountMinor,
       currency: pack.currency,
       market: pack.market,
+      custom: pack.custom === true,
+      saleDiscountPercent:
+        pack.custom === true
+          ? Number(
+              pack.discountPercent ||
+              0
+            )
+          : 0,
+      unitPriceMinor:
+        pack.custom === true
+          ? Number(
+              pack.unitPriceMinor ||
+              0
+            )
+          : null,
+      pricingTier:
+        pack.custom === true
+          ? clean(
+              pack.pricingTier
+            )
+          : "",
       provider: "safepay",
       providerTracker: "",
       status: "creating",
@@ -927,11 +1575,7 @@ export function createCreditBillingService({ store, workspaceService, externalSa
         amount: pack.amountMinor,
         metadata: {
           source: "reachfly_credit_purchase",
-          purchase_id: purchase.id,
-          workspace_id: ctx.workspaceId,
-          user_id: clean(user?.id),
-          pack_id: pack.id,
-          credits: String(pack.credits),
+          order_id: purchase.id,
         },
         include_fees: false,
       });
@@ -996,155 +1640,23 @@ export function createCreditBillingService({ store, workspaceService, externalSa
   }
 
   async function createAiCallCreditCheckout(user, input = {}) {
-    const state = store.read();
-    const ctx = getWorkspaceContext(user, state);
-    if (!ctx.workspaceId) throw httpError(401, "Billing workspace could not be resolved.");
-    const canPurchase = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
-    if (!canPurchase) {
-      throw httpError(403, "Only a workspace owner or administrator can purchase AI call credits.");
-    }
-
-    const codesyncWorkspace = ctx.workspaceId === CODESYNC_WORKSPACE_ID;
-    const hasActivePurchasedNumber =
-      codesyncWorkspace ||
-      (state.voicePhoneNumbers || []).some(
-        (item) =>
-          item.workspaceId === ctx.workspaceId &&
-          normalizeStatus(item.status) === "active" &&
-          (
-            clean(item.orderId) ||
-            item.ownershipVerified === true ||
-            clean(item.source) === "existing_number"
-          )
-      );
-
-    // Codesync already has a working preconfigured ElevenLabs/Telnyx calling
-    // identity. It is intentionally not required to own a Voice Commerce
-    // order row before purchasing optional AI call-credit packs.
-    if (!hasActivePurchasedNumber) {
-      throw httpError(
-        409,
-        "Buy and activate a ReachFly business number before purchasing AI call credits.",
-        "VOICE_NUMBER_REQUIRED"
-      );
-    }
-
-    ensureAiCallCreditWallet(ctx.workspaceId);
-
     const packId = clean(input.packId);
-    const pack = getAiCallCreditPacks().find((item) => item.id === packId);
-    if (!pack || !pack.active || !pack.amountMinor || !pack.credits) {
-      throw httpError(422, "This AI call-credit pack is not configured for checkout.", "AI_CALL_PACK_NOT_CONFIGURED");
-    }
+    const legacyPack = getAiCallCreditPacks().find(
+      (item) => item.id === packId
+    );
 
-    const now = new Date().toISOString();
-    const purchase = {
-      id: crypto.randomUUID(),
-      workspaceId: ctx.workspaceId,
-      userId: clean(user?.id),
-      packId: pack.id,
-      credits: wholeCredits(pack.credits),
-      amountMinor: Math.round(Number(pack.amountMinor)),
-      currency: clean(pack.currency).toUpperCase(),
-      walletType: "ai_call_credits",
-      provider: "safepay",
-      providerTracker: "",
-      status: "creating",
-      createdAt: now,
-      updatedAt: now,
-    };
-    store.update((draft) => {
-      ensureStateShape(draft);
-      draft.aiCallCreditPurchases.unshift(purchase);
-    });
-
-    try {
-      const safepay = await getSafepayClient();
-      const publicKey = requireEnv("SAFEPAY_PUBLIC_KEY");
-      const sessionResponse = await safepay.payments.session.setup({
-        merchant_api_key: publicKey,
-        intent: clean(process.env.SAFEPAY_PAYMENT_INTENT) || "CYBERSOURCE",
-        mode: "payment",
-        entry_mode: "raw",
-        currency: purchase.currency,
-        amount: purchase.amountMinor,
-        metadata: {
-          source: "reachfly_ai_call_credit_purchase",
-          purchase_id: purchase.id,
-          workspace_id: ctx.workspaceId,
-          user_id: clean(user?.id),
-          pack_id: pack.id,
-          credits: String(purchase.credits),
-          wallet_type: "ai_call_credits",
-        },
-        include_fees: false,
-      });
-      const tracker = clean(
-        sessionResponse?.data?.tracker?.token || sessionResponse?.tracker?.token || sessionResponse?.data?.token
-      );
-      if (!tracker) throw new Error("Safepay did not return a payment tracker.");
-      const passportResponse = await safepay.client.passport.create();
-      const tbt = clean(
-        passportResponse?.data?.token ||
-          passportResponse?.token ||
-          (typeof passportResponse?.data === "string" ? passportResponse.data : "")
-      );
-      if (!tbt) throw new Error("Safepay did not return an authentication token.");
-      const voiceReturnPath = normalizeCheckoutReturnPath(
-        input.returnPath,
-        "/app/billing"
-      );
-      const checkoutUrl = clean(
-        safepay.checkout.createCheckoutUrl({
-          env: getSafepayEnvironment(),
-          tracker,
-          tbt,
-          source: "hosted",
-          order_id: purchase.id,
-          redirect_url: buildCheckoutReturnUrl(
-            voiceReturnPath,
-            { voicePayment: "success", purchase: purchase.id }
-          ),
-          cancel_url: buildCheckoutReturnUrl(
-            voiceReturnPath,
-            { voicePayment: "cancelled", purchase: purchase.id }
-          ),
-        })
-      );
-      if (!checkoutUrl || !/^https?:\/\//i.test(checkoutUrl)) {
-        throw new Error("Safepay did not return a valid checkout URL.");
-      }
-
-      store.update((draft) => {
-        ensureStateShape(draft);
-        const target = draft.aiCallCreditPurchases.find((item) => item.id === purchase.id);
-        if (!target) return;
-        target.providerTracker = tracker;
-        target.status = "pending";
-        target.checkoutCreatedAt = new Date().toISOString();
-        target.updatedAt = target.checkoutCreatedAt;
-      });
-
-      return {
-        ok: true,
-        checkoutUrl,
-        purchase: publicAiCallPurchase({ ...purchase, providerTracker: tracker, status: "pending" }),
-      };
-    } catch (error) {
-      store.update((draft) => {
-        ensureStateShape(draft);
-        const target = draft.aiCallCreditPurchases.find((item) => item.id === purchase.id);
-        if (!target) return;
-        target.status = "failed";
-        target.error = clean(error?.message || String(error)).slice(0, 1000);
-        target.updatedAt = new Date().toISOString();
-      });
+    if (!legacyPack) {
       throw httpError(
-        error?.statusCode || 502,
-        error?.message || "Could not create Safepay AI call-credit checkout.",
-        "SAFEPAY_AI_CALL_CHECKOUT_FAILED"
+        422,
+        "This legacy AI calling pack is not available.",
+        "AI_CALL_PACK_NOT_CONFIGURED"
       );
     }
+
+    return createCreditCheckout(user, {
+      credits: legacyPack.credits,
+      source: "legacy-ai-call-checkout",
+    });
   }
 
   async function handleSafepayWebhook({ rawBody = "", headers = {}, body = {} } = {}) {
@@ -2026,6 +2538,18 @@ export const CREDIT_BILLING_DEFAULTS = {
   aiCallDefaultPriceMinor: AI_CALL_DEFAULT_PRICE_MINOR,
   aiCallDefaultCurrency: AI_CALL_DEFAULT_CURRENCY,
   aiCallDefaultPackCredits: AI_CALL_DEFAULT_PACK_CREDITS,
+  unifiedCreditStandardPriceMinor:
+    UNIFIED_CREDIT_STANDARD_PRICE_MINOR_DEFAULT,
+  unifiedCreditGrowthPriceMinor:
+    UNIFIED_CREDIT_GROWTH_PRICE_MINOR_DEFAULT,
+  unifiedCreditScalePriceMinor:
+    UNIFIED_CREDIT_SCALE_PRICE_MINOR_DEFAULT,
+  unifiedCreditGrowthThreshold:
+    UNIFIED_CREDIT_GROWTH_THRESHOLD_DEFAULT,
+  unifiedCreditScaleThreshold:
+    UNIFIED_CREDIT_SCALE_THRESHOLD_DEFAULT,
+  aiCallConnectedCreditsPerMinute:
+    AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT,
   rateCard: DEFAULT_RATE_CARD,
   packs: DEFAULT_CREDIT_PACKS,
   codesyncWorkspaceId: CODESYNC_WORKSPACE_ID,
