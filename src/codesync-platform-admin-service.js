@@ -462,13 +462,6 @@ export function createCodesyncPlatformAdminService({ store, creditBillingService
     if (targetEmail === PLATFORM_OWNER_EMAIL) {
       throw httpError(409, "The platform owner account cannot be deleted.");
     }
-    if (OWNER_ROLES.has(normalizeRole(target.workspaceRole || target.role))) {
-      throw httpError(
-        409,
-        "Workspace owners cannot be deleted from the Users action because that could orphan a company. Block the owner to suspend access, or transfer/delete the workspace with a dedicated account workflow."
-      );
-    }
-
     const confirmation = normalizeEmail(input.confirmEmail);
     if (!confirmation || confirmation !== targetEmail) {
       throw httpError(
@@ -479,20 +472,175 @@ export function createCodesyncPlatformAdminService({ store, creditBillingService
 
     const now = new Date().toISOString();
     const targetWorkspaceId = clean(target.workspaceId);
-    const targetName = clean(target.name || target.fullName || target.email || userId);
+    const targetName = clean(
+      target.name || target.fullName || target.email || userId
+    );
+    const deletingWorkspaceOwner = OWNER_ROLES.has(
+      normalizeRole(target.workspaceRole || target.role)
+    );
+
+    let transferredOwner = null;
+    let workspaceSuspended = false;
 
     store.update((draft) => {
-      draft.users = (draft.users || []).filter((item) => item.id !== userId);
-      if (Array.isArray(draft.workspaceMembers)) {
-        draft.workspaceMembers = draft.workspaceMembers.filter(
-          (item) => item.userId !== userId
-        );
+      draft.users = Array.isArray(draft.users) ? draft.users : [];
+      draft.workspaces = Array.isArray(draft.workspaces)
+        ? draft.workspaces
+        : [];
+      draft.workspaceMembers = Array.isArray(draft.workspaceMembers)
+        ? draft.workspaceMembers
+        : [];
+      draft.teamMembers = Array.isArray(draft.teamMembers)
+        ? draft.teamMembers
+        : [];
+      draft.companies = Array.isArray(draft.companies)
+        ? draft.companies
+        : [];
+
+      const draftTarget = draft.users.find((item) => item.id === userId);
+      if (!draftTarget) {
+        throw httpError(404, "User was not found.");
       }
-      if (Array.isArray(draft.teamMembers)) {
-        draft.teamMembers = draft.teamMembers.filter(
-          (item) => item.userId !== userId && item.id !== userId
-        );
+
+      const workspace = targetWorkspaceId
+        ? draft.workspaces.find(
+            (item) =>
+              clean(item.id || item.workspaceId) === targetWorkspaceId
+          ) || null
+        : null;
+
+      if (deletingWorkspaceOwner && targetWorkspaceId) {
+        const candidates = draft.users
+          .filter(
+            (item) =>
+              item.id !== userId &&
+              clean(item.workspaceId) === targetWorkspaceId &&
+              normalizeEmail(item.email) !== PLATFORM_OWNER_EMAIL &&
+              !isUserBlocked(item)
+          )
+          .sort((a, b) => {
+            const roleRank = (item) => {
+              const role = normalizeRole(
+                item.workspaceRole || item.role || "member"
+              );
+              if (role === "admin") return 0;
+              if (role === "manager") return 1;
+              if (role === "member") return 2;
+              if (role === "caller") return 3;
+              return 4;
+            };
+
+            const roleDelta = roleRank(a) - roleRank(b);
+            if (roleDelta) return roleDelta;
+
+            return String(a.createdAt || "").localeCompare(
+              String(b.createdAt || "")
+            );
+          });
+
+        const replacement = candidates[0] || null;
+
+        if (replacement) {
+          replacement.role = "Owner";
+          replacement.workspaceRole = "owner";
+          replacement.status = "active";
+          replacement.active = true;
+          replacement.isActive = true;
+          replacement.platformAccessBlocked = false;
+          replacement.updatedAt = now;
+
+          if (workspace) {
+            workspace.ownerId = replacement.id;
+            workspace.ownerUserId = replacement.id;
+            workspace.status =
+              normalizeStatus(workspace.status) === "suspended"
+                ? "active"
+                : workspace.status || "active";
+            workspace.active = true;
+            workspace.isActive = true;
+            workspace.updatedAt = now;
+          }
+
+          for (const member of draft.workspaceMembers) {
+            if (
+              clean(member.workspaceId) === targetWorkspaceId &&
+              member.userId === replacement.id
+            ) {
+              member.role = "owner";
+              member.workspaceRole = "owner";
+              member.status = "active";
+              member.active = true;
+              member.isActive = true;
+              member.updatedAt = now;
+            }
+          }
+
+          for (const company of draft.companies) {
+            if (
+              clean(company.workspaceId) !== targetWorkspaceId &&
+              clean(company.id) !== clean(workspace?.companyId)
+            ) {
+              continue;
+            }
+
+            company.ownerId = replacement.id;
+            company.ownerUserId = replacement.id;
+            company.ownerEmail = clean(replacement.email);
+            company.ownerName = clean(
+              replacement.name || replacement.fullName
+            );
+            company.status =
+              normalizeStatus(company.status) === "suspended"
+                ? "active"
+                : company.status || "active";
+            company.active = true;
+            company.isActive = true;
+            company.updatedAt = now;
+          }
+
+          transferredOwner = {
+            id: replacement.id,
+            email: clean(replacement.email),
+            name: clean(replacement.name || replacement.fullName),
+          };
+        } else if (workspace) {
+          workspace.ownerId = "";
+          workspace.ownerUserId = "";
+          workspace.status = "suspended";
+          workspace.active = false;
+          workspace.isActive = false;
+          workspace.ownerDeletedAt = now;
+          workspace.ownerDeletedBy = user.id;
+          workspace.updatedAt = now;
+          workspaceSuspended = true;
+
+          for (const company of draft.companies) {
+            if (
+              clean(company.workspaceId) !== targetWorkspaceId &&
+              clean(company.id) !== clean(workspace.companyId)
+            ) {
+              continue;
+            }
+
+            company.ownerId = "";
+            company.ownerUserId = "";
+            company.ownerEmail = "";
+            company.ownerName = "";
+            company.status = "suspended";
+            company.active = false;
+            company.isActive = false;
+            company.updatedAt = now;
+          }
+        }
       }
+
+      draft.users = draft.users.filter((item) => item.id !== userId);
+      draft.workspaceMembers = draft.workspaceMembers.filter(
+        (item) => item.userId !== userId
+      );
+      draft.teamMembers = draft.teamMembers.filter(
+        (item) => item.userId !== userId && item.id !== userId
+      );
 
       appendAdminActivity(draft, {
         actorId: user.id,
@@ -500,7 +648,11 @@ export function createCodesyncPlatformAdminService({ store, creditBillingService
         title: `${targetName} deleted from ReachFly`,
         targetWorkspaceId,
         targetUserId: userId,
-        detail: targetEmail,
+        detail: transferredOwner
+          ? `${targetEmail} · ownership transferred to ${transferredOwner.email}`
+          : workspaceSuspended
+            ? `${targetEmail} · workspace suspended pending owner reassignment`
+            : targetEmail,
         createdAt: now,
       });
     });
@@ -510,6 +662,10 @@ export function createCodesyncPlatformAdminService({ store, creditBillingService
       deleted: true,
       userId,
       email: targetEmail,
+      workspaceId: targetWorkspaceId,
+      ownershipTransferred: Boolean(transferredOwner),
+      transferredOwner,
+      workspaceSuspended,
     };
   }
 
@@ -787,8 +943,7 @@ function buildUsers(state, accounts) {
         isCodesync: Boolean(account?.isCodesync),
         platformOwner: normalizeEmail(email) === PLATFORM_OWNER_EMAIL,
         deletable:
-          normalizeEmail(email) !== PLATFORM_OWNER_EMAIL &&
-          !OWNER_ROLES.has(role),
+          normalizeEmail(email) !== PLATFORM_OWNER_EMAIL,
       };
     })
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));

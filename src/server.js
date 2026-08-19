@@ -7299,6 +7299,48 @@ app.post(
   })
 );
 
+app.put(
+  "/api/platform-admin/subscriptions/:workspaceId",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      codesyncPlatformAdminService.updateSubscription(
+        req.user,
+        req.params.workspaceId,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.patch(
+  "/api/platform-admin/users/:userId/access",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      codesyncPlatformAdminService.setUserAccess(
+        req.user,
+        req.params.userId,
+        req.body || {}
+      )
+    );
+  })
+);
+
+app.delete(
+  "/api/platform-admin/users/:userId",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      codesyncPlatformAdminService.deleteUser(
+        req.user,
+        req.params.userId,
+        req.body || {}
+      )
+    );
+  })
+);
+
 app.get(
   "/api/telnyx/ai-agent/access",
   requireAuth,

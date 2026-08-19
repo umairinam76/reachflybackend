@@ -94,6 +94,33 @@ const ACTIVE_CALL_STATUSES = new Set([
   "active",
 ]);
 
+function voiceCallLog(event, details = {}, level = "info") {
+  if (!envFlag("TELNYX_AI_AGENT_CALL_LOGS", true)) return;
+
+  const payload = {
+    at: new Date().toISOString(),
+    service: "reachfly-voice",
+    event,
+    ...details,
+  };
+
+  const line = `[voice-call] ${JSON.stringify(payload)}`;
+
+  if (level === "error") {
+    console.error(line);
+  } else if (level === "warn") {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+}
+
+function maskedPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  return `***${digits.slice(-4)}`;
+}
+
 /**
  * Workspace-scoped Telnyx AI voice-agent integration.
  *
@@ -1790,20 +1817,39 @@ export function createTelnyxAIAgentService({
       );
     }
 
-    const elevenLabsPhoneNumberId = resolveElevenLabsPhoneNumberId({
-      fromNumber: selectedFromNumber,
-      input: {
-        ...input,
-        elevenLabsPhoneNumberId:
-          purchasedNumber?.elevenLabsPhoneNumberId ||
-          input.elevenLabsPhoneNumberId ||
-          (isCodesyncWorkspace(ctx.workspaceId)
-            ? clean(process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID)
-            : ""),
-      },
-      existing,
-      required: true,
-    });
+    const resolvedElevenLabsPhone =
+      await resolveElevenLabsSipPhoneNumber({
+        fromNumber: selectedFromNumber,
+        input: {
+          ...input,
+          elevenLabsPhoneNumberId:
+            purchasedNumber?.elevenLabsPhoneNumberId ||
+            input.elevenLabsPhoneNumberId ||
+            (isCodesyncWorkspace(ctx.workspaceId)
+              ? clean(process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID)
+              : ""),
+        },
+        existing,
+        required: true,
+        allowConfiguredFallback: isCodesyncWorkspace(ctx.workspaceId),
+      });
+
+    const elevenLabsPhoneNumberId =
+      resolvedElevenLabsPhone.phoneNumberId;
+
+    /*
+     * A stale TELNYX_AI_AGENT_FROM_NUMBER can point at a different Telnyx
+     * number from the imported ElevenLabs SIP trunk. In the CodeSync control
+     * workspace, prefer the verified ElevenLabs SIP number instead of saving a
+     * configuration that will later originate through the wrong trunk.
+     */
+    if (
+      isCodesyncWorkspace(ctx.workspaceId) &&
+      resolvedElevenLabsPhone.usedConfiguredFallback &&
+      resolvedElevenLabsPhone.phoneNumber
+    ) {
+      config.fromNumber = resolvedElevenLabsPhone.phoneNumber;
+    }
 
     // Only create a provider agent after every paid activation gate has passed,
     // so rejected/incomplete customer setup never leaves an orphan provider agent.
@@ -1873,38 +1919,28 @@ export function createTelnyxAIAgentService({
       }
     );
 
-    // Production customer numbers are assigned to the workspace-managed
-    // ElevenLabs agent. Sandbox commerce uses the existing shared ReachFly
-    // caller only for outbound QA, so never reassign that shared phone record
-    // away from the Codesync production agent. The outbound-call API receives
-    // both agent_id and agent_phone_number_id explicitly.
-    if (
-      purchasedNumber?.testMode !== true &&
-      callingModeIncludesInbound(config.callingMode)
-    ) {
-      const inboundTransport = normalizeStatus(
-        process.env.ELEVENLABS_TELNYX_SIP_TRANSPORT || "tcp"
-      );
-      const inboundMediaEncryption = normalizeStatus(
-        process.env.ELEVENLABS_TELNYX_SIP_MEDIA_ENCRYPTION || "disabled"
-      );
-
-      await elevenLabsRequest(
-        `/v1/convai/phone-numbers/${encodeURIComponent(
-          elevenLabsPhoneNumberId
-        )}`,
-        {
-          method: "PATCH",
-          body: {
-            agent_id: elevenLabsAgentId,
-            label: `ReachFly ${config.companyName || config.name || selectedFromNumber}`,
-            inbound_trunk_config: {
-              transport: inboundTransport,
-              media_encryption: inboundMediaEncryption,
-            },
-          },
-        }
-      );
+    // Validate the selected SIP phone record and safely repair its Telnyx
+    // outbound trunk before it is persisted. Sandbox commerce deliberately
+    // keeps the shared provider phone record untouched because that record can
+    // be used by multiple test workspaces.
+    if (purchasedNumber?.testMode !== true) {
+      resolvedElevenLabsPhone.record =
+        await ensureElevenLabsTelnyxSipReady({
+          record: resolvedElevenLabsPhone.record,
+          expectedFromNumber:
+            config.fromNumber ||
+            resolvedElevenLabsPhone.phoneNumber ||
+            selectedFromNumber,
+          agentId: elevenLabsAgentId,
+          label: `ReachFly ${
+            config.companyName ||
+            config.name ||
+            resolvedElevenLabsPhone.phoneNumber ||
+            selectedFromNumber
+          }`,
+          assignAgent: callingModeIncludesInbound(config.callingMode),
+          configureInbound: callingModeIncludesInbound(config.callingMode),
+        });
     }
 
     const syncedTts = safeObject(
@@ -4032,18 +4068,6 @@ export function createTelnyxAIAgentService({
       );
     }
 
-    const phoneNumberId = resolveElevenLabsPhoneNumberId({
-      fromNumber,
-      input: {
-        elevenLabsPhoneNumberId:
-          purchasedNumber?.elevenLabsPhoneNumberId ||
-          (isCodesyncWorkspace(ctx.workspaceId)
-            ? clean(process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID)
-            : ""),
-      },
-      existing: agent,
-      required: true,
-    });
     const sharedTestRoutingNumber =
       purchasedNumber?.testMode === true
         ? normalizePhone(
@@ -4053,15 +4077,69 @@ export function createTelnyxAIAgentService({
               configuredFromNumbers()[0]
           )
         : "";
+
     if (purchasedNumber?.testMode === true && !sharedTestRoutingNumber) {
       return failQueueItem(
         queueItem.id,
         "The shared sandbox caller is not configured for Voice Agent testing."
       );
     }
+
     const elevenLabsAgentId = clean(
       agent.elevenLabsAgentId || requireElevenLabsAgentId()
     );
+
+    const requestedSipFromNumber =
+      sharedTestRoutingNumber || fromNumber;
+
+    let resolvedSipPhone = null;
+
+    try {
+      resolvedSipPhone =
+        await resolveElevenLabsSipPhoneNumber({
+          fromNumber: requestedSipFromNumber,
+          input: {
+            elevenLabsPhoneNumberId:
+              purchasedNumber?.elevenLabsPhoneNumberId ||
+              (isCodesyncWorkspace(ctx.workspaceId)
+                ? clean(process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID)
+                : ""),
+          },
+          existing: agent,
+          required: true,
+          allowConfiguredFallback: isCodesyncWorkspace(ctx.workspaceId),
+        });
+
+      if (purchasedNumber?.testMode !== true) {
+        resolvedSipPhone.record =
+          await ensureElevenLabsTelnyxSipReady({
+            record: resolvedSipPhone.record,
+            expectedFromNumber:
+              resolvedSipPhone.phoneNumber || requestedSipFromNumber,
+            agentId: elevenLabsAgentId,
+            label: `ReachFly ${
+              agent.companyName ||
+              agent.name ||
+              resolvedSipPhone.phoneNumber ||
+              requestedSipFromNumber
+            }`,
+            assignAgent: false,
+            configureInbound: false,
+          });
+      }
+    } catch (error) {
+      return failQueueItem(
+        queueItem.id,
+        clean(error?.message || String(error))
+      );
+    }
+
+    const phoneNumberId =
+      resolvedSipPhone.phoneNumberId;
+
+    const actualSipFromNumber =
+      resolvedSipPhone.phoneNumber ||
+      requestedSipFromNumber;
     const contextSnapshot = buildLeadContextSnapshot({
       state: latestState,
       agent,
@@ -4099,8 +4177,12 @@ export function createTelnyxAIAgentService({
         latestQueue.timezone ||
         agent.defaultLeadTimezone ||
         DEFAULT_LEAD_TIMEZONE,
-      fromNumber: sharedTestRoutingNumber || fromNumber,
-      displayFromNumber: fromNumber,
+      fromNumber: actualSipFromNumber,
+      displayFromNumber: actualSipFromNumber,
+      requestedFromNumber: fromNumber,
+      sipPhoneNumberId: phoneNumberId,
+      sipNumberFallbackUsed:
+        resolvedSipPhone.usedConfiguredFallback === true,
       testSharedCaller: Boolean(purchasedNumber?.testMode),
       toNumber: latestQueue.phone,
       status: "creating",
@@ -4148,7 +4230,18 @@ export function createTelnyxAIAgentService({
         }
       );
       if (response?.success === false) {
-        throw httpError(502, clean(response.message) || "ElevenLabs could not initiate the SIP call.");
+        const sipDiagnostic =
+          await latestElevenLabsSipDiagnostic(
+            phoneNumberId
+          );
+
+        throw httpError(
+          502,
+          formatSipOutboundFailure(
+            clean(response.message),
+            sipDiagnostic
+          )
+        );
       }
       const conversationId = clean(response?.conversation_id);
       const sipCallId = clean(response?.sip_call_id);
@@ -4185,12 +4278,50 @@ export function createTelnyxAIAgentService({
         call: publicCall(updated || call),
       };
     } catch (error) {
-      markCallFailed(call.id, error.message);
-      failQueueItem(latestQueue.id, error.message);
+      let message = clean(
+        error?.message || String(error)
+      );
+
+      if (
+        /(?:sip|invite|forbidden|\b40[137]\b)/i.test(
+          message
+        )
+      ) {
+        const sipDiagnostic =
+          await latestElevenLabsSipDiagnostic(
+            phoneNumberId
+          );
+
+        message = formatSipOutboundFailure(
+          message,
+          sipDiagnostic
+        );
+      }
+
+      markCallFailed(call.id, message);
+      failQueueItem(latestQueue.id, message);
+
+      voiceCallLog(
+        "outbound_sip_failed",
+        {
+          workspaceId: ctx.workspaceId,
+          agentId: agent.id,
+          phoneNumberId,
+          fromNumber: maskedPhone(
+            actualSipFromNumber
+          ),
+          toNumber: maskedPhone(
+            call.toNumber
+          ),
+          error: message.slice(0, 700),
+        },
+        "error"
+      );
+
       return {
         ok: false,
         queueId: latestQueue.id,
-        error: error.message,
+        error: message,
       };
     }
   }
@@ -5039,28 +5170,604 @@ export function createTelnyxAIAgentService({
   } = {}) {
     const normalized = normalizePhone(fromNumber);
     let mapped = "";
-    const mappingRaw = clean(process.env.ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON);
+    const mappingRaw = clean(
+      process.env.ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON
+    );
+
     if (mappingRaw) {
       try {
         const mapping = JSON.parse(mappingRaw);
-        mapped = clean(mapping?.[normalized] || mapping?.[fromNumber]);
+        mapped = clean(
+          mapping?.[normalized] ||
+            mapping?.[fromNumber]
+        );
       } catch {
-        throw httpError(500, "ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON must be valid JSON.");
+        throw httpError(
+          500,
+          "ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON must be valid JSON."
+        );
       }
     }
+
     const value = clean(
       input.elevenLabsPhoneNumberId ||
         mapped ||
         existing?.elevenLabsPhoneNumberId ||
         process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID
     );
+
     if (!value && required) {
       throw httpError(
         503,
         "Configure ELEVENLABS_AGENT_PHONE_NUMBER_ID (or ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON for multiple Telnyx caller IDs)."
       );
     }
+
     return value;
+  }
+
+  function elevenLabsPhoneNumberId(record = {}) {
+    return clean(
+      record.phone_number_id ||
+        record.phoneNumberId ||
+        record.id
+    );
+  }
+
+  function elevenLabsPhoneNumberValue(record = {}) {
+    return normalizePhone(
+      record.phone_number ||
+        record.phoneNumber ||
+        record.number
+    );
+  }
+
+  function elevenLabsPhoneNumberProvider(record = {}) {
+    return normalizeStatus(
+      record.provider ||
+        record.provider_name ||
+        record.providerName
+    );
+  }
+
+  async function getElevenLabsPhoneNumber(phoneNumberId) {
+    const id = clean(phoneNumberId);
+    if (!id) return null;
+
+    return await elevenLabsRequest(
+      `/v1/convai/phone-numbers/${encodeURIComponent(id)}`
+    );
+  }
+
+  async function listElevenLabsPhoneNumbers() {
+    const payload = await elevenLabsRequest(
+      "/v1/convai/phone-numbers"
+    );
+
+    if (Array.isArray(payload)) {
+      return payload;
+    }
+
+    if (Array.isArray(payload?.phone_numbers)) {
+      return payload.phone_numbers;
+    }
+
+    if (Array.isArray(payload?.data)) {
+      return payload.data;
+    }
+
+    return [];
+  }
+
+  async function resolveElevenLabsSipPhoneNumber({
+    fromNumber,
+    input = {},
+    existing = {},
+    required = true,
+    allowConfiguredFallback = false,
+  } = {}) {
+    const normalized = normalizePhone(fromNumber);
+
+    if (!normalized) {
+      if (!required) return null;
+      throw httpError(
+        503,
+        "A valid E.164 outbound business number is required before starting a SIP call."
+      );
+    }
+
+    const configuredId = resolveElevenLabsPhoneNumberId({
+      fromNumber: normalized,
+      input,
+      existing,
+      required: false,
+    });
+
+    let configuredRecord = null;
+
+    if (configuredId) {
+      try {
+        configuredRecord =
+          await getElevenLabsPhoneNumber(
+            configuredId
+          );
+      } catch (error) {
+        if (
+          ![404, 422].includes(
+            Number(
+              error?.statusCode ||
+                error?.status
+            )
+          )
+        ) {
+          throw error;
+        }
+      }
+
+      if (
+        configuredRecord &&
+        elevenLabsPhoneNumberProvider(
+          configuredRecord
+        ) === "sip_trunk" &&
+        elevenLabsPhoneNumberValue(
+          configuredRecord
+        ) === normalized
+      ) {
+        return {
+          record: configuredRecord,
+          phoneNumberId:
+            elevenLabsPhoneNumberId(
+              configuredRecord
+            ),
+          phoneNumber: normalized,
+          usedConfiguredFallback: false,
+        };
+      }
+    }
+
+    const phoneNumbers =
+      await listElevenLabsPhoneNumbers();
+
+    const exact = phoneNumbers.find(
+      (item) =>
+        elevenLabsPhoneNumberProvider(
+          item
+        ) === "sip_trunk" &&
+        elevenLabsPhoneNumberValue(item) ===
+          normalized
+    );
+
+    if (exact) {
+      return {
+        record: exact,
+        phoneNumberId:
+          elevenLabsPhoneNumberId(exact),
+        phoneNumber:
+          elevenLabsPhoneNumberValue(exact),
+        usedConfiguredFallback: false,
+      };
+    }
+
+    if (
+      allowConfiguredFallback &&
+      configuredRecord &&
+      elevenLabsPhoneNumberProvider(
+        configuredRecord
+      ) === "sip_trunk" &&
+      elevenLabsPhoneNumberValue(
+        configuredRecord
+      )
+    ) {
+      const fallbackNumber =
+        elevenLabsPhoneNumberValue(
+          configuredRecord
+        );
+
+      return {
+        record: configuredRecord,
+        phoneNumberId:
+          elevenLabsPhoneNumberId(
+            configuredRecord
+          ),
+        phoneNumber: fallbackNumber,
+        usedConfiguredFallback:
+          fallbackNumber !== normalized,
+      };
+    }
+
+    if (!required) {
+      return null;
+    }
+
+    const configuredNumber =
+      configuredRecord
+        ? elevenLabsPhoneNumberValue(
+            configuredRecord
+          )
+        : "";
+
+    const mismatchMessage =
+      configuredNumber &&
+      configuredNumber !== normalized
+        ? ` The configured ElevenLabs phone-number ID belongs to ${configuredNumber}, not ${normalized}.`
+        : "";
+
+    throw httpError(
+      503,
+      `The outbound number ${normalized} is not imported in ElevenLabs as a SIP-trunk phone number.${mismatchMessage} Import/map the same E.164 number in ElevenLabs or correct ELEVENLABS_TELNYX_PHONE_NUMBER_IDS_JSON.`
+    );
+  }
+
+  function telnyxSipRepairConfig() {
+    const explicitAddress = clean(
+      process.env
+        .ELEVENLABS_TELNYX_SIP_ADDRESS ||
+        process.env.TELNYX_SIP_ADDRESS ||
+        ""
+    )
+      .replace(/^sips?:\/\//i, "")
+      .replace(/\/+$/, "");
+
+    const transport = normalizeStatus(
+      process.env
+        .ELEVENLABS_TELNYX_SIP_TRANSPORT ||
+        "tcp"
+    );
+
+    const mediaEncryption =
+      normalizeStatus(
+        process.env
+          .ELEVENLABS_TELNYX_SIP_MEDIA_ENCRYPTION ||
+          "disabled"
+      );
+
+    const username = clean(
+      process.env
+        .ELEVENLABS_TELNYX_SIP_USERNAME ||
+        process.env.TELNYX_SIP_USERNAME ||
+        process.env.TELNYX_SIP_TRUNK_USERNAME
+    );
+
+    const password = String(
+      process.env
+        .ELEVENLABS_TELNYX_SIP_PASSWORD ||
+        process.env.TELNYX_SIP_PASSWORD ||
+        process.env.TELNYX_SIP_TRUNK_PASSWORD ||
+        ""
+    ).trim();
+
+    const authMode = normalizeStatus(
+      process.env
+        .ELEVENLABS_TELNYX_SIP_AUTH_MODE ||
+        "digest"
+    );
+
+    return {
+      explicitAddress,
+      transport: ["tcp", "tls", "udp"].includes(
+        transport
+      )
+        ? transport
+        : "tcp",
+      mediaEncryption: [
+        "disabled",
+        "allowed",
+        "required",
+      ].includes(mediaEncryption)
+        ? mediaEncryption
+        : "disabled",
+      username,
+      password,
+      authMode:
+        authMode === "acl"
+          ? "acl"
+          : "digest",
+    };
+  }
+
+  async function ensureElevenLabsTelnyxSipReady({
+    record,
+    expectedFromNumber,
+    agentId,
+    label = "",
+    assignAgent = false,
+    configureInbound = false,
+  } = {}) {
+    const phoneNumberId =
+      elevenLabsPhoneNumberId(record);
+    const actualNumber =
+      elevenLabsPhoneNumberValue(record);
+    const expectedNumber =
+      normalizePhone(expectedFromNumber);
+
+    if (!phoneNumberId) {
+      throw httpError(
+        503,
+        "ElevenLabs did not return a phone-number ID for the selected SIP trunk."
+      );
+    }
+
+    if (
+      elevenLabsPhoneNumberProvider(record) !==
+      "sip_trunk"
+    ) {
+      throw httpError(
+        409,
+        `ElevenLabs phone number ${actualNumber || phoneNumberId} is not configured as a SIP trunk.`
+      );
+    }
+
+    if (
+      expectedNumber &&
+      actualNumber &&
+      actualNumber !== expectedNumber
+    ) {
+      throw httpError(
+        409,
+        `SIP caller mismatch: ReachFly selected ${expectedNumber}, but ElevenLabs phone-number ID ${phoneNumberId} belongs to ${actualNumber}.`
+      );
+    }
+
+    const outbound = safeObject(
+      record.outbound_trunk ||
+        record.outboundTrunk
+    );
+
+    const repair =
+      telnyxSipRepairConfig();
+
+    const currentAddress = clean(
+      outbound.address
+    )
+      .replace(/^sips?:\/\//i, "")
+      .replace(/\/+$/, "");
+
+    const currentTransport =
+      normalizeStatus(
+        outbound.transport || "tcp"
+      );
+
+    const currentMediaEncryption =
+      normalizeStatus(
+        outbound.media_encryption ||
+          outbound.mediaEncryption ||
+          "disabled"
+      );
+
+    const hasStoredCredentials =
+      outbound.has_auth_credentials ===
+        true ||
+      outbound.hasAuthCredentials ===
+        true;
+
+    const hasEnvCredentials =
+      Boolean(
+        repair.username &&
+          repair.password
+      );
+
+    if (
+      repair.authMode === "digest" &&
+      !hasStoredCredentials &&
+      !hasEnvCredentials
+    ) {
+      throw httpError(
+        503,
+        "The ElevenLabs Telnyx SIP trunk has no digest credentials. Configure the Telnyx SIP username/password on the ElevenLabs phone number, or set ELEVENLABS_TELNYX_SIP_USERNAME and ELEVENLABS_TELNYX_SIP_PASSWORD on the API server."
+      );
+    }
+
+    const desiredAddress =
+      repair.explicitAddress ||
+      currentAddress ||
+      "sip.telnyx.com";
+
+    const needsOutboundRepair =
+      !currentAddress ||
+      (repair.explicitAddress &&
+        currentAddress !==
+          repair.explicitAddress) ||
+      (hasEnvCredentials &&
+        !hasStoredCredentials);
+
+    /*
+     * Do not replace an already-authenticated outbound trunk unless the API
+     * server also has the digest password. ElevenLabs intentionally does not
+     * return stored passwords, and replacing the nested trunk object without
+     * credentials could silently remove working authentication.
+     */
+    const canSafelyReplaceOutbound =
+      hasEnvCredentials ||
+      !hasStoredCredentials;
+
+    const body = {
+      store_sip_messages: true,
+    };
+
+    if (assignAgent && clean(agentId)) {
+      body.agent_id = clean(agentId);
+    }
+
+    if (clean(label)) {
+      body.label = clean(label).slice(
+        0,
+        120
+      );
+    }
+
+    if (
+      needsOutboundRepair &&
+      canSafelyReplaceOutbound
+    ) {
+      body.outbound_trunk_config = {
+        address: desiredAddress,
+        transport:
+          repair.transport ||
+          currentTransport ||
+          "tcp",
+        media_encryption:
+          repair.mediaEncryption ||
+          currentMediaEncryption ||
+          "disabled",
+        ...(hasEnvCredentials
+          ? {
+              credentials: {
+                username:
+                  repair.username,
+                password:
+                  repair.password,
+              },
+            }
+          : {}),
+      };
+    }
+
+    if (configureInbound) {
+      body.inbound_trunk_config = {
+        transport:
+          repair.transport ||
+          "tcp",
+        media_encryption:
+          repair.mediaEncryption ||
+          "disabled",
+      };
+    }
+
+    const updated =
+      await elevenLabsRequest(
+        `/v1/convai/phone-numbers/${encodeURIComponent(
+          phoneNumberId
+        )}`,
+        {
+          method: "PATCH",
+          body,
+        }
+      );
+
+    return updated || record;
+  }
+
+  async function latestElevenLabsSipDiagnostic(
+    phoneNumberId
+  ) {
+    const id = clean(phoneNumberId);
+    if (!id) return "";
+
+    try {
+      const payload =
+        await elevenLabsRequest(
+          `/v1/convai/phone-numbers/${encodeURIComponent(
+            id
+          )}/sip-messages?page_size=10`
+        );
+
+      const messages = Array.isArray(
+        payload?.sip_messages
+      )
+        ? payload.sip_messages
+        : Array.isArray(payload)
+          ? payload
+          : [];
+
+      const newest = [...messages]
+        .sort(
+          (left, right) =>
+            Number(
+              right.created_at_unix_micro ||
+                right.createdAtUnixMicro ||
+                0
+            ) -
+            Number(
+              left.created_at_unix_micro ||
+                left.createdAtUnixMicro ||
+                0
+            )
+        )
+        .find((item) => {
+          const raw = String(
+            item?.raw_message || ""
+          );
+          return (
+            clean(item?.error_message) ||
+            /SIP\/2\.0\s+[4-6]\d\d/i.test(
+              raw
+            )
+          );
+        });
+
+      if (!newest) return "";
+
+      const explicitError = clean(
+        newest.error_message
+      );
+
+      if (explicitError) {
+        return explicitError.slice(
+          0,
+          500
+        );
+      }
+
+      const raw = String(
+        newest.raw_message || ""
+      );
+
+      const statusLine =
+        raw.match(
+          /SIP\/2\.0\s+\d{3}[^\r\n]*/i
+        )?.[0] || "";
+
+      return clean(statusLine).slice(
+        0,
+        500
+      );
+    } catch {
+      return "";
+    }
+  }
+
+  function formatSipOutboundFailure(
+    providerMessage,
+    sipDiagnostic = ""
+  ) {
+    const combined = clean(
+      [
+        providerMessage,
+        sipDiagnostic,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    );
+
+    if (
+      /\b403\b|forbidden/i.test(combined)
+    ) {
+      return (
+        "Telnyx rejected the SIP INVITE with 403 Forbidden. ReachFly verified the ElevenLabs phone-number mapping before dialing. Check that the ElevenLabs outbound trunk uses the same Telnyx FQDN SIP connection, that digest credentials match Telnyx, that the caller number is assigned to that connection, and that the connection has an outbound voice profile." +
+        (sipDiagnostic
+          ? ` Provider detail: ${sipDiagnostic}`
+          : "")
+      );
+    }
+
+    if (
+      /\b401\b|\b407\b|unauthor/i.test(
+        combined
+      )
+    ) {
+      return (
+        "The Telnyx SIP trunk rejected authentication. Verify the digest username/password configured for this ElevenLabs phone number against the Telnyx SIP connection." +
+        (sipDiagnostic
+          ? ` Provider detail: ${sipDiagnostic}`
+          : "")
+      );
+    }
+
+    return (
+      clean(providerMessage) ||
+      clean(sipDiagnostic) ||
+      "ElevenLabs could not initiate the SIP call."
+    );
   }
 
   function calendlyEventUrl() {
