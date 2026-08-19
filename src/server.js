@@ -2839,8 +2839,8 @@ function requireWorkspacePermission(
 }
 
 /**
- * Lead generation and campaign mutation are intentionally manager-only.
- * Owners retain workspace oversight, while callers work only assigned leads.
+ * Lead generation and campaign mutation are available to workspace owners,
+ * administrators and managers. Callers continue to work assigned leads only.
  */
 function requireLeadGenerationManager(
   req,
@@ -2860,30 +2860,26 @@ function requireLeadGenerationManager(
     .trim()
     .toLowerCase();
 
-  if (role !== "manager") {
+  if (!["owner", "admin", "manager"].includes(role)) {
     return res.status(403).json({
       error:
-        "Only workspace managers can generate leads and manage campaigns.",
+        "Only workspace owners, administrators, or managers can generate leads and manage campaigns.",
       code:
-        "MANAGER_LEAD_ACCESS_REQUIRED",
+        "LEAD_MANAGEMENT_ACCESS_REQUIRED",
     });
   }
 
-  const permissions =
-    Array.isArray(
-      context?.permissions
-    )
-      ? context.permissions
-      : [];
+  const permissions = Array.isArray(context?.permissions)
+    ? context.permissions
+    : [];
 
   if (
-    !permissions.includes(
-      "manage_campaigns"
-    )
+    !permissions.includes("*") &&
+    !permissions.includes("manage_campaigns")
   ) {
     return res.status(403).json({
       error:
-        "Your manager account does not have campaign management permission.",
+        "Your account does not have campaign management permission.",
       code:
         "MANAGE_CAMPAIGNS_PERMISSION_REQUIRED",
     });
@@ -2893,7 +2889,8 @@ function requireLeadGenerationManager(
 }
 
 /**
- * Assigning and reassigning leads is manager-only.
+ * Assigning and reassigning leads is available to workspace owners,
+ * administrators and managers.
  */
 function requireLeadAssignmentManager(
   req,
@@ -2913,30 +2910,26 @@ function requireLeadAssignmentManager(
     .trim()
     .toLowerCase();
 
-  if (role !== "manager") {
+  if (!["owner", "admin", "manager"].includes(role)) {
     return res.status(403).json({
       error:
-        "Only workspace managers can assign leads.",
+        "Only workspace owners, administrators, or managers can assign leads.",
       code:
-        "MANAGER_ASSIGNMENT_ACCESS_REQUIRED",
+        "LEAD_ASSIGNMENT_ACCESS_REQUIRED",
     });
   }
 
-  const permissions =
-    Array.isArray(
-      context?.permissions
-    )
-      ? context.permissions
-      : [];
+  const permissions = Array.isArray(context?.permissions)
+    ? context.permissions
+    : [];
 
   if (
-    !permissions.includes(
-      "assign_leads"
-    )
+    !permissions.includes("*") &&
+    !permissions.includes("assign_leads")
   ) {
     return res.status(403).json({
       error:
-        "Your manager account does not have lead assignment permission.",
+        "Your account does not have lead assignment permission.",
       code:
         "ASSIGN_LEADS_PERMISSION_REQUIRED",
     });
@@ -7172,6 +7165,19 @@ app.post(
   asyncRoute(async (req, res) => {
     res.json(
       await voiceCommerceService.testExistingNumberRouting(
+        req.user,
+        req.params.id
+      )
+    );
+  })
+);
+
+app.delete(
+  "/api/voice-commerce/numbers/:id",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await voiceCommerceService.unlinkExistingNumber(
         req.user,
         req.params.id
       )

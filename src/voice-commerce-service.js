@@ -434,12 +434,6 @@ export function createVoiceCommerceService({
         metadata: {
           source: "reachfly_voice_number_purchase",
           order_id: order.id,
-          workspace_id: ctx.workspaceId,
-          user_id: clean(user?.id),
-          quote_id: quoteId,
-          phone_number: phoneNumber,
-          calling_mode: order.callingMode,
-          product_type: "voice_number",
         },
       });
 
@@ -631,13 +625,6 @@ export function createVoiceCommerceService({
         metadata: {
           source: "reachfly_voice_bundle_purchase",
           order_id: order.id,
-          workspace_id: ctx.workspaceId,
-          user_id: clean(user?.id),
-          quote_id: quoteId,
-          phone_number: phoneNumber,
-          product_type: "voice_bundle",
-          bundle_id: bundle.id,
-          ai_call_credits: String(bundle.credits),
         },
       });
 
@@ -1441,6 +1428,24 @@ export function createVoiceCommerceService({
     }
 
     const state = store.read();
+
+    // A business number can belong to only one ReachFly workspace at a time.
+    // This prevents one tenant from taking over a number another tenant has
+    // already verified or is currently verifying.
+    const workspaceConflict = (state.voicePhoneNumbers || []).find(
+      (item) =>
+        item.workspaceId !== ctx.workspaceId &&
+        normalizePhone(item.phoneNumber) === phoneNumber &&
+        !["failed", "disconnected"].includes(normalizeStatus(item.status))
+    );
+    if (workspaceConflict) {
+      throw httpError(
+        409,
+        "This business number is already linked to another ReachFly workspace.",
+        "VOICE_EXISTING_NUMBER_WORKSPACE_CONFLICT"
+      );
+    }
+
     const existing = (state.voicePhoneNumbers || []).find(
       (item) =>
         item.workspaceId === ctx.workspaceId &&
@@ -1448,11 +1453,17 @@ export function createVoiceCommerceService({
         !["failed", "disconnected"].includes(normalizeStatus(item.status))
     );
     if (existing) {
+      const pendingVerification = ["pending_verification", "verifying"].includes(
+        normalizeStatus(existing.status)
+      );
       return {
         ok: true,
         reused: true,
         number: publicNumber(existing),
         testVerificationCode: "",
+        requiresVerificationCode:
+          pendingVerification &&
+          normalizeStatus(existing.verificationProvider) === "telnyx_verified_numbers",
         verification: existingNumberNextStep(existing),
         sipDestination: existingSipDestination(existing),
       };
@@ -1467,36 +1478,25 @@ export function createVoiceCommerceService({
       ? crypto.createHash("sha256").update(verificationCode).digest("hex")
       : "";
 
-    let telnyxVerificationId = "";
+    const verificationMethod = testMode
+      ? "sandbox_code"
+      : ["call", "sms"].includes(normalizeStatus(input.verificationMethod))
+        ? normalizeStatus(input.verificationMethod)
+        : "call";
+
     if (!testMode) {
       requireTelnyxCommerceApiKey();
-      const verifyProfileId = clean(process.env.TELNYX_VERIFY_PROFILE_ID);
-      if (!verifyProfileId) {
-        throw httpError(
-          503,
-          "Existing-number ownership verification is not configured yet.",
-          "TELNYX_VERIFY_PROFILE_ID_MISSING"
-        );
-      }
 
-      const verificationResponse = await telnyxRequest(
-        "/verifications/dtmf_confirm",
-        {
-          method: "POST",
-          body: {
-            phone_number: phoneNumber,
-            verify_profile_id: verifyProfileId,
-          },
-        }
-      );
-      telnyxVerificationId = clean(verificationResponse?.data?.id);
-      if (!telnyxVerificationId) {
-        throw httpError(
-          502,
-          "The ownership-verification call could not be started.",
-          "TELNYX_VERIFY_START_FAILED"
-        );
-      }
+      // Verified Numbers is Telnyx's purpose-built API for proving ownership of
+      // a non-Telnyx number before it is used as an outbound caller ID. This
+      // does not require a Telnyx Verify Profile.
+      await telnyxRequest("/verified_numbers", {
+        method: "POST",
+        body: {
+          phone_number: phoneNumber,
+          verification_method: verificationMethod,
+        },
+      });
     }
 
     const record = {
@@ -1524,9 +1524,11 @@ export function createVoiceCommerceService({
       ownershipVerified: false,
       verificationHash,
       verificationAttempts: 0,
-      telnyxVerificationId,
-      verificationProvider: testMode ? "reachfly_sandbox" : "telnyx_dtmf_confirm",
-      verificationStatus: testMode ? "code_required" : "pending",
+      verificationMethod,
+      verificationProvider: testMode
+        ? "reachfly_sandbox"
+        : "telnyx_verified_numbers",
+      verificationStatus: testMode ? "code_required" : "code_required",
       status: testMode ? "verifying" : "pending_verification",
       testMode,
       createdAt: now,
@@ -1541,7 +1543,7 @@ export function createVoiceCommerceService({
         actorId: clean(user?.id),
         type: "voice_existing_number_started",
         title: `Existing business number ${phoneNumber} added for verification`,
-        detail: `${method} · ${callingMode}`,
+        detail: `${method} · ${callingMode} · ${verificationMethod}`,
       });
     });
 
@@ -1549,9 +1551,12 @@ export function createVoiceCommerceService({
       ok: true,
       number: publicNumber(record),
       testVerificationCode: testMode ? verificationCode : "",
+      requiresVerificationCode: !testMode,
       verification: testMode
         ? "Enter the sandbox verification code to complete QA."
-        : "ReachFly is calling this business number now. Answer the verification call and press 1, then click Check verification status.",
+        : verificationMethod === "sms"
+          ? "Telnyx sent an ownership-verification code by SMS. Enter the code below to connect this number."
+          : "Answer the Telnyx ownership-verification call, note the verification code, then enter it below.",
       sipDestination: "",
     };
   }
@@ -1660,48 +1665,44 @@ export function createVoiceCommerceService({
       );
     }
 
-    const verificationId = clean(current.telnyxVerificationId);
-    if (!verificationId) {
+    if (normalizeStatus(current.verificationProvider) !== "telnyx_verified_numbers") {
       throw httpError(
         409,
-        "No production ownership verification is attached to this number. Start the connection again.",
-        "VOICE_EXISTING_NUMBER_VERIFICATION_MISSING"
+        "This number uses an older ownership-verification flow. Unlink it and connect it again.",
+        "VOICE_EXISTING_NUMBER_LEGACY_VERIFICATION"
       );
     }
 
-    const verificationResponse = await telnyxRequest(
-      `/verifications/${encodeURIComponent(verificationId)}`
-    );
-    const verificationStatus = normalizeStatus(
-      verificationResponse?.data?.status || "pending"
-    );
+    if (!code) {
+      throw httpError(
+        422,
+        "Enter the ownership-verification code sent by Telnyx.",
+        "VOICE_EXISTING_NUMBER_CODE_REQUIRED"
+      );
+    }
 
-    if (verificationStatus !== "accepted") {
+    try {
+      await telnyxRequest(
+        `/verified_numbers/${encodeURIComponent(normalizePhone(current.phoneNumber))}/actions/verify`,
+        {
+          method: "POST",
+          body: { verification_code: code },
+        }
+      );
+    } catch (error) {
       store.update((draft) => {
         ensureStateShape(draft);
         const target = draft.voicePhoneNumbers.find((item) => item.id === id);
         if (!target) return;
-        target.verificationStatus = verificationStatus || "pending";
+        target.verificationAttempts = Number(target.verificationAttempts || 0) + 1;
+        target.verificationStatus = "code_rejected";
         target.updatedAt = new Date().toISOString();
       });
-
-      if (["invalid", "expired", "error", "failed"].includes(verificationStatus)) {
-        throw httpError(
-          409,
-          "Ownership verification did not complete. Start the existing-number connection again and answer the verification call.",
-          "VOICE_EXISTING_NUMBER_VERIFICATION_FAILED",
-          { status: verificationStatus }
-        );
-      }
-
-      return {
-        ok: true,
-        pending: true,
-        number: publicNumber({ ...current, verificationStatus }),
-        verification:
-          "Verification is still pending. Answer the ReachFly verification call, press 1, then check again.",
-        sipDestination: "",
-      };
+      throw httpError(
+        error?.statusCode || 422,
+        error?.message || "The ownership-verification code was not accepted.",
+        "VOICE_EXISTING_NUMBER_VERIFICATION_FAILED"
+      );
     }
 
     return await activateVerifiedExistingNumber(current, user);
@@ -1878,6 +1879,125 @@ export function createVoiceCommerceService({
     };
   }
 
+  async function unlinkExistingNumber(user, numberId) {
+    const ctx = assertPurchaser(user);
+    const id = clean(numberId);
+    const state = store.read();
+    const current = (state.voicePhoneNumbers || []).find(
+      (item) => item.id === id && item.workspaceId === ctx.workspaceId
+    );
+
+    if (!current) {
+      throw httpError(404, "Business number was not found.");
+    }
+    if (normalizeStatus(current.source) !== "existing_number") {
+      throw httpError(
+        409,
+        "ReachFly-managed purchased numbers cannot be unlinked here. Use a dedicated number-release workflow so a paid carrier number is never released accidentally.",
+        "VOICE_MANAGED_NUMBER_RELEASE_REQUIRED"
+      );
+    }
+
+    const phoneNumber = normalizePhone(current.phoneNumber);
+    const phoneNumberId = clean(current.elevenLabsPhoneNumberId);
+    const activeCallStatuses = new Set([
+      "creating",
+      "queued",
+      "initiated",
+      "ringing",
+      "answered",
+      "assistant_active",
+      "active",
+      "streaming",
+      "connected",
+      "in_progress",
+    ]);
+    const activeCall = (state.telnyxAiAgentCalls || []).find(
+      (call) =>
+        call.workspaceId === ctx.workspaceId &&
+        activeCallStatuses.has(normalizeStatus(call.status)) &&
+        [call.fromNumber, call.displayFromNumber, call.requestedFromNumber]
+          .map(normalizePhone)
+          .includes(phoneNumber)
+    );
+    if (activeCall) {
+      throw httpError(
+        409,
+        "End the active call using this business number before unlinking it.",
+        "VOICE_NUMBER_ACTIVE_CALL"
+      );
+    }
+
+    let telnyxVerifiedNumberRemoved = false;
+    let elevenLabsPhoneNumberRemoved = false;
+
+    // Sandbox records may reuse a shared test phone ID. Never delete that
+    // provider record when unlinking a sandbox number.
+    if (!current.testMode) {
+      if (normalizeStatus(current.verificationProvider) === "telnyx_verified_numbers") {
+        const telnyxResult = await deleteTelnyxVerifiedNumber(phoneNumber);
+        telnyxVerifiedNumberRemoved = telnyxResult.removed || telnyxResult.notFound;
+      }
+
+      if (phoneNumberId) {
+        const elevenResult = await deleteElevenLabsPhoneNumber(phoneNumberId);
+        elevenLabsPhoneNumberRemoved = elevenResult.removed || elevenResult.notFound;
+      }
+    }
+
+    const now = new Date().toISOString();
+    store.update((draft) => {
+      ensureStateShape(draft);
+
+      draft.voicePhoneNumbers = (draft.voicePhoneNumbers || []).filter(
+        (item) => !(item.id === id && item.workspaceId === ctx.workspaceId)
+      );
+
+      // Remove stale business-number references from every managed agent in
+      // this workspace. Provider agent identity remains intact; the workspace
+      // simply returns to "business number not connected" until another number
+      // is selected.
+      for (const agent of draft.telnyxAiAgents || []) {
+        if (agent.workspaceId !== ctx.workspaceId) continue;
+        const fromMatches = normalizePhone(agent.fromNumber) === phoneNumber;
+        const idMatches =
+          phoneNumberId && clean(agent.elevenLabsPhoneNumberId) === phoneNumberId;
+        if (!fromMatches && !idMatches) continue;
+
+        if (fromMatches) agent.fromNumber = "";
+        if (fromMatches || idMatches) agent.elevenLabsPhoneNumberId = "";
+        if (clean(agent.phoneNumberId) === phoneNumberId) agent.phoneNumberId = "";
+        if (clean(agent.sipPhoneNumberId) === phoneNumberId) agent.sipPhoneNumberId = "";
+        agent.numberDisconnectedAt = now;
+        agent.updatedAt = now;
+      }
+
+      appendActivity(draft, {
+        workspaceId: ctx.workspaceId,
+        actorId: clean(user?.id),
+        type: "voice_existing_number_unlinked",
+        title: `Existing business number ${phoneNumber} unlinked`,
+        detail: "Removed from ReachFly and disconnected from managed Telnyx/ElevenLabs number routing.",
+        createdAt: now,
+      });
+    });
+
+    emit({
+      workspaceId: ctx.workspaceId,
+      event: "voice-commerce:number-unlinked",
+      payload: { id, phoneNumber },
+    });
+
+    return {
+      ok: true,
+      unlinked: true,
+      id,
+      phoneNumber,
+      telnyxVerifiedNumberRemoved,
+      elevenLabsPhoneNumberRemoved,
+    };
+  }
+
   function existingSipDestination(number) {
     if (!number || number.connectionMethod !== "sip_byoc" || !number.ownershipVerified) {
       return "";
@@ -1912,6 +2032,7 @@ export function createVoiceCommerceService({
     connectExistingNumber,
     verifyExistingNumber,
     testExistingNumberRouting,
+    unlinkExistingNumber,
     getOrder,
     retryProvision,
     handleVerifiedSafepayEvent,
@@ -2000,6 +2121,98 @@ async function elevenLabsRequest(path, { method = "GET", body, apiKey } = {}) {
   return payload;
 }
 
+async function deleteTelnyxVerifiedNumber(phoneNumber) {
+  const normalized = normalizePhone(phoneNumber);
+  if (!normalized) return { removed: false, notFound: true };
+
+  const response = await fetch(
+    `${TELNYX_API_BASE}/verified_numbers/${encodeURIComponent(normalized)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${requireTelnyxCommerceApiKey()}`,
+        Accept: "application/json",
+      },
+    }
+  );
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { message: text };
+  }
+
+  if (response.status === 404) return { removed: false, notFound: true };
+  if (!response.ok) {
+    const message = clean(
+      payload?.errors?.[0]?.detail ||
+        payload?.errors?.[0]?.title ||
+        payload?.message ||
+        `Telnyx verified-number deletion failed with ${response.status}.`
+    );
+    throw httpError(
+      [401, 403].includes(Number(response.status)) ? 502 : response.status || 502,
+      message,
+      "TELNYX_VERIFIED_NUMBER_UNLINK_FAILED"
+    );
+  }
+  return { removed: true, notFound: false };
+}
+
+async function deleteElevenLabsPhoneNumber(phoneNumberId) {
+  const id = clean(phoneNumberId);
+  if (!id) return { removed: false, notFound: true };
+
+  const response = await fetch(
+    `${ELEVENLABS_API_BASE}/v1/convai/phone-numbers/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+      headers: {
+        "xi-api-key": requireEnv("ELEVENLABS_API_KEY"),
+        Accept: "application/json",
+      },
+    }
+  );
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { message: text };
+  }
+
+  if (response.status === 404) return { removed: false, notFound: true };
+  if (!response.ok) {
+    const message = clean(
+      payload?.detail?.message ||
+        payload?.detail ||
+        payload?.message ||
+        `ElevenLabs phone-number deletion failed with ${response.status}.`
+    );
+    throw httpError(
+      [401, 403].includes(Number(response.status)) ? 502 : response.status || 502,
+      message,
+      "ELEVENLABS_PHONE_NUMBER_UNLINK_FAILED"
+    );
+  }
+  return { removed: true, notFound: false };
+}
+
+function buildSafepayMetadata(metadata = {}, orderId = "") {
+  // Safepay's payment-session metadata accepts its documented commerce keys.
+  // Keep workspace/user/product details in ReachFly's own order record rather
+  // than sending unsupported provider metadata keys such as workspace_id.
+  const source = clean(metadata?.source || "reachfly").slice(0, 120);
+  const resolvedOrderId = clean(
+    metadata?.order_id || metadata?.orderId || orderId
+  ).slice(0, 200);
+  return {
+    source: source || "reachfly",
+    order_id: resolvedOrderId,
+  };
+}
+
 async function createSafepayCheckout({
   amountMinor,
   currency,
@@ -2017,7 +2230,7 @@ async function createSafepayCheckout({
     entry_mode: "raw",
     currency,
     amount: amountMinor,
-    metadata,
+    metadata: buildSafepayMetadata(metadata, orderId),
     include_fees: false,
   });
   const tracker = clean(
@@ -2307,7 +2520,10 @@ function publicNumber(item = {}) {
     outboundStatus: normalizeStatus(item.outboundStatus || "disabled"),
     ownershipVerified: item.ownershipVerified === true,
     verificationStatus: normalizeStatus(item.verificationStatus || ""),
+    verificationMethod: normalizeStatus(item.verificationMethod || ""),
+    verificationProvider: normalizeStatus(item.verificationProvider || ""),
     routingVerified: item.routingVerified === true,
+    elevenLabsPhoneNumberId: item.elevenLabsPhoneNumberId || "",
     testMode: Boolean(item.testMode),
     status: normalizeStatus(item.status || "unknown"),
     providerMonthlyMinor: Number(item.providerMonthlyMinor || 0),
