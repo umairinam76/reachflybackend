@@ -187,6 +187,7 @@ function buildQueries({
   location,
   locationVariants = [],
   maxQueries,
+  recoveryRound = 0,
 }) {
   const baseNiche = cleanText(niche);
   const baseLocation = cleanText(location);
@@ -201,18 +202,54 @@ function buildQueries({
     ...locationVariants,
   ]).slice(0, 8);
 
+  const round =
+    Math.max(
+      0,
+      Number(recoveryRound || 0)
+    ) % 4;
+
+  const patterns = [
+    (targetNiche, targetLocation) => [
+      `${targetNiche} in ${targetLocation}`,
+      `${targetNiche} near ${targetLocation}`,
+      `${targetLocation} ${targetNiche}`,
+      `${targetNiche} ${targetLocation}`,
+    ],
+    (targetNiche, targetLocation) => [
+      `${targetNiche} businesses in ${targetLocation}`,
+      `${targetNiche} services in ${targetLocation}`,
+      `${targetNiche} providers in ${targetLocation}`,
+      `${targetLocation} ${targetNiche} services`,
+    ],
+    (targetNiche, targetLocation) => [
+      `local ${targetNiche} in ${targetLocation}`,
+      `${targetNiche} around ${targetLocation}`,
+      `${targetNiche} locations in ${targetLocation}`,
+      `${targetLocation} local ${targetNiche}`,
+    ],
+    (targetNiche, targetLocation) => [
+      `${targetNiche} in and around ${targetLocation}`,
+      `${targetNiche} close to ${targetLocation}`,
+      `${targetLocation} businesses ${targetNiche}`,
+      `${targetNiche} ${targetLocation} contact`,
+    ],
+  ][round];
+
   const queries = [];
 
   for (const targetLocation of locations) {
     for (const targetNiche of niches) {
       queries.push(
-        `${targetNiche} in ${targetLocation}`,
-        `${targetNiche} near ${targetLocation}`
+        ...patterns(
+          targetNiche,
+          targetLocation
+        )
       );
     }
   }
 
-  return uniqueStrings(queries).slice(0, maxQueries);
+  return uniqueStrings(queries)
+    .slice(0, maxQueries);
 }
 
 function mapPlaceToCandidate(
@@ -267,31 +304,63 @@ function mapPlaceToCandidate(
   };
 }
 
+function candidateIdentity(candidate = {}) {
+  const placeId = cleanText(candidate?.placeId);
+
+  if (placeId) {
+    return `place:${placeId}`;
+  }
+
+  const phone = cleanText(
+    candidate?.phone
+  ).replace(/\D/g, "");
+
+  if (phone.length >= 7) {
+    return `phone:${phone}`;
+  }
+
+  const name = cleanText(
+    candidate?.name ||
+      candidate?.business
+  ).toLowerCase();
+
+  const address = cleanText(
+    candidate?.address
+  ).toLowerCase();
+
+  if (name && address) {
+    return `name-address:${name}|${address}`;
+  }
+
+  const host = safeHostname(
+    candidate?.website
+  );
+
+  if (host) {
+    return `host:${host}`;
+  }
+
+  return name
+    ? `name:${name}`
+    : "";
+}
+
 function dedupeCandidates(candidates) {
-  const seenPlaceIds = new Set();
-  const seenHosts = new Set();
+  const seen = new Set();
   const output = [];
 
   for (const candidate of candidates) {
-    const placeId = cleanText(candidate?.placeId);
-    const host = safeHostname(candidate?.website);
+    if (!candidate) continue;
 
-    if (placeId && seenPlaceIds.has(placeId)) {
+    const key = candidateIdentity(
+      candidate
+    );
+
+    if (!key || seen.has(key)) {
       continue;
     }
 
-    if (host && seenHosts.has(host)) {
-      continue;
-    }
-
-    if (placeId) {
-      seenPlaceIds.add(placeId);
-    }
-
-    if (host) {
-      seenHosts.add(host);
-    }
-
+    seen.add(key);
     output.push(candidate);
   }
 
@@ -381,7 +450,7 @@ export function createGooglePlacesProvider(
 
   const searchTimeoutMs = numberFromEnv(
     "GOOGLE_PLACES_SEARCH_TIMEOUT_MS",
-    Number(options.searchTimeoutMs || 60_000),
+    Number(options.searchTimeoutMs || 280_000),
     5_000,
     600_000
   );
@@ -402,16 +471,23 @@ export function createGooglePlacesProvider(
 
   const maxQueries = numberFromEnv(
     "GOOGLE_PLACES_MAX_QUERIES",
-    Number(options.maxQueries || 8),
+    Number(options.maxQueries || 48),
     1,
-    50
+    100
   );
 
   const maxRequestsPerSearch = numberFromEnv(
     "GOOGLE_PLACES_MAX_REQUESTS_PER_SEARCH",
-    Number(options.maxRequestsPerSearch || 10),
+    Number(options.maxRequestsPerSearch || 120),
     1,
-    100
+    200
+  );
+
+  const exactFillRounds = numberFromEnv(
+    "GOOGLE_PLACES_EXACT_FILL_ROUNDS",
+    Number(options.exactFillRounds || 4),
+    1,
+    6
   );
 
   const pageTokenDelayMs = numberFromEnv(
@@ -483,6 +559,7 @@ export function createGooglePlacesProvider(
       pageSize,
       maxQueries,
       maxRequestsPerSearch,
+      exactFillRounds,
       pageTokenDelayMs,
       logLevel,
       fieldMask,
@@ -852,25 +929,6 @@ export function createGooglePlacesProvider(
     runtime.lastSearchAt =
       new Date().toISOString();
 
-    logger.info("search:entered", {
-      searchCallId,
-      searchCallNumber:
-        runtime.searchCalls,
-      niche,
-      location,
-      requestedLimit,
-      regionCode: input.regionCode,
-      nicheVariants:
-        input.nicheVariants,
-      locationVariants:
-        input.locationVariants,
-      runId: input.runId,
-      hasProgressCallback:
-        Boolean(onProgress),
-      hasCandidateBatchCallback:
-        Boolean(onCandidateBatch),
-    });
-
     if (!niche) {
       const error = new Error(
         "Google Places requires a target niche."
@@ -895,372 +953,684 @@ export function createGooglePlacesProvider(
       throw error;
     }
 
-    const queries = buildQueries({
-      niche,
-      nicheVariants:
-        input.nicheVariants || [],
-      location,
-      locationVariants:
-        input.locationVariants || [],
-      maxQueries,
-    });
-
     const runId =
       cleanText(input.runId) ||
       crypto.randomUUID().slice(0, 8);
 
     const startedAt = Date.now();
-    const deadlineAt =
+
+    const externalDeadlineAt =
+      Number(input.deadlineAt || 0);
+
+    const ownDeadlineAt =
       startedAt + searchTimeoutMs;
 
-    const allCandidates = [];
-    const emittedCandidateKeys = new Set();
-    let requestCount = 0;
-    let stoppedReason = "";
+    const deadlineAt =
+      externalDeadlineAt > startedAt
+        ? Math.min(
+            ownDeadlineAt,
+            externalDeadlineAt
+          )
+        : ownDeadlineAt;
 
-    logger.info("search:query-plan", {
+    const recoveryRoundOffset =
+      Math.max(
+        0,
+        Number(
+          input.recoveryRoundOffset || 0
+        )
+      );
+
+    const forceRefresh =
+      input.forceRefresh === true;
+
+    const allCandidates = [];
+    const emittedCandidateKeys =
+      new Set();
+    const executedQueries =
+      new Set();
+    const queriesUsed = [];
+
+    let requestCount = 0;
+    let queryCount = 0;
+    let stoppedReason = "";
+    let roundsAttempted = 0;
+
+    const requestBudget = Math.min(
+      180,
+      Math.max(
+        maxRequestsPerSearch,
+        Math.ceil(
+          requestedLimit /
+            Math.max(1, pageSize)
+        ) * 3
+      )
+    );
+
+    const uniqueCount = () =>
+      dedupeCandidates(
+        allCandidates
+      ).length;
+
+    logger.info("search:entered", {
       searchCallId,
-      runId,
+      searchCallNumber:
+        runtime.searchCalls,
       niche,
       location,
       requestedLimit,
-      queryCount: queries.length,
-      queries,
-      maxPages,
-      pageSize,
-      maxRequestsPerSearch,
-      maxPossibleRequests:
-        queries.length * maxPages,
-      searchTimeoutMs,
-      regionCode:
-        cleanRegionCode(input.regionCode),
-      keyFingerprint:
-        fingerprintSecret(apiKey),
+      regionCode: input.regionCode,
+      nicheVariants:
+        input.nicheVariants,
+      locationVariants:
+        input.locationVariants,
+      runId,
+      exact:
+        input.exact !== false,
+      recoveryRoundOffset,
+      forceRefresh,
+      exactFillRounds,
+      requestBudget,
+      deadlineInMs:
+        Math.max(
+          0,
+          deadlineAt - startedAt
+        ),
+      hasProgressCallback:
+        Boolean(onProgress),
+      hasCandidateBatchCallback:
+        Boolean(onCandidateBatch),
     });
 
-    outer:
+    recovery:
     for (
-      let queryIndex = 0;
-      queryIndex < queries.length;
-      queryIndex += 1
+      let localRound = 0;
+      localRound < exactFillRounds;
+      localRound += 1
     ) {
       if (
-        dedupeCandidates(allCandidates)
-          .length >= requestedLimit
+        uniqueCount() >=
+        requestedLimit
       ) {
         stoppedReason =
           "requested-limit-reached";
         break;
       }
 
-      const query = queries[queryIndex];
-      let pageToken = "";
+      if (
+        Date.now() >= deadlineAt
+      ) {
+        stoppedReason =
+          "search-timeout-reached";
+        break;
+      }
 
-      logger.info("search:query-start", {
-        searchCallId,
-        runId,
-        query,
-        queryIndex,
-        queryNumber: queryIndex + 1,
-        queryCount: queries.length,
-        uniqueWebsiteSeeds:
-          dedupeCandidates(allCandidates)
-            .length,
-      });
+      if (
+        requestCount >=
+        requestBudget
+      ) {
+        stoppedReason =
+          "max-requests-reached";
+        break;
+      }
+
+      const recoveryRound =
+        recoveryRoundOffset +
+        localRound;
+
+      const roundQueries =
+        buildQueries({
+          niche,
+          nicheVariants:
+            input.nicheVariants || [],
+          location,
+          locationVariants:
+            input.locationVariants || [],
+          maxQueries,
+          recoveryRound,
+        });
+
+      roundsAttempted += 1;
+
+      const beforeRound =
+        uniqueCount();
+
+      if (localRound > 0) {
+        onProgress?.({
+          type:
+            "google-places-exact-fill-round",
+          percent: Math.min(
+            52,
+            18 + localRound * 8
+          ),
+          message:
+            `Found ${beforeRound}/${requestedLimit} unique Google matches. Running another search pass to fill the requested total.`,
+          meta: {
+            runId,
+            recoveryRound,
+            localRound:
+              localRound + 1,
+            found: beforeRound,
+            requested:
+              requestedLimit,
+          },
+          createdAt:
+            new Date().toISOString(),
+        });
+      }
+
+      logger.info(
+        "search:recovery-round-start",
+        {
+          searchCallId,
+          runId,
+          localRound:
+            localRound + 1,
+          recoveryRound,
+          requestedLimit,
+          deliveredBefore:
+            beforeRound,
+          queryCount:
+            roundQueries.length,
+        }
+      );
 
       for (
-        let page = 1;
-        page <= maxPages;
-        page += 1
+        let queryIndex = 0;
+        queryIndex <
+        roundQueries.length;
+        queryIndex += 1
       ) {
-        const uniqueBefore =
-          dedupeCandidates(allCandidates)
-            .length;
-
         if (
-          uniqueBefore >= requestedLimit
+          uniqueCount() >=
+          requestedLimit
         ) {
           stoppedReason =
             "requested-limit-reached";
-          break outer;
+          break recovery;
         }
 
         if (
           requestCount >=
-          maxRequestsPerSearch
+          requestBudget
         ) {
           stoppedReason =
             "max-requests-reached";
-
-          logger.warn(
-            "search:max-requests-reached",
-            {
-              searchCallId,
-              runId,
-              requestCount,
-              maxRequestsPerSearch,
-              delivered: uniqueBefore,
-            }
-          );
-
-          break outer;
-        }
-
-        if (Date.now() >= deadlineAt) {
-          stoppedReason =
-            "search-timeout-reached";
-
-          logger.warn(
-            "search:deadline-reached",
-            {
-              searchCallId,
-              runId,
-              searchTimeoutMs,
-              requestCount,
-              delivered: uniqueBefore,
-            }
-          );
-
-          break outer;
+          break recovery;
         }
 
         if (
-          pageToken &&
-          pageTokenDelayMs > 0
+          Date.now() >= deadlineAt
         ) {
-          logger.debug(
-            "search:page-token-delay",
+          stoppedReason =
+            "search-timeout-reached";
+          break recovery;
+        }
+
+        const query =
+          roundQueries[queryIndex];
+
+        const normalizedQuery =
+          cleanText(query)
+            .toLowerCase();
+
+        /*
+         * Recovery round 4+ is allowed to refresh a prior query.
+         * Google does not guarantee identical result ordering/sets for
+         * identical Text Search requests, so a controlled refresh can
+         * sometimes surface additional Place IDs.
+         */
+        const allowRepeat =
+          forceRefresh ||
+          recoveryRound >= 3;
+
+        if (
+          !allowRepeat &&
+          executedQueries.has(
+            normalizedQuery
+          )
+        ) {
+          continue;
+        }
+
+        executedQueries.add(
+          normalizedQuery
+        );
+        queriesUsed.push(query);
+        queryCount += 1;
+
+        let pageToken = "";
+
+        for (
+          let page = 1;
+          page <= maxPages;
+          page += 1
+        ) {
+          const uniqueBefore =
+            uniqueCount();
+
+          if (
+            uniqueBefore >=
+            requestedLimit
+          ) {
+            stoppedReason =
+              "requested-limit-reached";
+            break recovery;
+          }
+
+          if (
+            requestCount >=
+            requestBudget
+          ) {
+            stoppedReason =
+              "max-requests-reached";
+
+            logger.warn(
+              "search:max-requests-reached",
+              {
+                searchCallId,
+                runId,
+                requestCount,
+                requestBudget,
+                delivered:
+                  uniqueBefore,
+              }
+            );
+
+            break recovery;
+          }
+
+          if (
+            Date.now() >=
+            deadlineAt
+          ) {
+            stoppedReason =
+              "search-timeout-reached";
+
+            logger.warn(
+              "search:deadline-reached",
+              {
+                searchCallId,
+                runId,
+                searchTimeoutMs,
+                requestCount,
+                delivered:
+                  uniqueBefore,
+              }
+            );
+
+            break recovery;
+          }
+
+          if (
+            pageToken &&
+            pageTokenDelayMs > 0
+          ) {
+            await delay(
+              pageTokenDelayMs
+            );
+          }
+
+          onProgress?.({
+            type:
+              "google-places-page-started",
+            percent: Math.min(
+              54,
+              5 +
+                localRound * 9 +
+                Math.min(
+                  8,
+                  queryIndex
+                )
+            ),
+            message:
+              `Google Places pass ${localRound + 1}/${exactFillRounds}: query ${queryIndex + 1}/${roundQueries.length}, page ${page}.`,
+            meta: {
+              runId,
+              query,
+              recoveryRound,
+              localRound:
+                localRound + 1,
+              queryIndex,
+              page,
+              found:
+                uniqueBefore,
+              requested:
+                requestedLimit,
+            },
+            createdAt:
+              new Date().toISOString(),
+          });
+
+          const result =
+            await requestPage({
+              textQuery: query,
+              pageToken,
+              regionCode:
+                input.regionCode,
+              requestContext: {
+                runId,
+                recoveryRound,
+                localRound,
+                queryIndex,
+                page,
+              },
+              deadlineAt,
+              externalSignal:
+                input.signal || null,
+            });
+
+          requestCount += 1;
+
+          const fetchedAt =
+            new Date()
+              .toISOString();
+
+          for (
+            const place of
+              result.places
+          ) {
+            const candidate =
+              mapPlaceToCandidate(
+                place,
+                {
+                  niche,
+                  location,
+                  query,
+                  fetchedAt,
+                }
+              );
+
+            const closedPermanently =
+              cleanText(
+                candidate
+                  .businessStatus
+              ).toUpperCase() ===
+                "CLOSED_PERMANENTLY";
+
+            const hasBusinessIdentity =
+              Boolean(
+                cleanText(
+                  candidate.placeId
+                ) ||
+                cleanText(
+                  candidate.name
+                ) ||
+                cleanText(
+                  candidate.address
+                ) ||
+                cleanText(
+                  candidate.phone
+                ) ||
+                cleanText(
+                  candidate.website
+                )
+              );
+
+            if (
+              !closedPermanently &&
+              hasBusinessIdentity
+            ) {
+              allCandidates.push(
+                candidate
+              );
+            }
+          }
+
+          const uniqueCandidates =
+            dedupeCandidates(
+              allCandidates
+            );
+
+          const currentUniqueCount =
+            uniqueCandidates.length;
+
+          const freshCandidates =
+            uniqueCandidates.filter(
+              (candidate) => {
+                const key =
+                  candidateIdentity(
+                    candidate
+                  );
+
+                if (
+                  !key ||
+                  emittedCandidateKeys
+                    .has(key)
+                ) {
+                  return false;
+                }
+
+                emittedCandidateKeys
+                  .add(key);
+
+                return true;
+              }
+            );
+
+          if (
+            freshCandidates.length &&
+            onCandidateBatch
+          ) {
+            try {
+              await onCandidateBatch({
+                candidates:
+                  freshCandidates,
+                total:
+                  currentUniqueCount,
+                query,
+                queryIndex,
+                page,
+                requestId:
+                  result.requestId,
+                runId,
+                recoveryRound,
+                localRound:
+                  localRound + 1,
+                createdAt:
+                  new Date()
+                    .toISOString(),
+              });
+            } catch (error) {
+              logger.warn(
+                "search:candidate-batch-callback-failed",
+                {
+                  searchCallId,
+                  runId,
+                  query,
+                  page,
+                  error:
+                    cleanText(
+                      error?.message
+                    ) ||
+                    String(error),
+                }
+              );
+            }
+          }
+
+          logger.info(
+            "search:page-complete",
             {
               searchCallId,
               runId,
-              page,
-              delayMs:
-                pageTokenDelayMs,
-            }
-          );
-
-          await delay(pageTokenDelayMs);
-        }
-
-        onProgress?.({
-          type:
-            "google-places-page-started",
-          percent: Math.min(
-            17,
-            4 + queryIndex + page
-          ),
-          message:
-            `Google Places query ${queryIndex + 1}/${queries.length}, page ${page}.`,
-          meta: {
-            runId,
-            query,
-            queryIndex,
-            page,
-          },
-          createdAt:
-            new Date().toISOString(),
-        });
-
-        logger.info("search:page-start", {
-          searchCallId,
-          runId,
-          query,
-          queryIndex,
-          page,
-          maxPages,
-          hasPageToken:
-            Boolean(pageToken),
-          requestNumber:
-            requestCount + 1,
-          maxRequestsPerSearch,
-          uniqueWebsiteSeeds:
-            uniqueBefore,
-        });
-
-        const result = await requestPage({
-          textQuery: query,
-          pageToken,
-          regionCode: input.regionCode,
-          requestContext: {
-            runId,
-            queryIndex,
-            page,
-          },
-          deadlineAt,
-          externalSignal:
-            input.signal || null,
-        });
-
-        requestCount += 1;
-
-        const fetchedAt =
-          new Date().toISOString();
-
-        for (const place of result.places) {
-          const candidate =
-            mapPlaceToCandidate(place, {
-              niche,
-              location,
-              query,
-              fetchedAt,
-            });
-
-          if (candidate.website) {
-            allCandidates.push(candidate);
-          }
-        }
-
-        const uniqueCandidates =
-          dedupeCandidates(allCandidates);
-
-        const uniqueCount =
-          uniqueCandidates.length;
-
-        const freshCandidates =
-          uniqueCandidates.filter((candidate) => {
-            const key =
-              cleanText(candidate.placeId) ||
-              safeHostname(candidate.website) ||
-              `${cleanText(candidate.name)}|${cleanText(candidate.address)}`;
-
-            if (!key || emittedCandidateKeys.has(key)) {
-              return false;
-            }
-
-            emittedCandidateKeys.add(key);
-            return true;
-          });
-
-        if (freshCandidates.length && onCandidateBatch) {
-          try {
-            await onCandidateBatch({
-              candidates: freshCandidates,
-              total: uniqueCount,
+              recoveryRound,
+              localRound:
+                localRound + 1,
               query,
               queryIndex,
               page,
-              requestId: result.requestId,
-              runId,
-              createdAt: new Date().toISOString(),
-            });
-          } catch (error) {
-            logger.warn("search:candidate-batch-callback-failed", {
-              searchCallId,
-              runId,
-              query,
-              page,
-              error: cleanText(error?.message) || String(error),
-            });
+              requestId:
+                result.requestId,
+              rawReturned:
+                result.places
+                  .length,
+              uniqueCandidates:
+                currentUniqueCount,
+              freshCandidates:
+                freshCandidates
+                  .length,
+              hasNextPage:
+                Boolean(
+                  result
+                    .nextPageToken
+                ),
+              requestElapsedMs:
+                result.elapsedMs,
+            }
+          );
+
+          pageToken =
+            result.nextPageToken;
+
+          if (!pageToken) {
+            break;
           }
         }
+      }
 
-        logger.info("search:page-complete", {
+      const afterRound =
+        uniqueCount();
+
+      logger.info(
+        "search:recovery-round-complete",
+        {
           searchCallId,
           runId,
-          query,
-          queryIndex,
-          page,
-          requestId: result.requestId,
-          rawReturned:
-            result.places.length,
-          uniqueWebsiteSeeds:
-            uniqueCount,
-          hasNextPage: Boolean(
-            result.nextPageToken
-          ),
-          requestElapsedMs:
-            result.elapsedMs,
-        });
-
-        onProgress?.({
-          type:
-            "google-places-page-complete",
-          percent: Math.min(
-            17,
-            5 + queryIndex + page
-          ),
-          message:
-            `Google Places returned ${result.places.length} places; ${uniqueCount} unique website seeds collected.`,
-          meta: {
-            runId,
-            query,
-            queryIndex,
-            page,
-            returned:
-              result.places.length,
-            uniqueWebsiteSeeds:
-              uniqueCount,
-            requestId:
-              result.requestId,
-          },
-          createdAt:
-            new Date().toISOString(),
-        });
-
-        pageToken =
-          result.nextPageToken;
-
-        if (!pageToken) {
-          break;
+          localRound:
+            localRound + 1,
+          recoveryRound,
+          requestedLimit,
+          deliveredBefore:
+            beforeRound,
+          deliveredAfter:
+            afterRound,
+          added:
+            Math.max(
+              0,
+              afterRound -
+                beforeRound
+            ),
+          requestCount,
         }
+      );
+
+      if (
+        afterRound >=
+        requestedLimit
+      ) {
+        stoppedReason =
+          "requested-limit-reached";
+        break;
       }
     }
 
     const candidates =
-      dedupeCandidates(allCandidates)
-        .slice(0, requestedLimit);
+      dedupeCandidates(
+        allCandidates
+      ).slice(
+        0,
+        requestedLimit
+      );
+
+    const delivered =
+      candidates.length;
+
+    const exact =
+      delivered ===
+      requestedLimit;
+
+    const shortfall =
+      Math.max(
+        0,
+        requestedLimit -
+          delivered
+      );
 
     const elapsedMs =
-      Date.now() - startedAt;
+      Date.now() -
+      startedAt;
 
-    logger.info("search:complete", {
-      searchCallId,
-      runId,
-      niche,
-      location,
-      requestedLimit,
-      delivered: candidates.length,
-      requestCount,
-      queryCount: queries.length,
-      elapsedMs,
-      stoppedReason:
-        stoppedReason || "completed",
-      ...(logger.sampleRecords
-        ? {
-            samples: candidates
-              .slice(0, 5)
-              .map((candidate) => ({
-                placeId:
-                  candidate.placeId,
-                name:
-                  candidate.name,
-                websiteHost:
-                  safeHostname(
-                    candidate.website
+    if (
+      !stoppedReason
+    ) {
+      stoppedReason = exact
+        ? "requested-limit-reached"
+        : "recovery-rounds-exhausted";
+    }
+
+    logger.info(
+      "search:complete",
+      {
+        searchCallId,
+        runId,
+        niche,
+        location,
+        requestedLimit,
+        delivered,
+        shortfall,
+        exact,
+        requestCount,
+        queryCount,
+        roundsAttempted,
+        elapsedMs,
+        stoppedReason,
+        ...(logger.sampleRecords
+          ? {
+              samples:
+                candidates
+                  .slice(0, 5)
+                  .map(
+                    (candidate) => ({
+                      placeId:
+                        candidate
+                          .placeId,
+                      name:
+                        candidate
+                          .name,
+                      websiteHost:
+                        safeHostname(
+                          candidate
+                            .website
+                        ),
+                      hasPhone:
+                        Boolean(
+                          candidate
+                            .phone
+                        ),
+                    })
                   ),
-                hasPhone:
-                  Boolean(candidate.phone),
-              })),
-          }
-        : {}),
-    });
+            }
+          : {}),
+      }
+    );
 
     return {
       candidates,
       meta: {
-        provider: "google-places",
+        provider:
+          "google-places",
         runId,
-        requested: requestedLimit,
-        delivered: candidates.length,
+        requested:
+          requestedLimit,
+        delivered,
+        exact,
+        shortfall,
         requestCount,
-        queryCount: queries.length,
-        queries,
+        queryCount,
+        queries:
+          queriesUsed,
         maxPages,
         pageSize,
+        maxQueries,
         maxRequestsPerSearch,
+        requestBudget,
+        exactFillRounds,
+        roundsAttempted,
+        recoveryRoundOffset,
+        forceRefresh,
         searchTimeoutMs,
-        stoppedReason:
-          stoppedReason || "completed",
+        stoppedReason,
         elapsedMs,
       },
     };

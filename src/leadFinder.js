@@ -310,16 +310,42 @@ export function createLeadFinder(options = {}) {
 
     const nicheVariants = buildNicheVariants(niche);
 
+    const exactMode =
+      input.exact !== false;
+
     const discoveryTarget = Math.min(
       1_000,
       Math.max(
         requestedLimit,
-        requestedLimit * 2,
-        requestedLimit + 30
+        exactMode
+          ? requestedLimit * 3
+          : requestedLimit * 2,
+        requestedLimit +
+          (exactMode ? 80 : 30)
       )
     );
 
-    const deadlineAt = startedAt + totalBudgetMs;
+    const deadlineAt =
+      startedAt + totalBudgetMs;
+
+    const remainingMs = () =>
+      Math.max(
+        0,
+        deadlineAt - Date.now()
+      );
+
+    const exactFillPasses =
+      exactMode
+        ? clampNumber(
+            Number(
+              process.env
+                .LEAD_EXACT_FILL_PASSES ||
+                2
+            ),
+            1,
+            3
+          )
+        : 1;
 
     leadLog(runId, "started", {
       niche,
@@ -347,55 +373,235 @@ export function createLeadFinder(options = {}) {
       },
     });
 
-    const providerResult =
-      await placesProvider.searchCandidates({
-        runId,
-        niche,
-        nicheVariants,
-        location,
-        limit: discoveryTarget,
-        regionCode: cleanText(input.regionCode),
-        locationVariants: Array.isArray(
-          input.locationVariants
-        )
-          ? input.locationVariants
-          : [],
-        signal,
-        onProgress,
-        onCandidateBatch: async (batch) => {
-          await emitLeadBatch(batch?.candidates || [], {
-            phase: "discovery",
-            total: batch?.total || 0,
-            query: batch?.query || "",
-            queryIndex: batch?.queryIndex || 0,
-            page: batch?.page || 0,
-          });
-        },
-      });
+    const providerRuns = [];
+    let seeds = [];
 
-    const seeds = dedupeLeads(
-      providerResult?.candidates || []
+    for (
+      let fillPass = 0;
+      fillPass < exactFillPasses;
+      fillPass += 1
+    ) {
+      if (
+        isAborted() ||
+        remainingMs() <= 5_000
+      ) {
+        break;
+      }
+
+      if (fillPass > 0) {
+        const currentlyUsable =
+          rankLeads(
+            seeds.map((seed) =>
+              normalizeGoogleLead(
+                seed,
+                {
+                  niche,
+                  location,
+                }
+              )
+            ),
+            {
+              niche,
+              location,
+              minScore,
+              exact:
+                exactMode,
+            }
+          ).length;
+
+        if (
+          currentlyUsable >=
+          requestedLimit
+        ) {
+          break;
+        }
+
+        progress(onProgress, {
+          type:
+            "lead-exact-fill-pass",
+          percent: Math.min(
+            54,
+            38 + fillPass * 8
+          ),
+          message:
+            `Found ${currentlyUsable}/${requestedLimit} usable matching leads. Running another Google Places pass to fill the requested total.`,
+          meta: {
+            runId,
+            fillPass:
+              fillPass + 1,
+            found:
+              currentlyUsable,
+            requested:
+              requestedLimit,
+          },
+        });
+      }
+
+      const passTarget =
+        Math.min(
+          1_000,
+          Math.max(
+            discoveryTarget,
+            requestedLimit *
+              (3 + fillPass)
+          )
+        );
+
+      const passResult =
+        await placesProvider
+          .searchCandidates({
+            runId:
+              `${runId}-p${fillPass + 1}`,
+            niche,
+            nicheVariants,
+            location,
+            limit:
+              passTarget,
+            regionCode:
+              cleanText(
+                input.regionCode
+              ),
+            locationVariants:
+              Array.isArray(
+                input.locationVariants
+              )
+                ? input
+                    .locationVariants
+                : [],
+            exact:
+              exactMode,
+            deadlineAt,
+            recoveryRoundOffset:
+              fillPass * 2,
+            forceRefresh:
+              fillPass > 0,
+            signal,
+            onProgress,
+            onCandidateBatch:
+              async (batch) => {
+                await emitLeadBatch(
+                  batch?.candidates ||
+                    [],
+                  {
+                    phase:
+                      "discovery",
+                    total:
+                      batch?.total ||
+                      0,
+                    query:
+                      batch?.query ||
+                      "",
+                    queryIndex:
+                      batch
+                        ?.queryIndex ||
+                      0,
+                    page:
+                      batch?.page ||
+                      0,
+                  }
+                );
+              },
+          });
+
+      providerRuns.push(
+        passResult
+      );
+
+      seeds = dedupeLeads([
+        ...seeds,
+        ...(
+          passResult
+            ?.candidates || []
+        ),
+      ]);
+
+      const usableAfterPass =
+        rankLeads(
+          seeds.map((seed) =>
+            normalizeGoogleLead(
+              seed,
+              {
+                niche,
+                location,
+              }
+            )
+          ),
+          {
+            niche,
+            location,
+            minScore,
+            exact:
+              exactMode,
+          }
+        ).length;
+
+      leadLog(
+        runId,
+        "google-places:fill-pass",
+        {
+          fillPass:
+            fillPass + 1,
+          passTarget,
+          candidateCount:
+            seeds.length,
+          usableCount:
+            usableAfterPass,
+          requested:
+            requestedLimit,
+          providerMeta:
+            passResult?.meta ||
+            {},
+        }
+      );
+
+      if (
+        !exactMode ||
+        usableAfterPass >=
+          requestedLimit
+      ) {
+        break;
+      }
+    }
+
+    const providerResult =
+      providerRuns[
+        providerRuns.length - 1
+      ] || {
+        candidates: [],
+        meta: {},
+      };
+
+    leadLog(
+      runId,
+      "google-places:complete",
+      {
+        seeds:
+          seeds.length,
+        providerRuns:
+          providerRuns.length,
+        meta:
+          providerResult?.meta ||
+          {},
+      }
     );
 
-    leadLog(runId, "google-places:complete", {
-      seeds: seeds.length,
-      meta: providerResult?.meta || {},
-    });
-
     progress(onProgress, {
-      type: "lead-google-places-complete",
+      type:
+        "lead-google-places-complete",
       percent: 55,
       message:
-        `Google Places returned ${seeds.length} unique business website leads.`,
+        `Google Places returned ${seeds.length} unique matching business candidates.`,
       meta: {
         runId,
-        seedCount: seeds.length,
-        providerMeta: providerResult?.meta || {},
+        seedCount:
+          seeds.length,
+        providerRuns:
+          providerRuns.length,
+        providerMeta:
+          providerResult?.meta ||
+          {},
       },
     });
-
-    const remainingMs = () =>
-      Math.max(0, deadlineAt - Date.now());
 
     const enrichLimit =
       remainingMs() > websiteTimeoutMs
@@ -531,6 +737,7 @@ export function createLeadFinder(options = {}) {
       niche,
       location,
       minScore,
+      exact: exactMode,
     });
 
     const leads = ranked.slice(
@@ -557,7 +764,7 @@ export function createLeadFinder(options = {}) {
       ? `Found exactly ${delivered} Google Places leads.`
       : delivered
         ? `Found ${delivered} Google Places leads. ${shortfall} more were requested but were not available within the configured Google search limits.`
-        : "Google Places did not return any usable business website leads for this search.";
+        : "Google Places did not return any usable matching business leads for this search.";
 
     progress(onProgress, {
       type: "lead-search-complete",
@@ -595,6 +802,11 @@ export function createLeadFinder(options = {}) {
         elapsedMs: Date.now() - startedAt,
         providerMeta:
           providerResult?.meta || {},
+        providerRuns:
+          providerRuns.map(
+            (item) =>
+              item?.meta || {}
+          ),
       },
     };
 
@@ -971,22 +1183,56 @@ function scoreLead(
 
 function rankLeads(
   leads,
-  { niche, location, minScore }
+  {
+    niche,
+    location,
+    minScore,
+    exact = false,
+  }
 ) {
-  return dedupeLeads(leads)
-    .map((lead) =>
-      scoreLead(lead, {
-        niche,
-        location,
-      })
-    )
-    .filter(
-      (lead) =>
-        lead.qualityScore >=
+  const scored =
+    dedupeLeads(leads)
+      .map((lead) =>
+        scoreLead(lead, {
+          niche,
+          location,
+        })
+      )
+      .filter(isRightLead);
+
+  const eligible = exact
+    ? scored
+    : scored.filter(
+        (lead) =>
+          lead.qualityScore >=
+          minScore
+      );
+
+  return eligible.sort(
+    (a, b) => {
+      const aPreferred =
+        a.qualityScore >=
         minScore
-    )
-    .filter(isRightLead)
-    .sort((a, b) => {
+          ? 1
+          : 0;
+
+      const bPreferred =
+        b.qualityScore >=
+        minScore
+          ? 1
+          : 0;
+
+      if (
+        exact &&
+        bPreferred !==
+          aPreferred
+      ) {
+        return (
+          bPreferred -
+          aPreferred
+        );
+      }
+
       if (
         b.qualityScore !==
         a.qualityScore
@@ -1002,8 +1248,12 @@ function rankLeads(
         Boolean(a.email)
       ) {
         return (
-          Number(Boolean(b.email)) -
-          Number(Boolean(a.email))
+          Number(
+            Boolean(b.email)
+          ) -
+          Number(
+            Boolean(a.email)
+          )
         );
       }
 
@@ -1012,8 +1262,12 @@ function rankLeads(
         Boolean(a.phone)
       ) {
         return (
-          Number(Boolean(b.phone)) -
-          Number(Boolean(a.phone))
+          Number(
+            Boolean(b.phone)
+          ) -
+          Number(
+            Boolean(a.phone)
+          )
         );
       }
 
@@ -1022,7 +1276,8 @@ function rankLeads(
       ).localeCompare(
         String(b.name)
       );
-    });
+    }
+  );
 }
 
 export function isRightLead(
@@ -1040,7 +1295,17 @@ export function isRightLead(
     return false;
   }
 
-  if (!lead.website) {
+  const hasUsableBusinessIdentity =
+    Boolean(
+      lead.website ||
+      lead.phone ||
+      lead.placeId ||
+      lead.address
+    );
+
+  if (
+    !hasUsableBusinessIdentity
+  ) {
     return false;
   }
 
