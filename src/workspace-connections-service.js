@@ -4,6 +4,7 @@ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
 const GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
+const GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages";
 const CALENDAR_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy";
 const GOOGLE_CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars";
 const CALENDLY_API_BASE = "https://api.calendly.com";
@@ -13,6 +14,7 @@ const GOOGLE_SCOPES = [
   "email",
   "profile",
   "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/calendar.events.freebusy",
   "https://www.googleapis.com/auth/calendar.events",
 ];
@@ -220,6 +222,20 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
         lastError: "",
         capabilities: {
           emailSend: grantedScopes.includes("https://www.googleapis.com/auth/gmail.send"),
+          emailRead: grantedScopes.some((scope) =>
+            [
+              "https://www.googleapis.com/auth/gmail.readonly",
+              "https://www.googleapis.com/auth/gmail.modify",
+              "https://mail.google.com/",
+            ].includes(scope)
+          ),
+          inboxSync: grantedScopes.some((scope) =>
+            [
+              "https://www.googleapis.com/auth/gmail.readonly",
+              "https://www.googleapis.com/auth/gmail.modify",
+              "https://mail.google.com/",
+            ].includes(scope)
+          ),
           calendar: grantedScopes.some((scope) => scope.includes("calendar")),
           calendarFreeBusy: grantedScopes.some((scope) =>
             [
@@ -867,6 +883,184 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
     });
   }
 
+  async function syncGoogleInbox(user, options = {}) {
+    const ctx = requireContext(user);
+    const state = store.read();
+    const ownerId = clean(ctx.workspace?.ownerId || ctx.workspace?.ownerUserId || user.id);
+    const limit = Math.min(100, Math.max(5, Number(options.limit || 50)));
+
+    const connections = (state.workspaceConnections || [])
+      .filter(
+        (item) =>
+          item.workspaceId === ctx.workspaceId &&
+          item.provider === "google" &&
+          item.status === "connected"
+      )
+      .sort(byNewest);
+
+    const connection =
+      connections.find((item) => item.capabilities?.inboxSync === true) ||
+      connections[0] ||
+      null;
+
+    if (!connection) {
+      return {
+        ok: false,
+        noGoogleConnection: true,
+        synced: 0,
+        items: email?.listInbox ? await email.listInbox(ownerId) : [],
+        message: "Connect Google Workspace from Integrations to sync Gmail automatically.",
+      };
+    }
+
+    const canRead =
+      connection.capabilities?.inboxSync === true ||
+      (connection.scopes || []).some((scope) =>
+        [
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/gmail.modify",
+          "https://mail.google.com/",
+        ].includes(scope)
+      );
+
+    if (!canRead) {
+      return {
+        ok: false,
+        googleConnected: true,
+        requiresReconnect: true,
+        accountEmail: connection.accountEmail || "",
+        synced: 0,
+        items: email?.listInbox ? await email.listInbox(ownerId) : [],
+        message: `Google is connected as ${connection.accountEmail || "this account"}. Reconnect Google once from Integrations to grant Gmail inbox access.`,
+      };
+    }
+
+    try {
+      const accessToken = await getValidAccessToken(connection);
+      const listUrl = new URL(GMAIL_MESSAGES_URL);
+      listUrl.searchParams.set("maxResults", String(limit));
+      listUrl.searchParams.set("q", "in:inbox");
+
+      const listResult = await fetchJson(listUrl.toString(), {
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+
+      const ids = Array.isArray(listResult?.messages)
+        ? listResult.messages.slice(0, limit)
+        : [];
+
+      const fetched = [];
+      const concurrency = 8;
+
+      for (let index = 0; index < ids.length; index += concurrency) {
+        const batch = ids.slice(index, index + concurrency);
+        const rows = await Promise.all(
+          batch.map(async (item) => {
+            const url = new URL(`${GMAIL_MESSAGES_URL}/${encodeURIComponent(item.id)}`);
+            url.searchParams.set("format", "metadata");
+            for (const header of [
+              "From",
+              "To",
+              "Subject",
+              "Date",
+              "Message-ID",
+              "In-Reply-To",
+              "References",
+            ]) {
+              url.searchParams.append("metadataHeaders", header);
+            }
+
+            const message = await fetchJson(url.toString(), {
+              headers: { authorization: `Bearer ${accessToken}` },
+            });
+
+            const headers = Object.fromEntries(
+              (message?.payload?.headers || []).map((header) => [
+                String(header?.name || "").toLowerCase(),
+                String(header?.value || ""),
+              ])
+            );
+
+            const from = parseGoogleAddress(headers.from || "");
+            const to = parseGoogleAddress(headers.to || "");
+            const createdAt = normalizeGoogleDate(
+              headers.date,
+              message?.internalDate
+            );
+
+            return {
+              id: `gmail:${connection.id}:${message.id}`,
+              userId: ownerId,
+              workspaceId: ctx.workspaceId,
+              googleMessageId: message.id || "",
+              threadId: message.threadId || "",
+              accountId: connection.id,
+              accountLabel: connection.displayName || connection.accountEmail || "Google Workspace",
+              accountEmail: connection.accountEmail || "",
+              provider: "google",
+              channel: "email",
+              direction: "inbound",
+              source: "google-inbox",
+              mailbox: "INBOX",
+              unread: Array.isArray(message.labelIds)
+                ? message.labelIds.includes("UNREAD")
+                : false,
+              fromName: from.name || from.address || "Unknown sender",
+              fromEmail: from.address || "",
+              toEmail: to.address || connection.accountEmail || "",
+              subject: headers.subject || "No subject",
+              messageId: cleanGoogleMessageId(headers["message-id"]),
+              inReplyTo: cleanGoogleMessageId(headers["in-reply-to"]),
+              references: parseGoogleReferences(headers.references),
+              body: String(message.snippet || ""),
+              snippet: String(message.snippet || "").slice(0, 500),
+              createdAt,
+            };
+          })
+        );
+        fetched.push(...rows.filter(Boolean));
+      }
+
+      store.update((draft) => {
+        draft.userEmailInbox = draft.userEmailInbox || {};
+        const existing = Array.isArray(draft.userEmailInbox[ownerId])
+          ? draft.userEmailInbox[ownerId]
+          : [];
+        const map = new Map();
+        for (const item of [...fetched, ...existing]) {
+          if (!item?.id) continue;
+          map.set(item.id, item);
+        }
+        draft.userEmailInbox[ownerId] = Array.from(map.values())
+          .sort(
+            (a, b) =>
+              new Date(b.createdAt || 0).getTime() -
+              new Date(a.createdAt || 0).getTime()
+          )
+          .slice(0, 1000);
+      });
+
+      return {
+        ok: true,
+        googleConnected: true,
+        accountEmail: connection.accountEmail || "",
+        synced: fetched.length,
+        scanned: fetched.length,
+        items: email?.listInbox ? await email.listInbox(ownerId) : fetched,
+        message: `Synced ${fetched.length} recent Gmail message${fetched.length === 1 ? "" : "s"} from ${connection.accountEmail || "Google Workspace"}.`,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        googleConnected: true,
+        accountEmail: connection.accountEmail || "",
+        synced: 0,
+        items: email?.listInbox ? await email.listInbox(ownerId) : [],
+        message: clean(error?.message) || "Gmail inbox sync failed.",
+      };
+    }
+  }
+
   async function queryFreeBusy(connection, { timeMin, timeMax, timeZone }) {
     const accessToken = await getValidAccessToken(connection);
     const result = await fetchJson(CALENDAR_FREEBUSY_URL, {
@@ -979,10 +1173,45 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
     disconnect,
     testEmail,
     testCalendar,
+    syncGoogleInbox,
     sendAgentEmail,
     checkAgentCalendar,
     bookAgentMeeting,
   };
+}
+
+
+function parseGoogleAddress(value = "") {
+  const text = String(value || "").trim();
+  const match = text.match(/^(.*?)<([^>]+)>$/);
+  if (match) {
+    return {
+      name: String(match[1] || "").trim().replace(/^"|"$/g, ""),
+      address: normalizeEmail(match[2]),
+    };
+  }
+  return { name: "", address: normalizeEmail(text) };
+}
+
+function normalizeGoogleDate(headerDate, internalDate) {
+  const fromHeader = Date.parse(String(headerDate || ""));
+  if (Number.isFinite(fromHeader)) return new Date(fromHeader).toISOString();
+  const fromInternal = Number(internalDate || 0);
+  if (Number.isFinite(fromInternal) && fromInternal > 0) {
+    return new Date(fromInternal).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function cleanGoogleMessageId(value = "") {
+  return String(value || "").trim().replace(/^<|>$/g, "").toLowerCase();
+}
+
+function parseGoogleReferences(value = "") {
+  return String(value || "")
+    .split(/\s+/)
+    .map(cleanGoogleMessageId)
+    .filter(Boolean);
 }
 
 function publicConnection(item = {}) {

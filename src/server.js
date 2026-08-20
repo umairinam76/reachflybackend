@@ -819,11 +819,6 @@ const email =
     store,
   });
 
-const whatsapp =
-  createWhatsAppService({
-    store,
-  });
-
 const campaigns =
   createCampaignManager({
     store,
@@ -837,6 +832,13 @@ const workspaceService =
     store,
     email,
     appUrl: APP_URL,
+  });
+
+const whatsapp =
+  createWhatsAppService({
+    store,
+    workspaceService,
+    dataDir: DATA_DIR,
   });
 
 const auditService =
@@ -6013,14 +6015,32 @@ app.post(
         ?.ownerId ||
       req.user.id;
 
-    res.json(
+    const limit =
+      req.body.limit ||
+      25;
+
+    const googleSync =
+      await workspaceConnectionsService.syncGoogleInbox(
+        req.user,
+        {
+          limit,
+        }
+      );
+
+    if (
+      googleSync?.googleConnected ||
+      googleSync?.requiresReconnect
+    ) {
+      return res.json(
+        googleSync
+      );
+    }
+
+    return res.json(
       await email.syncInbox(
         ownerId,
         {
-          limit:
-            req.body.limit ||
-            25,
-
+          limit,
           accountId:
             req.body
               .accountId || "",
@@ -6215,11 +6235,16 @@ app.get(
   requireWorkspacePermission(
     "manage_channels"
   ),
-  requireLegacyWhatsAppEnabled,
-  async (_req, res) => {
-    res.json(
-      await whatsapp.status()
-    );
+  async (req, res, next) => {
+    try {
+      res.json(
+        await whatsapp.status(
+          req.user
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
   }
 );
 
@@ -6229,11 +6254,16 @@ app.post(
   requireWorkspacePermission(
     "manage_channels"
   ),
-  requireLegacyWhatsAppEnabled,
-  async (_req, res) => {
-    res.json(
-      await whatsapp.connect()
-    );
+  async (req, res, next) => {
+    try {
+      res.json(
+        await whatsapp.connect(
+          req.user
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
   }
 );
 
@@ -6243,11 +6273,16 @@ app.post(
   requireWorkspacePermission(
     "manage_channels"
   ),
-  requireLegacyWhatsAppEnabled,
-  async (_req, res) => {
-    res.json(
-      await whatsapp.logout()
-    );
+  async (req, res, next) => {
+    try {
+      res.json(
+        await whatsapp.logout(
+          req.user
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
   }
 );
 

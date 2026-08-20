@@ -385,14 +385,23 @@ export function createEmailService({ store }) {
             : item.source || "campaign-reply",
       }));
 
-    const matchedMailboxReplies = (state.userEmailInbox?.[ownerId] || [])
-      .filter((item) => item.direction === "inbound" && item.replyToSentId)
+    const mailboxMessages = (state.userEmailInbox?.[ownerId] || [])
+      .filter((item) => item.direction === "inbound")
+      .filter(
+        (item) =>
+          item.source === "google-inbox" ||
+          item.provider === "google" ||
+          Boolean(item.replyToSentId)
+      )
       .map((item) => ({
         ...item,
-        source: "campaign-reply",
+        source:
+          item.source === "google-inbox" || item.provider === "google"
+            ? "google-inbox"
+            : "campaign-reply",
       }));
 
-    return dedupeInboxItems([...matchedMailboxReplies, ...campaignActivity]).sort(
+    return dedupeInboxItems([...mailboxMessages, ...campaignActivity]).sort(
       (a, b) =>
         new Date(b.createdAt || 0).getTime() -
         new Date(a.createdAt || 0).getTime()
