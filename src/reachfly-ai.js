@@ -116,7 +116,7 @@ export function createReachFlyAI({
       return {
         reply: [
           buildScreenSuggestions(context),
-          `Live AI did not finish this response. ${anthropicSetupHint(error)}`,
+          `ReachFly AI live response is currently unavailable. ${anthropicSetupHint(error)}`,
         ].join("\n\n").trim(),
         degraded: true,
       };
@@ -183,7 +183,7 @@ export function createReachFlyAI({
 
       const reply = [
         buildScreenSuggestions(context),
-        "Live AI did not finish this response, but I can still guide you using the current ReachFly screen. Retry the question once; the backend will automatically use the next available Claude model.",
+        `ReachFly AI live response is currently unavailable. ${anthropicSetupHint(error)}`,
       ].join("\n\n");
       onDelta(`\n${reply}`);
       return { reply, degraded: true };
@@ -388,7 +388,57 @@ async function streamClaudeReply({ text, context, onDelta }) {
   let lineBuffer = "";
   let fullText = "";
   let withheld = "";
-  const tailLength = 56;
+  const tailLength = 80;
+
+  const processEvent = (event) => {
+    if (!event) return;
+
+    if (event.type === "error") {
+      const error = new Error(
+        event?.error?.message || event?.message || "Claude streaming request failed."
+      );
+      error.status = Number(event?.error?.status || event?.status || 500);
+      throw error;
+    }
+
+    if (
+      event.type !== "content_block_delta" ||
+      event?.delta?.type !== "text_delta"
+    ) {
+      return;
+    }
+
+    const delta = String(event?.delta?.text || "");
+    if (!delta) return;
+
+    fullText += delta;
+    withheld += delta;
+
+    // Hold a short tail so an internal support marker is never streamed to users.
+    if (withheld.length > tailLength) {
+      const safeLength = withheld.length - tailLength;
+      const emit = withheld.slice(0, safeLength);
+      withheld = withheld.slice(safeLength);
+      if (emit) onDelta(emit);
+    }
+  };
+
+  const processLine = (rawLine) => {
+    const line = String(rawLine || "").trim();
+    if (!line || !line.startsWith("data:")) return;
+
+    const raw = line.slice(5).trim();
+    if (!raw || raw === "[DONE]") return;
+
+    let event;
+    try {
+      event = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    processEvent(event);
+  };
 
   for await (const chunk of response.body) {
     lineBuffer += decoder.decode(chunk, { stream: true });
@@ -398,47 +448,28 @@ async function streamClaudeReply({ text, context, onDelta }) {
     lineBuffer = lines.pop() || "";
 
     for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const raw = line.slice(5).trim();
-      if (!raw || raw === "[DONE]") continue;
-
-      let event;
-      try {
-        event = JSON.parse(raw);
-      } catch {
-        continue;
-      }
-
-      if (event?.type === "error") {
-        throw new Error(
-          event?.error?.message || "Claude streaming request failed."
-        );
-      }
-
-      const delta =
-        event?.type === "content_block_delta" &&
-        event?.delta?.type === "text_delta"
-          ? String(event.delta.text || "")
-          : "";
-
-      if (!delta) continue;
-
-      fullText += delta;
-      withheld += delta;
-
-      if (withheld.length > tailLength) {
-        const safeLength = withheld.length - tailLength;
-        const emit = withheld.slice(0, safeLength);
-        withheld = withheld.slice(safeLength);
-        if (emit) onDelta(emit);
-      }
+      processLine(line);
     }
+  }
+
+  lineBuffer += decoder.decode();
+  if (lineBuffer.trim()) {
+    for (const line of lineBuffer.split(/
+?
+/)) {
+      processLine(line);
+    }
+  }
+
+  if (!fullText.trim()) {
+    throw new Error("Claude connected successfully but returned no text.");
   }
 
   const marker = extractSupportMarker(fullText);
   const alreadyEmittedLength = Math.max(0, fullText.length - withheld.length);
   const remainder = marker.cleanText.slice(alreadyEmittedLength);
   if (remainder) onDelta(remainder);
+
   return fullText.trim();
 }
 
@@ -878,8 +909,49 @@ function safeError(error) {
 }
 function anthropicSetupHint(error) {
   const message = safeError(error);
+  const status = Number(error?.status || error?.statusCode || 0);
+
   if (/ANTHROPIC_API_KEY/i.test(message)) {
-    return "Configure ANTHROPIC_API_KEY on the ReachFly API server to enable live Claude responses.";
+    return "Configure ANTHROPIC_API_KEY on the ReachFly API server, then restart reachfly-api with its updated environment.";
   }
-  return "Try again in a moment; if the problem continues, ReachFly can escalate it with the current page context.";
+
+  if (
+    status === 401 ||
+    /invalid.*api key|authentication|unauthorized/i.test(message)
+  ) {
+    return "Anthropic rejected the configured API key. Check the server-side ANTHROPIC_API_KEY and restart the API process.";
+  }
+
+  if (
+    status === 403 ||
+    /permission|forbidden|access denied/i.test(message)
+  ) {
+    return "The Anthropic account does not currently have access to the selected Claude model. ReachFly will try the configured fallback models automatically.";
+  }
+
+  if (status === 429 || /rate.?limit/i.test(message)) {
+    return "Claude is currently rate limited. Wait briefly and retry.";
+  }
+
+  if (/credit balance|billing|insufficient.*credit|purchase credits/i.test(message)) {
+    return "The Anthropic API account does not currently have enough API credit.";
+  }
+
+  if (/model.*not found|model.*unavailable|unsupported model/i.test(message)) {
+    return "The selected Claude model is unavailable for this Anthropic account. ReachFly will automatically try another configured Claude model.";
+  }
+
+  if (status === 529 || /overloaded/i.test(message)) {
+    return "Anthropic is temporarily overloaded. ReachFly will retry automatically.";
+  }
+
+  if (/fetch failed|ENOTFOUND|ECONNRESET|ECONNREFUSED|network/i.test(message)) {
+    return "The ReachFly API server could not reach Anthropic. Check outbound HTTPS/network access from the server.";
+  }
+
+  if (/timeout|timed out|aborted/i.test(message)) {
+    return "The Claude request timed out before Anthropic completed the response.";
+  }
+
+  return `Claude request failed: ${message}`;
 }

@@ -2,8 +2,10 @@ import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const CONNECT_WAIT_MS = 30_000;
-const RECONCILE_INTERVAL_MS = 1_000;
+const CONNECT_WAIT_MS = 2_500;
+const STATUS_RECONCILE_MS = 2_500;
+const AUTO_RESTART_DELAY_MS = 4_000;
+const MAX_AUTO_RESTARTS = 4;
 
 export function createWhatsAppService({
   store,
@@ -46,34 +48,41 @@ export function createWhatsAppService({
     return path.join(authRoot, `session-${clientIdFor(workspaceId)}`);
   }
 
-  function getStoredStatus(workspaceId) {
-    const state = store.read();
-    const current = state.whatsappSessions?.[workspaceId];
-
-    if (current) {
-      return {
-        ready: Boolean(current.ready),
-        authenticated: Boolean(current.authenticated || current.ready),
-        qr: String(current.qr || ""),
-        phone: String(current.phone || ""),
-        clientState: String(current.clientState || ""),
-        mode: "whatsapp-web.js",
-        message: String(current.message || ""),
-        checkedAt: current.checkedAt || current.updatedAt || "",
-        updatedAt: current.updatedAt || "",
-      };
-    }
-
+  function emptyStatus() {
     return {
       ready: false,
       authenticated: false,
       qr: "",
+      qrFormat: "raw",
       phone: "",
       clientState: "",
+      status: "disconnected",
       mode: "whatsapp-web.js",
       message: "WhatsApp is not linked yet.",
       checkedAt: new Date().toISOString(),
       updatedAt: "",
+    };
+  }
+
+  function getStoredStatus(workspaceId) {
+    const state = store.read();
+    const current = state.whatsappSessions?.[workspaceId];
+
+    if (!current) return emptyStatus();
+
+    return {
+      ready: Boolean(current.ready),
+      authenticated: Boolean(current.authenticated || current.ready),
+      qr: String(current.qr || ""),
+      qrFormat: String(current.qrFormat || "raw"),
+      phone: String(current.phone || ""),
+      clientState: String(current.clientState || ""),
+      status: String(current.status || ""),
+      mode: "whatsapp-web.js",
+      message: String(current.message || ""),
+      checkedAt: current.checkedAt || current.updatedAt || "",
+      updatedAt: current.updatedAt || "",
+      qrGeneratedAt: current.qrGeneratedAt || "",
     };
   }
 
@@ -88,6 +97,7 @@ export function createWhatsAppService({
         ...previous,
         workspaceId,
         mode: "whatsapp-web.js",
+        qrFormat: "raw",
         ...patch,
         checkedAt: now,
         updatedAt: now,
@@ -95,14 +105,15 @@ export function createWhatsAppService({
 
       state.whatsappSessions[workspaceId] = next;
 
-      // Compatibility mirror for older widgets. Workspace-scoped status above is
-      // still the source of truth.
+      // Compatibility mirror for older ReachFly widgets.
       state.whatsapp = {
         ready: Boolean(next.ready),
         authenticated: Boolean(next.authenticated || next.ready),
         qr: String(next.qr || ""),
+        qrFormat: "raw",
         phone: String(next.phone || ""),
         clientState: String(next.clientState || ""),
+        status: String(next.status || ""),
         mode: "whatsapp-web.js",
         message: String(next.message || ""),
         checkedAt: now,
@@ -134,20 +145,6 @@ export function createWhatsAppService({
     }
   }
 
-  async function createQrDataUrl(qrText) {
-    const qrcode = await import("qrcode");
-    const qrApi = qrcode.default || qrcode;
-    return qrApi.toDataURL(String(qrText || ""), {
-      margin: 2,
-      width: 360,
-      errorCorrectionLevel: "M",
-      color: {
-        dark: "#111827",
-        light: "#ffffff",
-      },
-    });
-  }
-
   function resolveBrowserExecutable() {
     const configured = String(process.env.PUPPETEER_EXECUTABLE_PATH || "").trim();
     if (configured && existsSync(configured)) return configured;
@@ -172,15 +169,14 @@ export function createWhatsAppService({
     if (missingLibrary) {
       return [
         `WhatsApp browser cannot start because the server is missing ${missingLibrary}.`,
-        "Install the Chrome/Chromium runtime libraries on the EC2 instance, then restart reachfly-api.",
-        "For Amazon Linux 2023 use: sudo dnf install -y atk at-spi2-atk cups-libs gtk3 libXcomposite libXcursor libXdamage libXrandr libXext libXi libXtst pango alsa-lib libdrm mesa-libgbm nss libXScrnSaver libxkbcommon",
+        "Install the Chrome/Chromium runtime libraries on the EC2 instance and restart reachfly-api.",
       ].join(" ");
     }
 
     if (/failed to launch the browser process/i.test(raw)) {
       return [
         "WhatsApp browser could not start on this server.",
-        "Install Chrome/Chromium and its Linux runtime dependencies, or set PUPPETEER_EXECUTABLE_PATH to a working browser executable, then restart reachfly-api.",
+        "Install Chrome/Chromium with its Linux runtime dependencies or set PUPPETEER_EXECUTABLE_PATH to a working browser executable.",
       ].join(" ");
     }
 
@@ -196,18 +192,24 @@ export function createWhatsAppService({
     } catch {}
 
     const phone = String(entry.client.info?.wid?.user || "").trim();
-    const connected = stateName === "CONNECTED" || Boolean(phone);
+    const connected =
+      stateName === "CONNECTED" ||
+      Boolean(phone) ||
+      entry.authenticated === true;
 
     if (connected) {
+      entry.authenticated = true;
+      entry.restartAttempts = 0;
       return saveStatus(workspaceId, {
         ready: true,
         authenticated: true,
         qr: "",
         phone,
-        clientState: stateName || "CONNECTED",
+        clientState: stateName || (phone ? "CONNECTED" : "AUTHENTICATED"),
+        status: "connected",
         message: phone
           ? `WhatsApp ${phone} is connected.`
-          : "WhatsApp is connected and ready.",
+          : "WhatsApp is connected. Finishing account sync…",
       });
     }
 
@@ -215,14 +217,24 @@ export function createWhatsAppService({
     if (stateName && stateName !== current.clientState) {
       return saveStatus(workspaceId, {
         clientState: stateName,
+        status: normalizeClientState(stateName),
         message:
           current.authenticated && !current.ready
-            ? "WhatsApp is authenticated. Finishing the browser session…"
+            ? "WhatsApp is authenticated. Finishing the saved browser session…"
             : current.message,
       });
     }
 
     return current;
+  }
+
+  function normalizeClientState(value) {
+    const stateName = String(value || "").trim().toUpperCase();
+    if (stateName === "CONNECTED" || stateName === "AUTHENTICATED") return "connected";
+    if (stateName === "QR" || stateName === "STARTING" || stateName === "OPENING") return "linking";
+    if (stateName === "AUTH_FAILURE" || stateName === "ERROR") return "error";
+    if (stateName === "DISCONNECTED") return "disconnected";
+    return stateName ? stateName.toLowerCase() : "";
   }
 
   async function destroyEntry(workspaceId, { logout = false } = {}) {
@@ -232,6 +244,9 @@ export function createWhatsAppService({
       return;
     }
 
+    if (entry.reconcileTimer) clearInterval(entry.reconcileTimer);
+    if (entry.restartTimer) clearTimeout(entry.restartTimer);
+
     try {
       if (logout) await entry.client.logout();
     } catch {}
@@ -240,8 +255,30 @@ export function createWhatsAppService({
       await entry.client.destroy();
     } catch {}
 
-    if (entry.reconcileTimer) clearInterval(entry.reconcileTimer);
     clients.delete(workspaceId);
+  }
+
+  function scheduleAutomaticRestore(user, workspaceId, entry) {
+    if (!entry || entry.intentionalLogout) return;
+    if ((entry.restartAttempts || 0) >= MAX_AUTO_RESTARTS) return;
+    if (entry.restartTimer) return;
+
+    entry.restartAttempts = Number(entry.restartAttempts || 0) + 1;
+    entry.restartTimer = setTimeout(async () => {
+      entry.restartTimer = null;
+      try {
+        await destroyEntry(workspaceId);
+        await ensureClient(user);
+      } catch (error) {
+        saveStatus(workspaceId, {
+          ready: false,
+          clientState: "RESTORE_ERROR",
+          status: "error",
+          message: readableBrowserLaunchError(error),
+        });
+      }
+    }, AUTO_RESTART_DELAY_MS);
+    entry.restartTimer.unref?.();
   }
 
   async function ensureClient(user, { forceNew = false } = {}) {
@@ -267,7 +304,6 @@ export function createWhatsAppService({
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        "--disable-software-rasterizer",
         "--no-first-run",
         "--no-zygote",
         "--disable-background-networking",
@@ -291,58 +327,58 @@ export function createWhatsAppService({
       puppeteer: puppeteerOptions,
       takeoverOnConflict: true,
       takeoverTimeoutMs: 0,
-      qrMaxRetries: 8,
+      qrMaxRetries: 12,
+      authTimeoutMs: 60_000,
     });
 
     const entry = {
       workspaceId,
       clientId,
+      user,
       client,
       initPromise: null,
       reconcileTimer: null,
+      restartTimer: null,
+      restartAttempts: 0,
       sawQr: false,
       authenticated: false,
+      intentionalLogout: false,
     };
 
     clients.set(workspaceId, entry);
 
-    client.on("qr", async (qrText) => {
+    client.on("qr", (qrText) => {
       entry.sawQr = true;
-      try {
-        const qr = await createQrDataUrl(qrText);
-        saveStatus(workspaceId, {
-          ready: false,
-          authenticated: false,
-          qr,
-          phone: "",
-          clientState: "QR",
-          message: "Scan this QR from WhatsApp → Linked devices → Link a device.",
-        });
-      } catch (error) {
-        saveStatus(workspaceId, {
-          ready: false,
-          authenticated: false,
-          qr: "",
-          message: `QR generation failed: ${error.message}`,
-        });
-      }
+      entry.authenticated = false;
+      saveStatus(workspaceId, {
+        ready: false,
+        authenticated: false,
+        qr: String(qrText || ""),
+        qrFormat: "raw",
+        qrGeneratedAt: new Date().toISOString(),
+        phone: "",
+        clientState: "QR",
+        status: "linking",
+        message: "Scan this QR from WhatsApp → Linked devices → Link a device.",
+      });
     });
 
     client.on("authenticated", () => {
       entry.authenticated = true;
-      // A successful scan means the phone has accepted this browser as a linked
-      // device. Mark it connected immediately so the ReachFly UI does not remain
-      // stuck on the QR screen while whatsapp-web.js finishes its ready event.
+      entry.restartAttempts = 0;
       saveStatus(workspaceId, {
         ready: true,
         authenticated: true,
         qr: "",
         clientState: "AUTHENTICATED",
-        message: "WhatsApp connected. Finishing message sync…",
+        status: "connected",
+        message: "WhatsApp connected. Finishing account sync…",
       });
     });
 
     client.on("ready", () => {
+      entry.authenticated = true;
+      entry.restartAttempts = 0;
       const phone = String(client.info?.wid?.user || "").trim();
       saveStatus(workspaceId, {
         ready: true,
@@ -350,9 +386,20 @@ export function createWhatsAppService({
         qr: "",
         phone,
         clientState: "CONNECTED",
+        status: "connected",
         message: phone
           ? `WhatsApp ${phone} is connected.`
           : "WhatsApp is connected and ready.",
+      });
+    });
+
+    client.on("loading_screen", (percent, message) => {
+      const current = getStoredStatus(workspaceId);
+      if (current.ready || current.authenticated) return;
+      saveStatus(workspaceId, {
+        clientState: "OPENING",
+        status: "linking",
+        message: `Opening WhatsApp Web${Number.isFinite(Number(percent)) ? ` · ${percent}%` : ""}${message ? ` · ${message}` : ""}`,
       });
     });
 
@@ -360,23 +407,28 @@ export function createWhatsAppService({
       const normalized = String(stateName || "").toUpperCase();
       if (normalized === "CONNECTED") {
         void reconcileClientState(workspaceId, entry);
-      } else {
-        const current = getStoredStatus(workspaceId);
-        saveStatus(workspaceId, {
-          clientState: normalized,
-          message:
-            current.authenticated || entry.authenticated
-              ? "WhatsApp is connected. Finishing session sync…"
-              : current.message,
-        });
+        return;
       }
+
+      const current = getStoredStatus(workspaceId);
+      saveStatus(workspaceId, {
+        clientState: normalized,
+        status: normalizeClientState(normalized),
+        message:
+          current.authenticated || entry.authenticated
+            ? "WhatsApp is connected. Finishing session sync…"
+            : current.message,
+      });
     });
 
     client.on("remote_session_saved", () => {
+      entry.authenticated = true;
       saveStatus(workspaceId, {
         ready: true,
         authenticated: true,
         qr: "",
+        clientState: "CONNECTED",
+        status: "connected",
         message: "WhatsApp session saved. Restoring account details…",
       });
       void reconcileClientState(workspaceId, entry);
@@ -390,6 +442,7 @@ export function createWhatsAppService({
         qr: "",
         phone: "",
         clientState: "AUTH_FAILURE",
+        status: "error",
         message: `WhatsApp authentication failed: ${String(message || "Unknown error")}`,
       });
     });
@@ -402,15 +455,15 @@ export function createWhatsAppService({
         qr: "",
         phone: "",
         clientState: "DISCONNECTED",
-        message: `WhatsApp disconnected${reason ? `: ${reason}` : "."}`,
+        status: "disconnected",
+        message: `WhatsApp connection was interrupted${reason ? `: ${reason}` : "."} Restoring the saved session automatically…`,
       });
-      if (entry.reconcileTimer) clearInterval(entry.reconcileTimer);
-      clients.delete(workspaceId);
+      scheduleAutomaticRestore(user, workspaceId, entry);
     });
 
     entry.reconcileTimer = setInterval(() => {
       void reconcileClientState(workspaceId, entry).catch(() => {});
-    }, 5_000);
+    }, STATUS_RECONCILE_MS);
     entry.reconcileTimer.unref?.();
 
     entry.initPromise = client.initialize().catch((error) => {
@@ -421,6 +474,7 @@ export function createWhatsAppService({
         qr: "",
         phone: "",
         clientState: "ERROR",
+        status: "error",
         message,
       });
       if (entry.reconcileTimer) clearInterval(entry.reconcileTimer);
@@ -441,15 +495,17 @@ export function createWhatsAppService({
       const entry = clients.get(workspaceId);
       if (entry) await reconcileClientState(workspaceId, entry).catch(() => {});
       const current = getStoredStatus(workspaceId);
+
       if (
         current.ready ||
         current.authenticated ||
         current.qr ||
-        /failed|could not start|missing .*library/i.test(current.message)
+        current.status === "error"
       ) {
         return current;
       }
-      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      await new Promise((resolve) => setTimeout(resolve, 180));
     }
 
     return getStoredStatus(workspaceId);
@@ -468,15 +524,13 @@ export function createWhatsAppService({
         hasSavedSession = existsSync(sessionPathFor(workspaceId));
       } catch {}
 
-      // Rehydrate any LocalAuth session after an API restart. This also covers
-      // the case where the phone shows the device as linked but the API restarted
-      // before ReachFly persisted a final ready event.
+      // Rehydrate LocalAuth after an API restart without asking the user to scan again.
       if (current.ready || current.authenticated || current.phone || hasSavedSession) {
         void ensureClient(user).catch(() => {});
         current = {
           ...current,
           message: current.ready
-            ? "Restoring the saved WhatsApp session…"
+            ? "WhatsApp is connected. Restoring the saved browser session…"
             : "Checking the saved WhatsApp session…",
         };
       }
@@ -500,63 +554,35 @@ export function createWhatsAppService({
       return { ...current, checkedAt: new Date().toISOString() };
     }
 
+    const hasInvalidSavedSession =
+      current.clientState === "AUTH_FAILURE" ||
+      /authentication failed/i.test(current.message || "");
+
+    if (hasInvalidSavedSession) {
+      await destroyEntry(workspaceId);
+      try {
+        await fs.rm(sessionPathFor(workspaceId), { recursive: true, force: true });
+      } catch {}
+    }
+
     saveStatus(workspaceId, {
       ready: false,
       authenticated: false,
       qr: "",
       phone: "",
       clientState: "STARTING",
+      status: "linking",
       message: "Starting WhatsApp Web…",
     });
 
-    let entry = await ensureClient(user);
+    await ensureClient(user);
     current = await waitForQrOrReady(workspaceId, CONNECT_WAIT_MS);
 
-    // If an old LocalAuth session became invalid, remove only that workspace's
-    // session and start a clean QR flow. This fixes the common case where the
-    // phone no longer trusts the saved browser and whatsapp-web.js otherwise
-    // loops without showing a new QR.
-    if (
-      !current.ready &&
-      !current.authenticated &&
-      !current.qr &&
-      (current.clientState === "AUTH_FAILURE" || /authentication failed/i.test(current.message))
-    ) {
-      await destroyEntry(workspaceId);
-      try {
-        await fs.rm(sessionPathFor(workspaceId), { recursive: true, force: true });
-      } catch {}
-      saveStatus(workspaceId, {
-        ready: false,
-        authenticated: false,
-        qr: "",
-        phone: "",
-        clientState: "RESTARTING",
-        message: "The previous WhatsApp session expired. Generating a fresh QR…",
-      });
-      entry = await ensureClient(user);
-      current = await waitForQrOrReady(workspaceId, 20_000);
-    }
-
-    // A Chromium process can occasionally start without ever reaching the QR
-    // event. If there is no authenticated LocalAuth session, retry once with a
-    // fresh browser instance instead of leaving the UI blank indefinitely.
-    if (!current.ready && !current.authenticated && !current.qr && !entry.authenticated) {
-      saveStatus(workspaceId, {
-        clientState: "RESTARTING",
-        message: "WhatsApp took too long to generate a QR. Restarting the browser once…",
-      });
-      entry = await ensureClient(user, { forceNew: true });
-      current = await waitForQrOrReady(workspaceId, 20_000);
-    }
-
-    if (!current.ready && !current.authenticated && !current.qr) {
+    if (!current.ready && !current.authenticated && !current.qr && current.status !== "error") {
       current = saveStatus(workspaceId, {
-        clientState: current.clientState || "WAITING",
-        message:
-          current.message && !/starting|restarting/i.test(current.message)
-            ? current.message
-            : "WhatsApp Web started but no QR was returned yet. Try Start linking again in a few seconds.",
+        clientState: current.clientState || "STARTING",
+        status: "linking",
+        message: "WhatsApp Web is starting. The QR will appear here automatically.",
       });
     }
 
@@ -568,6 +594,9 @@ export function createWhatsAppService({
 
   async function logout(user) {
     const { workspaceId } = workspaceContext(user);
+    const entry = clients.get(workspaceId);
+    if (entry) entry.intentionalLogout = true;
+
     await destroyEntry(workspaceId, { logout: true });
 
     try {
@@ -580,6 +609,7 @@ export function createWhatsAppService({
       qr: "",
       phone: "",
       clientState: "DISCONNECTED",
+      status: "disconnected",
       message: "WhatsApp session disconnected.",
     });
 
