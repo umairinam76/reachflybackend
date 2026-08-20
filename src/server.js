@@ -4816,6 +4816,57 @@ app.get(
 );
 
 app.post(
+  "/api/leads/scraped/import",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    const leads = Array.isArray(req.body?.leads)
+      ? req.body.leads.slice(0, 5000)
+      : [];
+
+    if (!leads.length) {
+      return res.status(400).json({
+        error: "At least one lead is required.",
+        code: "SCRAPED_LEADS_REQUIRED",
+      });
+    }
+
+    const runId = String(
+      req.body?.runId ||
+        req.requestId ||
+        crypto.randomUUID()
+    ).trim();
+
+    const result = scrapedLeadsService.saveBatch(
+      req.user,
+      leads,
+      {
+        runId,
+        niche: req.body?.niche || "",
+        location: req.body?.location || "",
+        requested: Number(req.body?.requested ?? leads.length),
+        status: req.body?.status || "complete",
+        source: req.body?.source || "browser-recovery",
+      }
+    );
+
+    scrapedLeadsService.finishRun(req.user, {
+      runId,
+      requested: Number(req.body?.requested ?? leads.length),
+      status: req.body?.status || "complete",
+    });
+
+    res.set("Cache-Control", "no-store");
+    return res.status(201).json({
+      ok: true,
+      saved: result.saved,
+      total: result.total,
+      runId: result.runId || runId,
+    });
+  })
+);
+
+app.post(
   "/api/leads/find/stream",
   requireAuth,
   requireLeadGenerationManager,
