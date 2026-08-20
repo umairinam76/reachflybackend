@@ -448,6 +448,44 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
     return { ok: true, messageId: result.id || "", to };
   }
 
+  async function sendSupportNotification(user, input = {}) {
+    if (!user?.id) throw httpError(401, "Authentication is required.");
+    const rawContext = workspaceService.getContext?.(user) || {};
+    const workspaceId = clean(
+      rawContext.workspaceId || user.workspaceId || user.companyId || user.id
+    );
+    if (!workspaceId) throw httpError(401, "Workspace could not be resolved.");
+    const ctx = { ...rawContext, workspaceId };
+    const to = normalizeEmail(input.to);
+    if (!to) throw httpError(422, "Support notification recipient is missing.");
+
+    const state = store.read();
+    ensureStateShape(state);
+    const connection = (state.workspaceConnections || [])
+      .filter((item) => item.workspaceId === ctx.workspaceId)
+      .filter((item) => item.provider === "google")
+      .filter((item) => item.status === "connected")
+      .find((item) => item.capabilities?.emailSend !== false);
+
+    if (!connection) {
+      throw httpError(409, "No connected Google sender is available for support notifications.");
+    }
+
+    const result = await sendEmailWithConnection(connection, {
+      to,
+      subject: clean(input.subject) || "ReachFly support request",
+      text: clean(input.text) || "A ReachFly user requested support.",
+      replyTo: normalizeEmail(input.replyTo || user.email),
+    });
+
+    return {
+      ok: true,
+      messageId: clean(result.id || result.messageId),
+      fromEmail: normalizeEmail(connection.accountEmail),
+      to,
+    };
+  }
+
   async function testCalendar(user, connectionId, input = {}) {
     const ctx = requireContext(user);
     const connection = requireConnection(ctx.workspaceId, connectionId, "calendar");
@@ -1173,6 +1211,7 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
     disconnect,
     testEmail,
     testCalendar,
+    sendSupportNotification,
     syncGoogleInbox,
     sendAgentEmail,
     checkAgentCalendar,

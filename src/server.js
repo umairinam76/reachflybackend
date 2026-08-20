@@ -35,6 +35,7 @@ import { createCreditBillingService } from "./credit-billing-service.js";
 import { createVoiceCommerceService } from "./voice-commerce-service.js";
 import { createWorkspaceConnectionsService } from "./workspace-connections-service.js";
 import { createScrapedLeadsService } from "./scraped-leads-service.js";
+import { createExternalLeadConnectorsService } from "./external-lead-connectors-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
@@ -935,6 +936,12 @@ const scrapedLeadsService =
     workspaceService,
   });
 
+const externalLeadConnectorsService =
+  createExternalLeadConnectorsService({
+    store,
+    workspaceService,
+  });
+
 const telnyxAiAgentService =
   createTelnyxAIAgentService({
     store,
@@ -1009,6 +1016,7 @@ const ai = createReachFlyAI({
   store,
   campaigns,
   workspaceService,
+  workspaceConnectionsService,
 });
 const AUDIT_TEMPLATE_EXAMPLE_MAX_BYTES = Math.max(
   1024,
@@ -4799,6 +4807,49 @@ app.post(
 );
 
 app.get(
+  "/api/external-lead-sources",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({ connections: externalLeadConnectorsService.list(req.user) });
+  })
+);
+
+app.post(
+  "/api/external-lead-sources",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    const result = await externalLeadConnectorsService.create(req.user, req.body || {});
+    res.status(201).json(result);
+  })
+);
+
+app.post(
+  "/api/external-lead-sources/:connectionId/import",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    const result = await externalLeadConnectorsService.importLeads(
+      req.user,
+      req.params.connectionId,
+      req.body || {}
+    );
+    res.json(result);
+  })
+);
+
+app.delete(
+  "/api/external-lead-sources/:connectionId",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    res.json(externalLeadConnectorsService.remove(req.user, req.params.connectionId));
+  })
+);
+
+app.get(
   "/api/leads/scraped",
   requireAuth,
   requireLeadGenerationManager,
@@ -6738,13 +6789,16 @@ function registerReachFlyUpgradeRoutes({
     async (req, res, next) => {
       let creditReservation = null;
       try {
-        creditReservation = creditBillingService.reserveUsage({
-          workspaceId: req.user?.workspaceId || req.user?.id,
-          feature: "reachfly_ai_message",
-          quantity: 1,
-          idempotencyKey: `ai-context:${req.requestId || crypto.randomUUID()}`,
-          actorId: req.user?.id || "reachfly-ai",
-        });
+        const automatic = req.body?.automatic === true;
+        if (!automatic) {
+          creditReservation = creditBillingService.reserveUsage({
+            workspaceId: req.user?.workspaceId || req.user?.id,
+            feature: "reachfly_ai_message",
+            quantity: 1,
+            idempotencyKey: `ai-context:${req.requestId || crypto.randomUUID()}`,
+            actorId: req.user?.id || "reachfly-ai",
+          });
+        }
         const result =
           await ai.command(
             req.body.command,
@@ -6755,13 +6809,79 @@ function registerReachFlyUpgradeRoutes({
                   .screen || {},
             }
           );
-        creditBillingService.commitUsage(creditReservation.id, { actualQuantity: 1 });
+        if (creditReservation?.id) {
+          creditBillingService.commitUsage(creditReservation.id, { actualQuantity: 1 });
+        }
         res.json(result);
       } catch (error) {
         if (creditReservation?.id) {
           creditBillingService.releaseUsage(creditReservation.id, error?.message || "ReachFly AI request failed.");
         }
         next(error);
+      }
+    }
+  );
+
+  app.post(
+    "/api/ai/contextual-stream",
+    requireAuth,
+    async (req, res) => {
+      let creditReservation = null;
+      const automatic = req.body?.automatic === true;
+
+      res.status(200);
+      res.set({
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.flushHeaders?.();
+
+      const write = (payload) => {
+        if (!res.writableEnded) {
+          res.write(`${JSON.stringify(payload)}\n`);
+        }
+      };
+
+      try {
+        if (!automatic) {
+          creditReservation = creditBillingService.reserveUsage({
+            workspaceId: req.user?.workspaceId || req.user?.id,
+            feature: "reachfly_ai_message",
+            quantity: 1,
+            idempotencyKey: `ai-stream:${req.requestId || crypto.randomUUID()}`,
+            actorId: req.user?.id || "reachfly-ai",
+          });
+        }
+
+        const result = await ai.streamCommand(
+          req.body?.command,
+          {
+            user: req.user,
+            screen: req.body?.screen || {},
+          },
+          (text) => write({ type: "delta", text })
+        );
+
+        if (creditReservation?.id) {
+          creditBillingService.commitUsage(creditReservation.id, { actualQuantity: 1 });
+        }
+
+        write({ type: "done", result });
+        res.end();
+      } catch (error) {
+        if (creditReservation?.id) {
+          creditBillingService.releaseUsage(
+            creditReservation.id,
+            error?.message || "ReachFly AI stream failed."
+          );
+        }
+        write({
+          type: "error",
+          message: error?.message || "ReachFly AI could not complete this request.",
+        });
+        res.end();
       }
     }
   );
