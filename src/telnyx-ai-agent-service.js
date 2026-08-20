@@ -165,6 +165,156 @@ export function createTelnyxAIAgentService({
     value: null,
   };
 
+  function getWorkspaceAgentEntitlement(
+    workspaceId
+  ) {
+    if (
+      creditBillingService
+        ?.getWorkspaceAgentEntitlement
+    ) {
+      return (
+        creditBillingService
+          .getWorkspaceAgentEntitlement(
+            workspaceId
+          ) ||
+        {
+          plan: "launch",
+          limit: 1,
+          unlimited: false,
+          nextPlan: "growth",
+          upgradePath:
+            "/app/billing",
+        }
+      );
+    }
+
+    if (
+      isCodesyncWorkspace(
+        workspaceId
+      )
+    ) {
+      return {
+        plan: "enterprise",
+        limit: null,
+        unlimited: true,
+        nextPlan: null,
+        upgradePath:
+          "/app/billing",
+      };
+    }
+
+    return {
+      plan: "launch",
+      limit: 1,
+      unlimited: false,
+      nextPlan: "growth",
+      upgradePath:
+        "/app/billing",
+    };
+  }
+
+  function countWorkspaceAgentsForLimit(
+    state,
+    workspaceId
+  ) {
+    return findWorkspaceAgents(
+      state,
+      workspaceId
+    ).filter(
+      (item) =>
+        normalizeStatus(
+          item.status
+        ) !== "deleted" &&
+        !item.deletedAt
+    ).length;
+  }
+
+  function assertWorkspaceCanCreateAgent(
+    state,
+    workspaceId
+  ) {
+    const entitlement =
+      getWorkspaceAgentEntitlement(
+        workspaceId
+      );
+
+    const currentAgents =
+      countWorkspaceAgentsForLimit(
+        state,
+        workspaceId
+      );
+
+    if (
+      entitlement.unlimited ===
+        true ||
+      entitlement.limit == null
+    ) {
+      return {
+        ...entitlement,
+        currentAgents,
+        remaining: null,
+      };
+    }
+
+    const limit =
+      Math.max(
+        1,
+        Number(
+          entitlement.limit
+        ) || 1
+      );
+
+    if (
+      currentAgents >=
+      limit
+    ) {
+      const planLabel =
+        String(
+          entitlement.plan ||
+          "launch"
+        )
+          .replace(
+            /_/g,
+            " "
+          )
+          .replace(
+            /\b\w/g,
+            (char) =>
+              char.toUpperCase()
+          );
+
+      throw httpError(
+        403,
+        `${planLabel} supports up to ${limit} AI Agent${limit === 1 ? "" : "s"}. Upgrade the workspace plan before creating another agent.`,
+        "AI_AGENT_LIMIT_REACHED",
+        {
+          plan:
+            entitlement.plan,
+          agentLimit:
+            limit,
+          currentAgents,
+          nextPlan:
+            entitlement.nextPlan ||
+            null,
+          upgradePath:
+            entitlement.upgradePath ||
+            "/app/billing",
+        }
+      );
+    }
+
+    return {
+      ...entitlement,
+      currentAgents,
+      remaining:
+        Math.max(
+          0,
+          limit -
+            currentAgents
+        ),
+    };
+  }
+
   function getAccess(user) {
     const state = store.read();
     const ctx = getContext(user, state);
@@ -329,6 +479,34 @@ export function createTelnyxAIAgentService({
 
     const workspaceAgents = findWorkspaceAgents(state, ctx.workspaceId);
     const agent = workspaceAgents[0] || null;
+
+    const agentEntitlement =
+      getWorkspaceAgentEntitlement(
+        ctx.workspaceId
+      );
+
+    const agentCountForLimit =
+      countWorkspaceAgentsForLimit(
+        state,
+        ctx.workspaceId
+      );
+
+    const publicAgentEntitlement = {
+      ...agentEntitlement,
+      currentAgents:
+        agentCountForLimit,
+      remaining:
+        agentEntitlement.unlimited ||
+        agentEntitlement.limit == null
+          ? null
+          : Math.max(
+              0,
+              Number(
+                agentEntitlement.limit
+              ) -
+                agentCountForLimit
+            ),
+    };
     const queue = (state.telnyxAiAgentAssignments || [])
       .filter(
         (item) => item.workspaceId === ctx.workspaceId
@@ -382,6 +560,8 @@ export function createTelnyxAIAgentService({
       },
       agent: agent ? publicAgent(agent) : null,
       agents: workspaceAgents.map((item) => publicAgent(item)),
+      agentEntitlement:
+        publicAgentEntitlement,
       diagnostics: diagnostics(state, ctx.workspaceId),
       summary: {
         agents: workspaceAgents.length,
@@ -1664,6 +1844,14 @@ export function createTelnyxAIAgentService({
     if (requestedAgentId && !existing) {
       throw httpError(404, "Voice agent not found in this workspace.", "VOICE_AGENT_NOT_FOUND");
     }
+
+    if (!existing) {
+      assertWorkspaceCanCreateAgent(
+        state,
+        ctx.workspaceId
+      );
+    }
+
     const config = normalizeAgentInput({
       input,
       existing,

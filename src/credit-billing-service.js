@@ -1,6 +1,20 @@
 import crypto from "node:crypto";
 
 const CODESYNC_WORKSPACE_ID = "codesync-labs-workspace";
+
+const AI_AGENT_PLAN_LIMITS = Object.freeze({
+  launch: 1,
+  growth: 3,
+  scale: 10,
+  enterprise: null,
+});
+
+const AI_AGENT_PLAN_RANK = Object.freeze({
+  launch: 1,
+  growth: 2,
+  scale: 3,
+  enterprise: 4,
+});
 const TEST_CREDIT_GRANT = 1000;
 const AI_CALL_TEST_CREDIT_GRANT = 30;
 const AI_CALL_SIGNUP_FREE_CREDITS_DEFAULT = 10;
@@ -150,6 +164,289 @@ export function createCreditBillingService({ store, workspaceService, externalSa
         user?.accountType || user?.workspaceType || workspace?.accountType || workspace?.workspaceType
       ) || (workspace ? "company" : "individual"),
     };
+  }
+
+  function normalizeAiAgentPlan(value) {
+    const normalized = normalizeStatus(value);
+
+    if (
+      ["enterprise", "unlimited", "custom"].includes(normalized)
+    ) {
+      return "enterprise";
+    }
+
+    if (
+      ["scale", "business", "pro_scale"].includes(normalized)
+    ) {
+      return "scale";
+    }
+
+    if (
+      ["growth", "pro", "professional"].includes(normalized)
+    ) {
+      return "growth";
+    }
+
+    if (
+      ["launch", "starter", "basic", "free"].includes(normalized)
+    ) {
+      return "launch";
+    }
+
+    return "";
+  }
+
+  function planFromCreditPurchase(purchase = {}) {
+    const explicit =
+      normalizeAiAgentPlan(
+        purchase.pricingTier ||
+        purchase.agentPlan ||
+        purchase.plan
+      );
+
+    if (explicit) {
+      return explicit;
+    }
+
+    const credits =
+      wholeCredits(
+        purchase.credits
+      );
+
+    if (credits >= 5000) {
+      return "scale";
+    }
+
+    if (credits >= 2500) {
+      return "growth";
+    }
+
+    return "launch";
+  }
+
+  function higherAiAgentPlan(left, right) {
+    const a =
+      normalizeAiAgentPlan(left) ||
+      "launch";
+
+    const b =
+      normalizeAiAgentPlan(right) ||
+      "launch";
+
+    return (
+      (AI_AGENT_PLAN_RANK[b] || 0) >
+      (AI_AGENT_PLAN_RANK[a] || 0)
+    )
+      ? b
+      : a;
+  }
+
+  function getWorkspaceAgentEntitlement(workspaceId) {
+    const id =
+      clean(workspaceId);
+
+    if (!id) {
+      return {
+        plan: "launch",
+        limit: 1,
+        unlimited: false,
+        source: "default",
+        nextPlan: "growth",
+        upgradePath: "/app/billing",
+      };
+    }
+
+    if (id === CODESYNC_WORKSPACE_ID) {
+      return {
+        plan: "enterprise",
+        limit: null,
+        unlimited: true,
+        source: "internal_workspace",
+        nextPlan: null,
+        upgradePath: "/app/billing",
+      };
+    }
+
+    const state =
+      store.read();
+
+    const workspace =
+      (state.workspaces || []).find(
+        (item) =>
+          clean(item.id) === id
+      ) ||
+      null;
+
+    const explicitPlan =
+      normalizeAiAgentPlan(
+        workspace?.aiAgentPlan ||
+        workspace?.voiceAgentPlan ||
+        workspace?.entitlements?.aiAgents?.plan ||
+        workspace?.billing?.aiAgentPlan
+      );
+
+    const explicitLimit = Number(
+      workspace?.aiAgentLimit ??
+      workspace?.entitlements?.aiAgents?.limit
+    );
+
+    let purchasedPlan =
+      "launch";
+
+    for (
+      const purchase of
+        state.creditPurchases || []
+    ) {
+      if (
+        clean(purchase.workspaceId) !== id
+      ) {
+        continue;
+      }
+
+      const succeeded =
+        normalizeStatus(
+          purchase.status
+        ) === "succeeded" ||
+        Boolean(
+          purchase.creditsGrantedAt ||
+          purchase.paidAt
+        );
+
+      if (!succeeded) {
+        continue;
+      }
+
+      purchasedPlan =
+        higherAiAgentPlan(
+          purchasedPlan,
+          planFromCreditPurchase(
+            purchase
+          )
+        );
+    }
+
+    const plan =
+      explicitPlan
+        ? higherAiAgentPlan(
+            explicitPlan,
+            purchasedPlan
+          )
+        : purchasedPlan;
+
+    if (plan === "enterprise") {
+      return {
+        plan,
+        limit: null,
+        unlimited: true,
+        source:
+          explicitPlan === "enterprise"
+            ? "workspace_override"
+            : "purchase",
+        nextPlan: null,
+        upgradePath: "/app/billing",
+      };
+    }
+
+    const configuredLimit =
+      Number.isFinite(
+        explicitLimit
+      ) &&
+      explicitLimit > 0
+        ? Math.round(
+            explicitLimit
+          )
+        : null;
+
+    const planLimit =
+      AI_AGENT_PLAN_LIMITS[plan] ||
+      AI_AGENT_PLAN_LIMITS.launch;
+
+    const limit =
+      configuredLimit ||
+      planLimit;
+
+    return {
+      plan,
+      limit,
+      unlimited: false,
+      source:
+        configuredLimit
+          ? "workspace_override"
+          : explicitPlan
+            ? "workspace_plan"
+            : purchasedPlan !== "launch"
+              ? "purchase"
+              : "default",
+      nextPlan:
+        plan === "launch"
+          ? "growth"
+          : plan === "growth"
+            ? "scale"
+            : "enterprise",
+      upgradePath: "/app/billing",
+    };
+  }
+
+  function applyWorkspaceAgentPlanUpgrade(
+    draft,
+    workspaceId,
+    purchasedCredits,
+    now
+  ) {
+    const id =
+      clean(workspaceId);
+
+    if (
+      !id ||
+      id === CODESYNC_WORKSPACE_ID
+    ) {
+      return;
+    }
+
+    const workspace =
+      (draft.workspaces || []).find(
+        (item) =>
+          clean(item.id) === id
+      );
+
+    if (!workspace) {
+      return;
+    }
+
+    const current =
+      normalizeAiAgentPlan(
+        workspace.aiAgentPlan ||
+        workspace.voiceAgentPlan ||
+        workspace.entitlements?.aiAgents?.plan
+      ) ||
+      "launch";
+
+    const purchased =
+      planFromCreditPurchase({
+        credits:
+          purchasedCredits,
+      });
+
+    const next =
+      higherAiAgentPlan(
+        current,
+        purchased
+      );
+
+    if (
+      next === current
+    ) {
+      return;
+    }
+
+    workspace.aiAgentPlan =
+      next;
+
+    workspace.aiAgentPlanUpdatedAt =
+      now;
+
+    workspace.updatedAt =
+      now;
   }
 
   function ensureStateShape(draft) {
@@ -1436,6 +1733,10 @@ export function createCreditBillingService({ store, workspaceService, externalSa
         )?.totalConsumed
       ),
       creditPricing: getUnifiedCreditPricing(),
+      agentEntitlement:
+        getWorkspaceAgentEntitlement(
+          ctx.workspaceId
+        ),
       creditPurposes: [
         "lead_generated",
         "ai_connected_call",
@@ -1978,6 +2279,13 @@ export function createCreditBillingService({ store, workspaceService, externalSa
       purchase.providerCurrency = clean(data.currency || purchase.currency).toUpperCase();
       purchase.updatedAt = now;
 
+      applyWorkspaceAgentPlanUpgrade(
+        draft,
+        purchase.workspaceId,
+        purchasedCredits,
+        now
+      );
+
       draft.creditLedger.unshift({
         id: crypto.randomUUID(),
         workspaceId: purchase.workspaceId,
@@ -2300,6 +2608,7 @@ export function createCreditBillingService({ store, workspaceService, externalSa
     getRateCard,
     getRate,
     getCreditPacks,
+    getWorkspaceAgentEntitlement,
     updateRate,
     updatePack,
     adjustWorkspaceCredits,
@@ -2550,6 +2859,8 @@ export const CREDIT_BILLING_DEFAULTS = {
     UNIFIED_CREDIT_SCALE_THRESHOLD_DEFAULT,
   aiCallConnectedCreditsPerMinute:
     AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT,
+  aiAgentPlanLimits:
+    AI_AGENT_PLAN_LIMITS,
   rateCard: DEFAULT_RATE_CARD,
   packs: DEFAULT_CREDIT_PACKS,
   codesyncWorkspaceId: CODESYNC_WORKSPACE_ID,
