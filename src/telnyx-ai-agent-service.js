@@ -160,10 +160,7 @@ export function createTelnyxAIAgentService({
     expiresAt: 0,
     value: [],
   };
-  const calendlyEventTypeCache = {
-    expiresAt: 0,
-    value: null,
-  };
+  const calendlyEventTypeCache = new Map();
 
   function getWorkspaceAgentEntitlement(
     workspaceId
@@ -3525,10 +3522,11 @@ export function createTelnyxAIAgentService({
 
     let eventType;
     try {
-      eventType = await resolveCalendlyEventType();
+      eventType = await resolveCalendlyEventType({ workspaceId: call.workspaceId });
     } catch (error) {
       return calendlyBookingFallback(error, {
         booked: false,
+        workspaceId: call.workspaceId,
         startAt,
         timezone,
       });
@@ -3543,6 +3541,7 @@ export function createTelnyxAIAgentService({
         endAt: new Date(Date.parse(startAt) + 60 * 60_000).toISOString(),
         timezone,
         limit: 10,
+        workspaceId: call.workspaceId,
       });
       const exactSlotOpen = exactAvailability.some(
         (slot) => Math.abs(Date.parse(slot.start_time) - Date.parse(startAt)) < 60_000
@@ -3552,7 +3551,7 @@ export function createTelnyxAIAgentService({
           ok: false,
           booked: false,
           staleSlot: true,
-          bookingUrl: calendlyEventUrl(),
+          bookingUrl: calendlyEventUrl(call.workspaceId),
           alternatives: exactAvailability.slice(0, 3),
           message: exactAvailability.length
             ? "That exact Calendly slot is no longer open. Offer one of the returned alternatives and get explicit confirmation again."
@@ -3562,6 +3561,7 @@ export function createTelnyxAIAgentService({
     } catch (error) {
       return calendlyBookingFallback(error, {
         booked: false,
+        workspaceId: call.workspaceId,
         startAt,
         timezone,
       });
@@ -3607,12 +3607,14 @@ export function createTelnyxAIAgentService({
       providerResponse = await calendlyRequest("/invitees", {
         method: "POST",
         body: bookingBody,
+        workspaceId: call.workspaceId,
       });
     } catch (error) {
       // A 400/404 often means the slot was taken or the event location requires
       // extra input; 403 commonly means Scheduling API is not enabled on plan.
       return calendlyBookingFallback(error, {
         booked: false,
+        workspaceId: call.workspaceId,
         startAt,
         timezone,
       });
@@ -3653,7 +3655,7 @@ export function createTelnyxAIAgentService({
       calendlyInviteeUri: clean(bookedInvitee.uri),
       calendlyCancelUrl: clean(bookedInvitee.cancel_url),
       calendlyRescheduleUrl: clean(bookedInvitee.reschedule_url),
-      calendlyBookingUrl: calendlyEventUrl(),
+      calendlyBookingUrl: calendlyEventUrl(call.workspaceId),
       createdAt: now,
       updatedAt: now,
     };
@@ -3799,7 +3801,7 @@ export function createTelnyxAIAgentService({
       call.leadTimezone ||
       DEFAULT_LEAD_TIMEZONE;
 
-    if (!calendlyConfigured()) {
+    if (!calendlyConfigured(call.workspaceId)) {
       const slots = Array.isArray(call.availableMeetingSlots)
         ? call.availableMeetingSlots
         : [];
@@ -3808,7 +3810,7 @@ export function createTelnyxAIAgentService({
         timezone,
         availableSlots: slots.slice(0, 20),
         source: slots.length ? "preloaded_call_context" : "calendly_link_fallback",
-        bookingUrl: calendlyEventUrl(),
+        bookingUrl: calendlyEventUrl(call.workspaceId),
         message: slots.length
           ? "Calendly API is not configured, so use these preloaded slots and explicitly confirm one before booking."
           : "Live Calendly availability is not configured. Do not invent times; offer the configured Calendly link or ask for a preferred time for human follow-up.",
@@ -3817,7 +3819,7 @@ export function createTelnyxAIAgentService({
 
     let eventType;
     try {
-      eventType = await resolveCalendlyEventType();
+      eventType = await resolveCalendlyEventType({ workspaceId: call.workspaceId });
       const nowMs = Date.now();
       const requestedStart = normalizeDate(
         body.start_time || body.start_at || body.startAt || body.range_start
@@ -3842,6 +3844,7 @@ export function createTelnyxAIAgentService({
         endAt: new Date(Math.max(endMs, startMs + 30 * 60_000)).toISOString(),
         timezone,
         limit,
+        workspaceId: call.workspaceId,
       });
       return {
         ok: true,
@@ -3850,7 +3853,7 @@ export function createTelnyxAIAgentService({
           name: clean(eventType.name),
           durationMinutes: Number(eventType.duration || 30),
         },
-        bookingUrl: calendlyEventUrl(),
+        bookingUrl: calendlyEventUrl(call.workspaceId),
         availableSlots: slots,
         source: "calendly_live",
         message: slots.length
@@ -3860,6 +3863,7 @@ export function createTelnyxAIAgentService({
     } catch (error) {
       return calendlyBookingFallback(error, {
         booked: false,
+        workspaceId: call.workspaceId,
         timezone,
         checkOnly: true,
       });
@@ -5969,16 +5973,55 @@ export function createTelnyxAIAgentService({
     );
   }
 
-  function calendlyEventUrl() {
-    return String(
-      process.env.CALENDLY_EVENT_URL || "https://calendly.com/umairinam76/30min"
-    )
+  function calendlyConfig(workspaceId = "") {
+    const state = store.read();
+    const workspaceConnection = (state.workspaceConnections || [])
+      .filter(
+        (item) =>
+          clean(item.workspaceId) === clean(workspaceId) &&
+          normalizeStatus(item.provider) === "calendly" &&
+          normalizeStatus(item.status) === "connected"
+      )
+      .sort((left, right) =>
+        String(right.updatedAt || right.createdAt || "").localeCompare(
+          String(left.updatedAt || left.createdAt || "")
+        )
+      )[0];
+
+    const workspaceToken = decryptWorkspaceConnectionSecret(
+      workspaceConnection?.calendlyAccessTokenEncrypted
+    );
+    const workspaceUrl = clean(workspaceConnection?.calendlyEventUrl);
+    const workspaceEventTypeUri = clean(workspaceConnection?.calendlyEventTypeUri);
+
+    if (workspaceConnection) {
+      return {
+        token: workspaceToken,
+        eventUrl: workspaceUrl,
+        eventTypeUri: workspaceEventTypeUri,
+        source: "workspace",
+      };
+    }
+
+    return {
+      token: clean(process.env.CALENDLY_ACCESS_TOKEN),
+      eventUrl:
+        clean(process.env.CALENDLY_EVENT_URL) ||
+        "https://calendly.com/umairinam76/30min",
+      eventTypeUri: clean(process.env.CALENDLY_EVENT_TYPE_URI),
+      source: "environment",
+    };
+  }
+
+  function calendlyEventUrl(workspaceId = "") {
+    return String(calendlyConfig(workspaceId).eventUrl || "")
       .trim()
       .replace(/\/+$/, "");
   }
 
-  function calendlyConfigured() {
-    return Boolean(clean(process.env.CALENDLY_ACCESS_TOKEN) && calendlyEventUrl());
+  function calendlyConfigured(workspaceId = "") {
+    const config = calendlyConfig(workspaceId);
+    return Boolean(clean(config.token) && clean(config.eventUrl));
   }
 
   function normalizeCalendlyPublicUrl(value) {
@@ -5996,10 +6039,44 @@ export function createTelnyxAIAgentService({
     return clean(value).split("/").filter(Boolean).pop() || "";
   }
 
-  async function calendlyRequest(endpoint, { method = "GET", body } = {}) {
-    const token = clean(process.env.CALENDLY_ACCESS_TOKEN);
+  function decryptWorkspaceConnectionSecret(value) {
+    const encoded = clean(value);
+    if (!encoded) return "";
+    const parts = encoded.split(".");
+    if (parts.length !== 4 || parts[0] !== "v1") return "";
+
+    const rawKey = String(process.env.CONNECTION_ENCRYPTION_KEY || "").trim();
+    let key = Buffer.alloc(0);
+    if (/^[a-f0-9]{64}$/i.test(rawKey)) {
+      key = Buffer.from(rawKey, "hex");
+    } else {
+      try {
+        key = Buffer.from(rawKey, "base64");
+      } catch {
+        key = Buffer.alloc(0);
+      }
+    }
+    if (key.length !== 32) return "";
+
+    try {
+      const iv = Buffer.from(parts[1], "base64url");
+      const tag = Buffer.from(parts[2], "base64url");
+      const encrypted = Buffer.from(parts[3], "base64url");
+      const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+      decipher.setAuthTag(tag);
+      return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+    } catch {
+      return "";
+    }
+  }
+
+  async function calendlyRequest(
+    endpoint,
+    { method = "GET", body, workspaceId = "" } = {}
+  ) {
+    const token = clean(calendlyConfig(workspaceId).token);
     if (!token) {
-      throw httpError(503, "CALENDLY_ACCESS_TOKEN is not configured.");
+      throw httpError(503, "Calendly is not configured for this workspace.");
     }
     const response = await fetch(`${CALENDLY_API_BASE}${endpoint}`, {
       method,
@@ -6024,7 +6101,10 @@ export function createTelnyxAIAgentService({
         payload?.error ||
         payload?.details?.[0]?.message ||
         `Calendly request failed (${response.status}).`;
-      const error = httpError(response.status >= 500 ? 502 : response.status, String(detail));
+      const error = httpError(
+        response.status >= 500 ? 502 : response.status,
+        String(detail)
+      );
       error.code = "CALENDLY_ERROR";
       error.providerStatus = response.status;
       error.details = payload;
@@ -6033,29 +6113,35 @@ export function createTelnyxAIAgentService({
     return payload;
   }
 
-  async function resolveCalendlyEventType({ force = false } = {}) {
-    if (!calendlyConfigured()) {
+  async function resolveCalendlyEventType({
+    force = false,
+    workspaceId = "",
+  } = {}) {
+    if (!calendlyConfigured(workspaceId)) {
       throw httpError(503, "Calendly live booking is not configured.");
     }
-    if (
-      !force &&
-      calendlyEventTypeCache.value &&
-      calendlyEventTypeCache.expiresAt > Date.now()
-    ) {
-      return calendlyEventTypeCache.value;
+
+    const cacheKey = clean(workspaceId) || "__default__";
+    const cached = calendlyEventTypeCache.get(cacheKey);
+    if (!force && cached?.value && cached.expiresAt > Date.now()) {
+      return cached.value;
     }
 
-    const configuredUri = clean(process.env.CALENDLY_EVENT_TYPE_URI);
+    const config = calendlyConfig(workspaceId);
+    const configuredUri = clean(config.eventTypeUri);
     let eventType = null;
     if (configuredUri) {
       const uuid = calendlyUuidFromUri(configuredUri);
       if (uuid) {
-        const response = await calendlyRequest(`/event_types/${encodeURIComponent(uuid)}`);
+        const response = await calendlyRequest(
+          `/event_types/${encodeURIComponent(uuid)}`,
+          { workspaceId }
+        );
         eventType = safeObject(response?.resource || response);
       }
       if (!clean(eventType.uri)) eventType.uri = configuredUri;
     } else {
-      const meResponse = await calendlyRequest("/users/me");
+      const meResponse = await calendlyRequest("/users/me", { workspaceId });
       const me = safeObject(meResponse?.resource || meResponse);
       const userUri = clean(me.uri);
       if (!userUri) {
@@ -6066,23 +6152,30 @@ export function createTelnyxAIAgentService({
         active: "true",
         count: "100",
       });
-      const response = await calendlyRequest(`/event_types?${params.toString()}`);
+      const response = await calendlyRequest(
+        `/event_types?${params.toString()}`,
+        { workspaceId }
+      );
       const eventTypes = Array.isArray(response?.collection) ? response.collection : [];
-      const wantedUrl = normalizeCalendlyPublicUrl(calendlyEventUrl());
+      const wantedUrl = normalizeCalendlyPublicUrl(calendlyEventUrl(workspaceId));
       eventType = eventTypes.find(
         (item) => normalizeCalendlyPublicUrl(item?.scheduling_url) === wantedUrl
       );
       if (!eventType) {
-        // Be a little forgiving about a trailing slash or URL casing, but never
-        // silently select an unrelated event type.
         let wantedPath = "";
         try {
-          wantedPath = new URL(calendlyEventUrl()).pathname.replace(/\/+$/, "").toLowerCase();
+          wantedPath = new URL(calendlyEventUrl(workspaceId))
+            .pathname.replace(/\/+$/, "")
+            .toLowerCase();
         } catch {}
         if (wantedPath) {
           eventType = eventTypes.find((item) => {
             try {
-              return new URL(item?.scheduling_url || "").pathname.replace(/\/+$/, "").toLowerCase() === wantedPath;
+              return (
+                new URL(item?.scheduling_url || "")
+                  .pathname.replace(/\/+$/, "")
+                  .toLowerCase() === wantedPath
+              );
             } catch {
               return false;
             }
@@ -6092,13 +6185,18 @@ export function createTelnyxAIAgentService({
       if (!eventType) {
         throw httpError(
           404,
-          `Calendly event type was not found for ${calendlyEventUrl()}. Set CALENDLY_EVENT_TYPE_URI if this event is hidden from the event-type list.`
+          `Calendly event type was not found for ${calendlyEventUrl(
+            workspaceId
+          )}. Reconnect Calendly with an active event link.`
         );
       }
       const uuid = calendlyUuidFromUri(eventType.uri);
       if (uuid) {
         try {
-          const detailResponse = await calendlyRequest(`/event_types/${encodeURIComponent(uuid)}`);
+          const detailResponse = await calendlyRequest(
+            `/event_types/${encodeURIComponent(uuid)}`,
+            { workspaceId }
+          );
           eventType = {
             ...eventType,
             ...safeObject(detailResponse?.resource || detailResponse),
@@ -6112,8 +6210,10 @@ export function createTelnyxAIAgentService({
     if (!clean(eventType?.uri)) {
       throw httpError(502, "Calendly event type URI could not be resolved.");
     }
-    calendlyEventTypeCache.value = eventType;
-    calendlyEventTypeCache.expiresAt = Date.now() + 10 * 60_000;
+    calendlyEventTypeCache.set(cacheKey, {
+      value: eventType,
+      expiresAt: Date.now() + 10 * 60_000,
+    });
     return eventType;
   }
 
@@ -6123,6 +6223,7 @@ export function createTelnyxAIAgentService({
     endAt,
     timezone,
     limit = 6,
+    workspaceId = "",
   }) {
     const params = new URLSearchParams({
       event_type: eventTypeUri,
@@ -6130,7 +6231,8 @@ export function createTelnyxAIAgentService({
       end_time: new Date(endAt).toISOString(),
     });
     const response = await calendlyRequest(
-      `/event_type_available_times?${params.toString()}`
+      `/event_type_available_times?${params.toString()}`,
+      { workspaceId }
     );
     const collection = Array.isArray(response?.collection) ? response.collection : [];
     return collection
@@ -6200,7 +6302,7 @@ export function createTelnyxAIAgentService({
 
   function calendlyBookingFallback(error, context = {}) {
     const providerStatus = Number(error?.providerStatus || error?.statusCode || error?.status || 0);
-    const bookingUrl = calendlyEventUrl();
+    const bookingUrl = calendlyEventUrl(context.workspaceId);
     const planBlocked = providerStatus === 403;
     const slotOrValidationIssue = [400, 404, 409, 422].includes(providerStatus);
     return {
@@ -6512,7 +6614,7 @@ export function createTelnyxAIAgentService({
       timezone: clean(value.timezone) || DEFAULT_LEAD_TIMEZONE,
       available_meeting_slots: JSON.stringify(value.availableMeetingSlots || []).slice(0, 4000),
       private_context: clean(value.privateContext).slice(0, 8000),
-      calendly_url: calendlyEventUrl(),
+      calendly_url: calendlyEventUrl(call.workspaceId),
     };
   }
 

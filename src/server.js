@@ -3683,6 +3683,16 @@ app.post(
   }
 );
 
+app.post(
+  "/api/connections/calendly",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    res.json(
+      await workspaceConnectionsService.connectCalendly(req.user, req.body || {})
+    );
+  })
+);
+
 app.get(
   "/api/connections/google/callback",
   async (req, res) => {

@@ -6,6 +6,7 @@ const GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
 const GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
 const CALENDAR_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy";
 const GOOGLE_CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars";
+const CALENDLY_API_BASE = "https://api.calendly.com";
 
 const GOOGLE_SCOPES = [
   "openid",
@@ -257,6 +258,124 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
       connection: publicConnection(saved),
       returnTo: pending.returnTo || "/app/connections",
     };
+  }
+
+  async function connectCalendly(user, input = {}) {
+    const ctx = requireContext(user);
+    const accessToken = clean(input.accessToken || input.token);
+    const eventUrl = normalizeCalendlyPublicUrl(
+      input.eventUrl || input.schedulingUrl || input.bookingUrl
+    );
+
+    if (!accessToken) {
+      throw httpError(422, "Enter a Calendly personal access token.", "CALENDLY_TOKEN_REQUIRED");
+    }
+    if (!eventUrl) {
+      throw httpError(422, "Enter the Calendly event scheduling URL.", "CALENDLY_EVENT_URL_REQUIRED");
+    }
+
+    requireEncryptionKey();
+
+    const meResponse = await calendlyFetch(accessToken, "/users/me");
+    const me = meResponse?.resource || meResponse || {};
+    const userUri = clean(me.uri);
+    const accountEmail = normalizeEmail(me.email);
+    const displayName = clean(me.name) || accountEmail || "Calendly";
+
+    if (!userUri) {
+      throw httpError(502, "Calendly did not return the connected user.", "CALENDLY_USER_UNAVAILABLE");
+    }
+
+    let eventTypeUri = clean(input.eventTypeUri);
+    let resolvedEventUrl = eventUrl;
+
+    if (!eventTypeUri) {
+      const params = new URLSearchParams({
+        user: userUri,
+        active: "true",
+        count: "100",
+      });
+      const list = await calendlyFetch(
+        accessToken,
+        `/event_types?${params.toString()}`
+      );
+      const eventTypes = Array.isArray(list?.collection) ? list.collection : [];
+      const wanted = normalizeCalendlyPublicUrl(eventUrl);
+      const match = eventTypes.find(
+        (item) => normalizeCalendlyPublicUrl(item?.scheduling_url) === wanted
+      );
+
+      if (!match?.uri) {
+        throw httpError(
+          422,
+          "That Calendly scheduling link was not found among the active event types for this account.",
+          "CALENDLY_EVENT_TYPE_NOT_FOUND"
+        );
+      }
+
+      eventTypeUri = clean(match.uri);
+      resolvedEventUrl = normalizeCalendlyPublicUrl(match.scheduling_url) || eventUrl;
+    }
+
+    const now = new Date().toISOString();
+    let saved = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+      let connection = draft.workspaceConnections.find(
+        (item) =>
+          item.workspaceId === ctx.workspaceId &&
+          normalizeStatus(item.provider) === "calendly" &&
+          (clean(item.calendlyUserUri) === userUri ||
+            (accountEmail && normalizeEmail(item.accountEmail) === accountEmail))
+      );
+
+      if (!connection) {
+        connection = {
+          id: crypto.randomUUID(),
+          workspaceId: ctx.workspaceId,
+          provider: "calendly",
+          type: "calendly",
+          createdBy: user.id,
+          createdAt: now,
+        };
+        draft.workspaceConnections.push(connection);
+      }
+
+      Object.assign(connection, {
+        accountEmail,
+        displayName,
+        status: "connected",
+        calendlyAccessTokenEncrypted: encryptSecret(accessToken),
+        calendlyEventUrl: resolvedEventUrl,
+        calendlyEventTypeUri: eventTypeUri,
+        calendlyUserUri: userUri,
+        updatedAt: now,
+        lastError: "",
+        capabilities: {
+          emailSend: false,
+          calendar: false,
+          scheduling: true,
+          calendly: true,
+        },
+      });
+
+      draft.workspaceConnectionActivity.unshift({
+        id: crypto.randomUUID(),
+        workspaceId: ctx.workspaceId,
+        connectionId: connection.id,
+        type: "calendly_connected",
+        actorId: user.id,
+        detail: accountEmail || displayName,
+        createdAt: now,
+      });
+      if (draft.workspaceConnectionActivity.length > 3000) {
+        draft.workspaceConnectionActivity.splice(3000);
+      }
+      saved = { ...connection };
+    });
+
+    return { ok: true, connection: publicConnection(saved) };
   }
 
   function disconnect(user, connectionId) {
@@ -856,6 +975,7 @@ export function createWorkspaceConnectionsService({ store, workspaceService, ema
     getDashboard,
     beginGoogleOAuth,
     handleGoogleOAuthCallback,
+    connectCalendly,
     disconnect,
     testEmail,
     testCalendar,
@@ -878,6 +998,9 @@ function publicConnection(item = {}) {
     scopes: Array.isArray(item.scopes) ? item.scopes : [],
     capabilities: item.capabilities || {},
     lastError: item.lastError || "",
+    calendlyEventUrl: item.calendlyEventUrl || "",
+    calendlyEventTypeUri: item.calendlyEventTypeUri || "",
+    schedulingUrl: item.calendlyEventUrl || "",
     createdAt: item.createdAt || "",
     updatedAt: item.updatedAt || "",
   };
@@ -960,6 +1083,54 @@ async function fetchJson(url, options = {}) {
     throw httpError(502, message, "CONNECTION_PROVIDER_ERROR");
   }
   return body || {};
+}
+
+async function calendlyFetch(accessToken, endpoint, options = {}) {
+  const response = await fetch(`${CALENDLY_API_BASE}${endpoint}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+      ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  const text = await response.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = { raw: text };
+  }
+  if (!response.ok) {
+    const message =
+      body?.message ||
+      body?.title ||
+      body?.error ||
+      `Calendly request failed (${response.status}).`;
+    throw httpError(
+      response.status >= 500 ? 502 : response.status,
+      String(message),
+      "CALENDLY_CONNECTION_FAILED"
+    );
+  }
+  return body || {};
+}
+
+function normalizeCalendlyPublicUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || !/(^|\.)calendly\.com$/i.test(url.hostname)) {
+      return "";
+    }
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
 }
 
 function safeIso(value) {
