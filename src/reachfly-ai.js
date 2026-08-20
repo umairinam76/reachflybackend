@@ -1,7 +1,12 @@
 import crypto from "node:crypto";
 
 const SUPPORT_MARKER_RE = /\[\[REACHFLY_SUPPORT:(billing|technical|account|data|other)\]\]/i;
-const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
+const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
+const CLAUDE_MODEL_FALLBACKS = [
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5-20251001",
+];
 
 export function createReachFlyAI({
   store,
@@ -109,7 +114,11 @@ export function createReachFlyAI({
       }
 
       return {
-        reply: `${buildScreenSuggestions(context)}\n\nClaude is temporarily unavailable. ${anthropicSetupHint(error)}`.trim(),
+        reply: [
+          buildScreenSuggestions(context),
+          `Live AI did not finish this response. ${anthropicSetupHint(error)}`,
+        ].join("\n\n").trim(),
+        degraded: true,
       };
     }
   }
@@ -154,9 +163,30 @@ export function createReachFlyAI({
       });
     } catch (error) {
       console.error("[reachfly-ai] claude stream failed", error);
-      const result = await command(text, options);
-      if (result?.reply) onDelta(`\n${result.reply}`);
-      return result;
+
+      const forcedCategory = supportCategoryFromRequest(text, screen);
+      if (forcedCategory && user) {
+        const support = await createSupportRequest({
+          store,
+          workspaceConnectionsService,
+          user,
+          screen,
+          request: text,
+          category: forcedCategory,
+          reason: safeError(error),
+        });
+        const reply =
+          "I couldn’t complete that account-specific request automatically. I sent the current page context to ReachFly support so you do not need to repeat the issue.";
+        onDelta(`\n${reply}`);
+        return { reply, support };
+      }
+
+      const reply = [
+        buildScreenSuggestions(context),
+        "Live AI did not finish this response, but I can still guide you using the current ReachFly screen. Retry the question once; the backend will automatically use the next available Claude model.",
+      ].join("\n\n");
+      onDelta(`\n${reply}`);
+      return { reply, degraded: true };
     }
   }
 
@@ -329,35 +359,13 @@ function suggestionCards(context) {
 }
 
 async function claudeReply({ text, context }) {
-  const apiKey = requireAnthropicKey();
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: process.env.ANTHROPIC_REACHFLY_MODEL || DEFAULT_CLAUDE_MODEL,
-      max_tokens: clampInt(process.env.ANTHROPIC_REACHFLY_MAX_TOKENS, 900, 200, 2500),
-      temperature: 0.2,
-      system: buildClaudeSystemPrompt(),
-      messages: [
-        {
-          role: "user",
-          content: JSON.stringify({
-            request: text,
-            reachflyContext: compactContext(context),
-          }),
-        },
-      ],
-    }),
+  const { response } = await openClaudeResponse({
+    text,
+    context,
+    stream: false,
   });
 
   const body = await readAnthropicJson(response);
-  if (!response.ok) {
-    throw new Error(body?.error?.message || `Claude returned HTTP ${response.status}.`);
-  }
   return (body?.content || [])
     .filter((item) => item?.type === "text")
     .map((item) => item.text || "")
@@ -366,35 +374,14 @@ async function claudeReply({ text, context }) {
 }
 
 async function streamClaudeReply({ text, context, onDelta }) {
-  const apiKey = requireAnthropicKey();
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: process.env.ANTHROPIC_REACHFLY_MODEL || DEFAULT_CLAUDE_MODEL,
-      max_tokens: clampInt(process.env.ANTHROPIC_REACHFLY_MAX_TOKENS, 900, 200, 2500),
-      temperature: 0.2,
-      stream: true,
-      system: buildClaudeSystemPrompt(),
-      messages: [
-        {
-          role: "user",
-          content: JSON.stringify({
-            request: text,
-            reachflyContext: compactContext(context),
-          }),
-        },
-      ],
-    }),
+  const { response } = await openClaudeResponse({
+    text,
+    context,
+    stream: true,
   });
 
-  if (!response.ok || !response.body) {
-    const body = await readAnthropicJson(response);
-    throw new Error(body?.error?.message || `Claude returned HTTP ${response.status}.`);
+  if (!response.body) {
+    throw new Error("Claude streaming response did not include a response body.");
   }
 
   const decoder = new TextDecoder();
@@ -405,23 +392,40 @@ async function streamClaudeReply({ text, context, onDelta }) {
 
   for await (const chunk of response.body) {
     lineBuffer += decoder.decode(chunk, { stream: true });
-    const lines = lineBuffer.split(/\r?\n/);
+    const lines = lineBuffer.split(/
+?
+/);
     lineBuffer = lines.pop() || "";
 
     for (const line of lines) {
       if (!line.startsWith("data:")) continue;
       const raw = line.slice(5).trim();
       if (!raw || raw === "[DONE]") continue;
+
       let event;
-      try { event = JSON.parse(raw); } catch { continue; }
+      try {
+        event = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+
+      if (event?.type === "error") {
+        throw new Error(
+          event?.error?.message || "Claude streaming request failed."
+        );
+      }
+
       const delta =
-        event?.type === "content_block_delta" && event?.delta?.type === "text_delta"
+        event?.type === "content_block_delta" &&
+        event?.delta?.type === "text_delta"
           ? String(event.delta.text || "")
           : "";
+
       if (!delta) continue;
 
       fullText += delta;
       withheld += delta;
+
       if (withheld.length > tailLength) {
         const safeLength = withheld.length - tailLength;
         const emit = withheld.slice(0, safeLength);
@@ -436,6 +440,163 @@ async function streamClaudeReply({ text, context, onDelta }) {
   const remainder = marker.cleanText.slice(alreadyEmittedLength);
   if (remainder) onDelta(remainder);
   return fullText.trim();
+}
+
+async function openClaudeResponse({ text, context, stream }) {
+  const apiKey = requireAnthropicKey();
+  const models = getClaudeModelCandidates();
+  let lastError = null;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetchWithTimeout(
+          "https://api.anthropic.com/v1/messages",
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-api-key": apiKey,
+              "anthropic-version": "2023-06-01",
+            },
+            body: JSON.stringify({
+              model,
+              max_tokens: clampInt(
+                process.env.ANTHROPIC_REACHFLY_MAX_TOKENS,
+                900,
+                200,
+                2500
+              ),
+              stream: Boolean(stream),
+              system: buildClaudeSystemPrompt(),
+              messages: [
+                {
+                  role: "user",
+                  content: JSON.stringify({
+                    request: text,
+                    reachflyContext: compactContext(context),
+                  }),
+                },
+              ],
+            }),
+          },
+          clampInt(process.env.ANTHROPIC_REACHFLY_TIMEOUT_MS, 30_000, 5_000, 90_000)
+        );
+
+        if (response.ok) {
+          return { response, model };
+        }
+
+        const body = await readAnthropicJson(response);
+        const message =
+          body?.error?.message ||
+          body?.message ||
+          `Claude returned HTTP ${response.status}.`;
+        const error = new Error(message);
+        error.status = response.status;
+        error.model = model;
+        lastError = error;
+
+        // A model can be unavailable to one Anthropic account even while the API
+        // key itself is valid. Move to the next supported model automatically.
+        if (isClaudeModelAvailabilityError(response.status, message)) {
+          break;
+        }
+
+        if (isRetryableClaudeStatus(response.status) && attempt === 0) {
+          await wait(500);
+          continue;
+        }
+
+        throw error;
+      } catch (error) {
+        lastError = error;
+
+        if (isAbortError(error)) {
+          if (attempt === 0) {
+            await wait(350);
+            continue;
+          }
+          break;
+        }
+
+        // Network/transient failures get one retry before falling back to the
+        // next model. Authentication errors are not hidden by model fallback.
+        if (isAuthenticationClaudeError(error)) {
+          throw error;
+        }
+
+        if (attempt === 0) {
+          await wait(350);
+          continue;
+        }
+
+        break;
+      }
+    }
+  }
+
+  throw lastError || new Error("Claude did not return an available model response.");
+}
+
+function getClaudeModelCandidates() {
+  const configured = String(
+    process.env.ANTHROPIC_REACHFLY_MODEL ||
+      process.env.CLAUDE_MODEL ||
+      ""
+  ).trim();
+
+  return [...new Set([
+    configured,
+    DEFAULT_CLAUDE_MODEL,
+    ...CLAUDE_MODEL_FALLBACKS,
+  ].filter(Boolean))];
+}
+
+function isClaudeModelAvailabilityError(status, message) {
+  if (![400, 403, 404].includes(Number(status))) return false;
+  return /(model|not found|not available|access|permission|unsupported)/i.test(
+    String(message || "")
+  );
+}
+
+function isRetryableClaudeStatus(status) {
+  return [408, 409, 429, 500, 502, 503, 504, 529].includes(Number(status));
+}
+
+function isAuthenticationClaudeError(error) {
+  const status = Number(error?.status || 0);
+  const message = String(error?.message || "");
+  return (
+    status === 401 ||
+    (/api key|authentication|unauthorized/i.test(message) &&
+      !/model/i.test(message))
+  );
+}
+
+function isAbortError(error) {
+  return (
+    error?.name === "AbortError" ||
+    /aborted|timeout|timed out/i.test(String(error?.message || ""))
+  );
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildClaudeSystemPrompt() {
