@@ -16,6 +16,7 @@ const AI_AGENT_PLAN_RANK = Object.freeze({
   enterprise: 4,
 });
 const TEST_CREDIT_GRANT = 1000;
+const REACHFLY_SIGNUP_FREE_CREDITS_DEFAULT = 10;
 const AI_CALL_TEST_CREDIT_GRANT = 30;
 const AI_CALL_SIGNUP_FREE_CREDITS_DEFAULT = 10;
 const AI_CALL_CONNECTED_CREDITS_PER_MINUTE_DEFAULT = 10;
@@ -527,6 +528,148 @@ export function createCreditBillingService({ store, workspaceService, externalSa
       output = { ...wallet };
     });
     return output;
+  }
+
+  function getWorkspaceSignupFreeCredits() {
+    const configured = Number(
+      process.env.REACHFLY_SIGNUP_FREE_CREDITS
+    );
+
+    if (
+      Number.isFinite(configured) &&
+      configured >= 0
+    ) {
+      return roundCredits(configured);
+    }
+
+    return REACHFLY_SIGNUP_FREE_CREDITS_DEFAULT;
+  }
+
+  function grantWorkspaceSignupCredits(
+    workspaceId,
+    actorId = "system"
+  ) {
+    const id = clean(workspaceId);
+
+    if (!id) {
+      throw httpError(
+        400,
+        "Workspace is required for signup credits.",
+        "WORKSPACE_REQUIRED"
+      );
+    }
+
+    const credits =
+      getWorkspaceSignupFreeCredits();
+
+    ensureWorkspaceWallet(
+      id,
+      actorId
+    );
+
+    let output = null;
+
+    store.update((draft) => {
+      ensureStateShape(draft);
+
+      const wallet =
+        draft.creditWallets.find(
+          (item) =>
+            item.workspaceId === id
+        );
+
+      if (!wallet) {
+        throw httpError(
+          500,
+          "Workspace credit wallet could not be initialized."
+        );
+      }
+
+      if (wallet.signupGrantAppliedAt) {
+        output = {
+          ...wallet,
+          reused: true,
+        };
+        return;
+      }
+
+      const now =
+        new Date().toISOString();
+
+      wallet.signupGrantAppliedAt =
+        now;
+
+      if (credits > 0) {
+        wallet.balance =
+          roundCredits(
+            creditNumber(
+              wallet.balance
+            ) +
+              credits
+          );
+
+        wallet.totalGranted =
+          roundCredits(
+            creditNumber(
+              wallet.totalGranted
+            ) +
+              credits
+          );
+
+        draft.creditLedger.unshift({
+          id:
+            crypto.randomUUID(),
+          workspaceId: id,
+          type:
+            "signup_grant",
+          feature:
+            "workspace_signup",
+          delta:
+            credits,
+          balanceAfter:
+            wallet.balance,
+          reservedAfter:
+            creditNumber(
+              wallet.reserved
+            ),
+          actorId:
+            clean(actorId) ||
+            "system",
+          description:
+            `${credits} free ReachFly credits included with signup`,
+          createdAt: now,
+        });
+
+        if (
+          draft.creditLedger.length >
+          5000
+        ) {
+          draft.creditLedger.splice(
+            5000
+          );
+        }
+
+        appendActivity(draft, {
+          workspaceId: id,
+          actorId:
+            clean(actorId) ||
+            "system",
+          type:
+            "workspace_signup_credits_granted",
+          title:
+            `${credits} free ReachFly credits added`,
+          detail:
+            "New-workspace starter balance",
+        });
+      }
+
+      wallet.updatedAt = now;
+      output = {
+        ...wallet,
+      };
+    });
+
+    return publicWallet(output);
   }
 
   function getAiCallPolicy() {
@@ -1707,6 +1850,8 @@ export function createCreditBillingService({ store, workspaceService, externalSa
     const ownerLike = ["owner", "admin"].includes(ctx.role) || ctx.accountType === "individual";
     return {
       wallet: publicWallet(wallet),
+      signupFreeCredits:
+        getWorkspaceSignupFreeCredits(),
       freeTestCredits: isTestGrantEnabled() ? TEST_CREDIT_GRANT : 0,
       testGrantEnabled: isTestGrantEnabled(),
       rateCard: getRateCard(),
@@ -2601,6 +2746,8 @@ export function createCreditBillingService({ store, workspaceService, externalSa
     createAiCallCreditCheckout,
     handleSafepayWebhook,
     ensureWorkspaceWallet,
+    getWorkspaceSignupFreeCredits,
+    grantWorkspaceSignupCredits,
     reserveUsage,
     commitUsage,
     releaseUsage,
@@ -2714,6 +2861,8 @@ function publicWallet(wallet = {}) {
     totalPurchased: creditNumber(wallet.totalPurchased),
     totalConsumed: creditNumber(wallet.totalConsumed),
     testGrantAppliedAt: wallet.testGrantAppliedAt || "",
+    signupGrantAppliedAt:
+      wallet.signupGrantAppliedAt || "",
     updatedAt: wallet.updatedAt || "",
   };
 }

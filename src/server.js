@@ -3356,9 +3356,8 @@ app.post(
           user.id
         ) || user;
 
-      // Every newly created customer workspace starts with a small, real
-      // dedicated AI-calling balance. This is separate from general ReachFly
-      // credits and from the developer-only AI_CALL_TEST_GRANT_ENABLED path.
+      // Every genuinely new workspace gets one idempotent starter grant
+      // in the shared ReachFly credit wallet.
       const signupWorkspaceContext =
         workspaceService.getContext?.(workspaceUser) || {};
       const signupWorkspaceId = String(
@@ -3368,8 +3367,9 @@ app.post(
           workspaceUser.id ||
           ""
       ).trim();
+
       if (signupWorkspaceId) {
-        creditBillingService.grantAiCallSignupCredits(
+        creditBillingService.grantWorkspaceSignupCredits(
           signupWorkspaceId,
           workspaceUser.id
         );
@@ -3406,6 +3406,7 @@ app.post(
     const accountType = req.body?.accountType === "company" ? "company" : "individual";
     const companyName = String(req.body?.companyName || "").trim().slice(0, 200);
     const descriptiveRole = String(req.body?.role || "").trim().slice(0, 160);
+    const requestedName = String(req.body?.name || "").trim().slice(0, 160);
     const snapshot = store.read();
     let user = (snapshot.users || []).find(
       (item) => normalizeEmail(item.email) === identity.email
@@ -3456,7 +3457,10 @@ app.post(
       const now = new Date().toISOString();
       user = {
         id: crypto.randomUUID(),
-        name: identity.name || identity.email.split("@")[0],
+        name:
+          requestedName ||
+          identity.name ||
+          identity.email.split("@")[0],
         email: identity.email,
         passwordHash: "",
         googleSub: identity.sub,
@@ -3492,7 +3496,10 @@ app.post(
         ctx.workspaceId || workspaceUser.workspaceId || workspaceUser.id || ""
       ).trim();
       if (workspaceId) {
-        creditBillingService.grantAiCallSignupCredits(workspaceId, workspaceUser.id);
+        creditBillingService.grantWorkspaceSignupCredits(
+          workspaceId,
+          workspaceUser.id
+        );
       }
     }
 
