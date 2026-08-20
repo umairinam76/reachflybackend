@@ -132,6 +132,7 @@ export function createVoiceCommerceService({
     const activeNumber = numbers.find((item) => item.status === "active") || null;
 
     const codesyncWorkspace = clean(ctx.workspaceId) === CODESYNC_WORKSPACE_ID;
+    const purchaseReadiness = getNumberCheckoutReadiness();
 
     return {
       canPurchase: ctx.ownerLike,
@@ -158,6 +159,7 @@ export function createVoiceCommerceService({
         provisioning: isVoiceCommerceTestMode() ? "shared_test_route" : "telnyx",
         realInboundAvailable: !isVoiceCommerceTestMode(),
       },
+      purchaseReadiness,
       numberConnection: {
         canBuy: ctx.ownerLike,
         canConnectExisting: ctx.ownerLike,
@@ -339,6 +341,7 @@ export function createVoiceCommerceService({
 
   async function createNumberCheckout(user, input = {}) {
     const ctx = assertPurchaser(user);
+    assertNumberCheckoutReady();
     const quoteId = clean(input.quoteId);
     const phoneNumber = normalizePhone(input.phoneNumber);
     if (!quoteId || !phoneNumber) {
@@ -425,12 +428,22 @@ export function createVoiceCommerceService({
     });
 
     try {
+      const returnPath = normalizeReturnPath(
+        input.returnPath ||
+          "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers"
+      );
       const checkout = await createSafepayCheckout({
         amountMinor: order.amountMinor,
         currency: order.currency,
         orderId: order.id,
-        redirectUrl: `${getAppUrl()}/app/voice-agent?onboarding=1&numberPayment=success&order=${encodeURIComponent(order.id)}`,
-        cancelUrl: `${getAppUrl()}/app/voice-agent?onboarding=1&numberPayment=cancelled&order=${encodeURIComponent(order.id)}`,
+        redirectUrl: buildReturnUrl(returnPath, {
+          numberPayment: "success",
+          order: order.id,
+        }),
+        cancelUrl: buildReturnUrl(returnPath, {
+          numberPayment: "cancelled",
+          order: order.id,
+        }),
         metadata: {
           source: "reachfly_voice_number_purchase",
           order_id: order.id,
@@ -474,6 +487,7 @@ export function createVoiceCommerceService({
 
   async function createBundleCheckout(user, input = {}) {
     const ctx = assertPurchaser(user);
+    assertNumberCheckoutReady();
     const quoteId = clean(input.quoteId);
     const phoneNumber = normalizePhone(input.phoneNumber);
     const bundleId = clean(input.bundleId);
@@ -616,12 +630,22 @@ export function createVoiceCommerceService({
     });
 
     try {
+      const returnPath = normalizeReturnPath(
+        input.returnPath ||
+          "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers"
+      );
       const checkout = await createSafepayCheckout({
         amountMinor: order.amountMinor,
         currency: order.currency,
         orderId: order.id,
-        redirectUrl: `${getAppUrl()}/app/voice-agent?onboarding=1&numberPayment=success&order=${encodeURIComponent(order.id)}`,
-        cancelUrl: `${getAppUrl()}/app/voice-agent?onboarding=1&numberPayment=cancelled&order=${encodeURIComponent(order.id)}`,
+        redirectUrl: buildReturnUrl(returnPath, {
+          numberPayment: "success",
+          order: order.id,
+        }),
+        cancelUrl: buildReturnUrl(returnPath, {
+          numberPayment: "cancelled",
+          order: order.id,
+        }),
         metadata: {
           source: "reachfly_voice_bundle_purchase",
           order_id: order.id,
@@ -2287,6 +2311,81 @@ async function getSafepayClient() {
     throw httpError(503, "Safepay SDK could not be initialized.", "SAFEPAY_SDK_INVALID");
   }
   return factory(secretKey, { authType: "secret", host });
+}
+
+function getNumberCheckoutReadiness() {
+  const missing = [];
+
+  if (!clean(process.env.SAFEPAY_SECRET_KEY)) missing.push("SAFEPAY_SECRET_KEY");
+  if (!clean(process.env.SAFEPAY_PUBLIC_KEY)) missing.push("SAFEPAY_PUBLIC_KEY");
+
+  if (isVoiceCommerceTestMode()) {
+    if (
+      !clean(
+        process.env.VOICE_TEST_CALL_PHONE_NUMBER_ID ||
+          process.env.ELEVENLABS_AGENT_PHONE_NUMBER_ID
+      )
+    ) {
+      missing.push("VOICE_TEST_CALL_PHONE_NUMBER_ID");
+    }
+    if (
+      !normalizePhone(
+        process.env.VOICE_TEST_CALL_FROM_NUMBER ||
+          process.env.TELNYX_AI_AGENT_FROM_NUMBER ||
+          String(process.env.TELNYX_AI_AGENT_FROM_NUMBERS || "").split(",")[0]
+      )
+    ) {
+      missing.push("VOICE_TEST_CALL_FROM_NUMBER");
+    }
+  } else {
+    if (!getTelnyxCommerceApiKey()) missing.push("TELNYX_API_KEY");
+    if (!resolveTelnyxConnectionId(false)) missing.push("TELNYX_AI_AGENT_SIP_CONNECTION_ID");
+    if (!clean(process.env.ELEVENLABS_API_KEY)) missing.push("ELEVENLABS_API_KEY");
+  }
+
+  return {
+    ready: missing.length === 0,
+    missing,
+    message: missing.length
+      ? `Business-number checkout is waiting for server configuration: ${missing.join(", ")}.`
+      : "Business-number checkout and provisioning are configured.",
+  };
+}
+
+function assertNumberCheckoutReady() {
+  const readiness = getNumberCheckoutReadiness();
+  if (!readiness.ready) {
+    throw httpError(
+      503,
+      readiness.message,
+      "VOICE_NUMBER_CHECKOUT_NOT_CONFIGURED",
+      { missing: readiness.missing }
+    );
+  }
+  return readiness;
+}
+
+function normalizeReturnPath(value) {
+  const raw = clean(value);
+  if (!raw || !raw.startsWith("/app/")) {
+    return "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers";
+  }
+  try {
+    const parsed = new URL(raw, "https://reachfly.local");
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers";
+  }
+}
+
+function buildReturnUrl(returnPath, params = {}) {
+  const url = new URL(normalizeReturnPath(returnPath), getAppUrl());
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && String(value) !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url.toString();
 }
 
 function resolveTelnyxConnectionId(required = true) {

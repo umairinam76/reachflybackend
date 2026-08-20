@@ -34,6 +34,7 @@ import { createCodesyncPlatformAdminService } from "./codesync-platform-admin-se
 import { createCreditBillingService } from "./credit-billing-service.js";
 import { createVoiceCommerceService } from "./voice-commerce-service.js";
 import { createWorkspaceConnectionsService } from "./workspace-connections-service.js";
+import { createScrapedLeadsService } from "./scraped-leads-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
@@ -924,6 +925,12 @@ const workspaceConnectionsService =
     store,
     workspaceService,
     email,
+  });
+
+const scrapedLeadsService =
+  createScrapedLeadsService({
+    store,
+    workspaceService,
   });
 
 const telnyxAiAgentService =
@@ -3669,6 +3676,7 @@ app.get(
   "/api/connections",
   requireAuth,
   (req, res) => {
+    res.set("Cache-Control", "no-store");
     res.json(workspaceConnectionsService.getDashboard(req.user));
   }
 );
@@ -4788,6 +4796,25 @@ app.post(
   }
 );
 
+app.get(
+  "/api/leads/scraped",
+  requireAuth,
+  requireLeadGenerationManager,
+  (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(
+      scrapedLeadsService.list(req.user, {
+        latestOnly: ["1", "true", "yes"].includes(
+          String(req.query?.latest || "").trim().toLowerCase()
+        ),
+        search: req.query?.search || "",
+        limit: req.query?.limit,
+        offset: req.query?.offset,
+      })
+    );
+  }
+);
+
 app.post(
   "/api/leads/find/stream",
   requireAuth,
@@ -4834,6 +4861,10 @@ app.post(
             .filter(Boolean)
             .slice(0, 20)
         : [];
+
+    const searchRunId =
+      req.requestId ||
+      crypto.randomUUID();
 
     if (niche.length < 2) {
       return res.status(400).json({
@@ -4992,6 +5023,7 @@ app.post(
     sendEvent({
       type: "started",
       requestId: req.requestId || "",
+      runId: searchRunId,
       requested: limit,
       niche,
       location,
@@ -5032,12 +5064,7 @@ app.post(
     try {
       leadPromise =
         leadFinder.findLeads({
-          runId:
-            req.requestId ||
-            crypto.randomUUID().slice(
-              0,
-              8
-            ),
+          runId: searchRunId,
           niche,
           location,
           limit,
@@ -5063,6 +5090,19 @@ app.post(
 
             rememberStreamedLeads(
               batchLeads
+            );
+
+            scrapedLeadsService.saveBatch(
+              req.user,
+              batchLeads,
+              {
+                runId: searchRunId,
+                niche,
+                location,
+                requested: limit,
+                status: "streaming",
+                source: "google-places",
+              }
             );
 
             sendEvent({
@@ -5112,6 +5152,24 @@ app.post(
       rememberStreamedLeads(
         result?.leads || []
       );
+
+      scrapedLeadsService.saveBatch(
+        req.user,
+        result?.leads || [],
+        {
+          runId: searchRunId,
+          niche,
+          location,
+          requested: limit,
+          status: result?.status || "complete",
+          source: "google-places",
+        }
+      );
+      scrapedLeadsService.finishRun(req.user, {
+        runId: searchRunId,
+        requested: limit,
+        status: result?.status || "complete",
+      });
 
       if (leadCreditReservation?.id) {
         creditBillingService.commitUsage(leadCreditReservation.id, {
@@ -5191,6 +5249,24 @@ app.post(
           },
         };
 
+        scrapedLeadsService.saveBatch(
+          req.user,
+          partialLeads,
+          {
+            runId: searchRunId,
+            niche,
+            location,
+            requested: limit,
+            status: partialResult.status,
+            source: "google-places",
+          }
+        );
+        scrapedLeadsService.finishRun(req.user, {
+          runId: searchRunId,
+          requested: limit,
+          status: partialResult.status,
+        });
+
         if (leadCreditReservation?.id) {
           creditBillingService.commitUsage(leadCreditReservation.id, {
             actualQuantity: partialLeads.length,
@@ -5222,11 +5298,30 @@ app.post(
         return;
       }
 
+      const interruptedLeads = [
+        ...streamedLeadMap.values(),
+      ].slice(0, limit);
+
+      scrapedLeadsService.finishRun(req.user, {
+        runId: searchRunId,
+        requested: limit,
+        status: clientClosed ? "interrupted" : "error",
+      });
+
       if (leadCreditReservation?.id) {
-        creditBillingService.releaseUsage(
-          leadCreditReservation.id,
-          error?.message || "Lead search failed."
-        );
+        if (interruptedLeads.length) {
+          creditBillingService.commitUsage(leadCreditReservation.id, {
+            actualQuantity: interruptedLeads.length,
+            metadata: {
+              status: clientClosed ? "interrupted" : "error_partial",
+            },
+          });
+        } else {
+          creditBillingService.releaseUsage(
+            leadCreditReservation.id,
+            error?.message || "Lead search failed."
+          );
+        }
       }
 
       console.error(
@@ -5331,6 +5426,10 @@ app.post(
               .slice(0, 8)
           : [];
 
+      const searchRunId =
+        req.requestId ||
+        crypto.randomUUID();
+
       if (niche.length < 2) {
         return res.status(400).json({
           error:
@@ -5387,12 +5486,7 @@ app.post(
 
       const result =
         await leadFinder.findLeads({
-          runId:
-            req.requestId ||
-            crypto.randomUUID().slice(
-              0,
-              8
-            ),
+          runId: searchRunId,
           niche,
           location,
           limit,
@@ -5403,6 +5497,24 @@ app.post(
           exact:
             req.body?.exact !== false,
         });
+
+      scrapedLeadsService.saveBatch(
+        req.user,
+        result?.leads || [],
+        {
+          runId: searchRunId,
+          niche,
+          location,
+          requested: limit,
+          status: result?.status || "complete",
+          source: "google-places",
+        }
+      );
+      scrapedLeadsService.finishRun(req.user, {
+        runId: searchRunId,
+        requested: limit,
+        status: result?.status || "complete",
+      });
 
       if (leadCreditReservation?.id) {
         creditBillingService.commitUsage(leadCreditReservation.id, {

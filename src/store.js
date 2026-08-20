@@ -33,6 +33,7 @@ const DEFAULT_ARRAY_KEYS = [
   "dialerProfiles",
   "senderProfiles",
   "companies",
+  "scrapedLeads",
   // Compatibility collections kept because older routes/services still read them.
   "leadAssignments",
   "callRecords",
@@ -73,6 +74,7 @@ const defaultState = {
   dialerProfiles: [],
   senderProfiles: [],
   companies: [],
+  scrapedLeads: [],
 
   leadAssignments: [],
   callRecords: [],
