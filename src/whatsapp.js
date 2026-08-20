@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -131,6 +132,47 @@ export function createWhatsAppService({
     });
   }
 
+  function resolveBrowserExecutable() {
+    const configured = String(process.env.PUPPETEER_EXECUTABLE_PATH || "").trim();
+    if (configured) return configured;
+
+    // Prefer a system browser when one is installed. Installing Chrome/Chromium
+    // through the operating-system package manager also installs its shared
+    // libraries, which is more reliable on EC2 than Puppeteer's downloaded
+    // Chromium binary.
+    const candidates = [
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium",
+    ];
+
+    return candidates.find((candidate) => existsSync(candidate)) || "";
+  }
+
+  function readableBrowserLaunchError(error) {
+    const raw = String(error?.message || error || "Unknown browser launch error");
+    const missingLibrary = raw.match(/error while loading shared libraries:\s*([^:\s]+):/i)?.[1];
+
+    if (missingLibrary) {
+      return [
+        `WhatsApp browser cannot start because the server is missing ${missingLibrary}.`,
+        "Install the Chrome/Chromium runtime libraries on the EC2 instance, then restart reachfly-api.",
+        "For Amazon Linux 2023 use: sudo dnf install -y atk at-spi2-atk cups-libs gtk3 libXcomposite libXcursor libXdamage libXrandr libXext libXi libXtst pango alsa-lib libdrm mesa-libgbm nss libXScrnSaver libxkbcommon",
+      ].join(" ");
+    }
+
+    if (/failed to launch the browser process/i.test(raw)) {
+      return [
+        "WhatsApp browser could not start on this server.",
+        "Install Chrome/Chromium and its Linux runtime dependencies, or set PUPPETEER_EXECUTABLE_PATH to a working browser executable, then restart reachfly-api.",
+      ].join(" ");
+    }
+
+    return `WhatsApp browser could not start: ${raw}`;
+  }
+
   async function ensureClient(user) {
     const context = workspaceContext(user);
     const workspaceId = context.workspaceId;
@@ -152,15 +194,21 @@ export function createWhatsAppService({
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-software-rasterizer",
         "--no-first-run",
         "--no-zygote",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--mute-audio",
       ],
     };
 
-    if (String(process.env.PUPPETEER_EXECUTABLE_PATH || "").trim()) {
-      puppeteerOptions.executablePath = String(
-        process.env.PUPPETEER_EXECUTABLE_PATH
-      ).trim();
+    const browserExecutable = resolveBrowserExecutable();
+    if (browserExecutable) {
+      puppeteerOptions.executablePath = browserExecutable;
     }
 
     const client = new Client({
@@ -243,14 +291,18 @@ export function createWhatsAppService({
     entry.initPromise = client
       .initialize()
       .catch((error) => {
+        const message = readableBrowserLaunchError(error);
         saveStatus(workspaceId, {
           ready: false,
           qr: "",
           phone: "",
-          message: `WhatsApp browser could not start: ${error.message}`,
+          message,
         });
         clients.delete(workspaceId);
-        throw error;
+
+        const wrapped = new Error(message);
+        wrapped.cause = error;
+        throw wrapped;
       });
 
     // Do not await initialize here. A fresh WhatsApp login intentionally waits
