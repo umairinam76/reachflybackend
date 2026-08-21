@@ -138,6 +138,7 @@ export function createTelnyxAIAgentService({
   store,
   workspaceService,
   leadFinder,
+  scrapedLeadsService,
   creditBillingService,
   email,
   emit = () => {},
@@ -1480,8 +1481,28 @@ export function createTelnyxAIAgentService({
             durationMinutes: { type: "number", description: "Duration when end is omitted." },
             timeZone: { type: "string", description: "IANA timezone." },
             attendeeEmail: { type: "string", description: "Confirmed invite email." },
-            title: { type: "string", description: "Short meeting title." },
-            description: { type: "string", description: "Short meeting notes." },
+            operationType: {
+              type: "string",
+              description:
+                "Niche-specific outcome type when relevant, for example reservation, appointment, viewing, service_visit, or consultation.",
+            },
+            service: {
+              type: "string",
+              description:
+                "Service or booking type requested by the customer, such as dinner reservation, dental cleaning, haircut, property viewing, or repair visit.",
+            },
+            partySize: {
+              type: "number",
+              description:
+                "Number of guests/attendees when relevant, especially restaurant or hospitality reservations.",
+            },
+            location: {
+              type: "string",
+              description:
+                "Confirmed location, branch, property, table area, or service address when relevant.",
+            },
+            title: { type: "string", description: "Short meeting or booking title." },
+            description: { type: "string", description: "Short meeting or booking notes." },
           },
         })
       );
@@ -2249,6 +2270,10 @@ export function createTelnyxAIAgentService({
     }
 
     const runId = `voice-${crypto.randomUUID().slice(0, 8)}`;
+    const excludedIdentityKeys = scrapedLeadsService?.getIdentityKeys
+      ? scrapedLeadsService.getIdentityKeys(user)
+      : new Set();
+
     const result = await leadFinder.findLeads({
       runId,
       niche,
@@ -2259,11 +2284,29 @@ export function createTelnyxAIAgentService({
       regionCode,
       locationVariants,
       exact: input.exact !== false,
+      excludeKeys: excludedIdentityKeys,
     });
 
     const rawLeads = Array.isArray(result?.leads)
       ? result.leads
       : [];
+
+    if (rawLeads.length && scrapedLeadsService?.saveBatch) {
+      scrapedLeadsService.saveBatch(user, rawLeads, {
+        runId,
+        niche,
+        location,
+        requested: limit,
+        status: result?.status || "complete",
+        source: "google-places-voice",
+      });
+      scrapedLeadsService.finishRun?.(user, {
+        runId,
+        requested: limit,
+        status: result?.status || "complete",
+      });
+    }
+
     const now = new Date().toISOString();
     const existingKeys = collectExistingLeadKeys(
       state,
@@ -3646,9 +3689,39 @@ export function createTelnyxAIAgentService({
       endAt: new Date(Date.parse(startAt) + durationMinutes * 60_000).toISOString(),
       durationMinutes,
       timezone,
+      operationType: clean(
+        body.operation_type ||
+          body.operationType ||
+          body.booking_type ||
+          body.bookingType ||
+          "meeting"
+      ),
+      service: clean(
+        body.service ||
+          body.service_type ||
+          body.serviceType ||
+          eventType.name ||
+          ""
+      ),
+      partySize: clampInteger(
+        body.party_size || body.partySize,
+        0,
+        0,
+        500
+      ),
+      location: clean(
+        body.location ||
+          body.meeting_location ||
+          body.meetingLocation ||
+          ""
+      ),
+      customerName: attendeeName || call.leadName || "",
+      phone: attendeePhone || "",
+      email: attendeeEmail || "",
       notes: clean(body.notes).slice(0, 2000),
       status: "confirmed",
       source: "calendly",
+      channel: "voice",
       calendlyEventTypeUri: eventType.uri,
       calendlyEventTypeName: clean(eventType.name),
       calendlyEventUri: eventUri,
@@ -8148,6 +8221,26 @@ function buildAssistantPayload({
             attendee_phone: {
               type: "string",
               description: "Lead's telephone number.",
+            },
+            operation_type: {
+              type: "string",
+              description:
+                "Niche-specific outcome type when relevant: reservation, appointment, viewing, service_visit, consultation, or meeting.",
+            },
+            service: {
+              type: "string",
+              description:
+                "Confirmed service or booking type requested by the lead.",
+            },
+            party_size: {
+              type: "integer",
+              description:
+                "Confirmed guest/attendee count when the business niche needs it.",
+            },
+            location: {
+              type: "string",
+              description:
+                "Confirmed branch, service address, property, or booking location when relevant.",
             },
             notes: {
               type: "string",

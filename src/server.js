@@ -35,6 +35,7 @@ import { createCreditBillingService } from "./credit-billing-service.js";
 import { createVoiceCommerceService } from "./voice-commerce-service.js";
 import { createWorkspaceConnectionsService } from "./workspace-connections-service.js";
 import { createScrapedLeadsService } from "./scraped-leads-service.js";
+import { createOperationsService } from "./operations-service.js";
 import { createExternalLeadConnectorsService } from "./external-lead-connectors-service.js";
 import multer from "multer";
 import { Server as SocketIOServer } from "socket.io";
@@ -820,14 +821,6 @@ const email =
     store,
   });
 
-const campaigns =
-  createCampaignManager({
-    store,
-    broadcast,
-    leadFinder,
-    email,
-  });
-
 const workspaceService =
   createWorkspaceService({
     store,
@@ -936,6 +929,24 @@ const scrapedLeadsService =
     workspaceService,
   });
 
+const campaigns =
+  createCampaignManager({
+    store,
+    broadcast,
+    leadFinder,
+    email,
+    scrapedLeadsService,
+  });
+
+const operationsService =
+  createOperationsService({
+    store,
+    workspaceService,
+    emit({ workspaceId, event, payload }) {
+      emitToWorkspace(workspaceId, event, payload);
+    },
+  });
+
 const externalLeadConnectorsService =
   createExternalLeadConnectorsService({
     store,
@@ -947,6 +958,7 @@ const telnyxAiAgentService =
     store,
     workspaceService,
     leadFinder,
+    scrapedLeadsService,
     creditBillingService,
     email,
     emit({ workspaceId, event, payload }) {
@@ -4850,6 +4862,49 @@ app.delete(
 );
 
 app.get(
+  "/api/operations",
+  requireAuth,
+  requireLeadGenerationManager,
+  (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(
+      operationsService.list(req.user, {
+        search: req.query?.search || "",
+        status: req.query?.status || "all",
+        limit: req.query?.limit,
+        offset: req.query?.offset,
+      })
+    );
+  }
+);
+
+app.post(
+  "/api/operations",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    const result = operationsService.create(req.user, req.body || {});
+    res.set("Cache-Control", "no-store");
+    res.status(201).json(result);
+  })
+);
+
+app.patch(
+  "/api/operations/:id",
+  requireAuth,
+  requireLeadGenerationManager,
+  asyncRoute(async (req, res) => {
+    const result = operationsService.update(
+      req.user,
+      req.params.id,
+      req.body || {}
+    );
+    res.set("Cache-Control", "no-store");
+    res.json(result);
+  })
+);
+
+app.get(
   "/api/leads/scraped",
   requireAuth,
   requireLeadGenerationManager,
@@ -4997,6 +5052,9 @@ app.post(
         code: "LEAD_LIMIT_INVALID",
       });
     }
+
+    const excludedIdentityKeys =
+      scrapedLeadsService.getIdentityKeys(req.user);
 
     let leadCreditReservation = null;
     try {
@@ -5147,6 +5205,8 @@ app.post(
         qualityLevel,
         regionCode,
         locationVariants,
+        excludedIdentityCount:
+          excludedIdentityKeys.size,
         providerDiagnostics:
           placesProvider.getDiagnostics(),
       })}`
@@ -5178,6 +5238,8 @@ app.post(
           locationVariants,
           exact:
             req.body?.exact !== false,
+          excludeKeys:
+            excludedIdentityKeys,
           signal:
             streamController.signal,
           onProgress: (event) => {
@@ -5562,6 +5624,9 @@ app.post(
         });
       }
 
+      const excludedIdentityKeys =
+        scrapedLeadsService.getIdentityKeys(req.user);
+
       leadCreditReservation = creditBillingService.reserveUsage({
         workspaceId: req.user?.workspaceId || req.user?.id,
         feature: "lead_generated",
@@ -5583,6 +5648,8 @@ app.post(
           qualityLevel,
           regionCode,
           locationVariants,
+          excludedIdentityCount:
+            excludedIdentityKeys.size,
           providerDiagnostics:
             placesProvider.getDiagnostics(),
         })}`
@@ -5600,6 +5667,8 @@ app.post(
           locationVariants,
           exact:
             req.body?.exact !== false,
+          excludeKeys:
+            excludedIdentityKeys,
         });
 
       scrapedLeadsService.saveBatch(
@@ -7857,12 +7926,18 @@ app.post(
 app.post(
   "/api/telnyx/ai-agent/tools/google-calendar/book",
   asyncRoute(async (req, res) => {
-    res.json(
-      await workspaceConnectionsService.bookAgentMeeting({
-        headers: req.headers,
-        body: { ...(req.query || {}), ...(req.body || {}) },
-      })
-    );
+    const body = { ...(req.query || {}), ...(req.body || {}) };
+    const booking = await workspaceConnectionsService.bookAgentMeeting({
+      headers: req.headers,
+      body,
+    });
+
+    operationsService.recordVoiceBooking({
+      body,
+      booking: { ...booking, provider: "google-calendar" },
+    });
+
+    res.json(booking);
   })
 );
 
@@ -7872,12 +7947,18 @@ app.post(
     try {
       // Existing ElevenLabs tool IDs can keep calling bookMeeting. When the
       // selected agent has Google Calendar assigned, ReachFly books there.
-      return res.json(
-        await workspaceConnectionsService.bookAgentMeeting({
-          headers: req.headers,
-          body: req.body || {},
-        })
-      );
+      const body = req.body || {};
+      const booking = await workspaceConnectionsService.bookAgentMeeting({
+        headers: req.headers,
+        body,
+      });
+
+      operationsService.recordVoiceBooking({
+        body,
+        booking: { ...booking, provider: "google-calendar" },
+      });
+
+      return res.json(booking);
     } catch (error) {
       if (!isMissingAssignedCalendarConnectionError(error)) {
         throw error;

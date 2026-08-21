@@ -32,7 +32,13 @@ const improvements = [
   "add a lead magnet and follow-up automation",
 ];
 
-export function createCampaignManager({ store, broadcast, leadFinder, email }) {
+export function createCampaignManager({
+  store,
+  broadcast,
+  leadFinder,
+  email,
+  scrapedLeadsService,
+}) {
   const running = new Set();
   const sending = new Set();
 
@@ -102,6 +108,51 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
     const validEmails = Number(payload.validEmails || importedLeads.length);
     const missingEmails = Number(payload.missingEmails || 0);
     const duplicateEmails = Number(payload.duplicateEmails || 0);
+    const validPhones = Number(
+      payload.validPhones ??
+        importedLeads.filter((lead) => cleanText(lead.phone)).length
+    );
+    const missingPhones = Number(
+      payload.missingPhones ??
+        Math.max(0, importedLeads.length - validPhones)
+    );
+
+    const primaryChannel = normalizeCampaignChannel(
+      payload.primaryChannel ||
+        (payload.voiceEnabled || payload.aiVoiceEnabled ? "voice" : "email")
+    );
+
+    const campaignType = cleanText(
+      payload.campaignType ||
+        (primaryChannel === "voice" ? "ai-calling" : "email")
+    );
+
+    const voiceEnabled = Boolean(
+      payload.voiceEnabled === true ||
+        payload.aiVoiceEnabled === true ||
+        payload.outreachPlan?.aiVoice === true ||
+        primaryChannel === "voice"
+    );
+
+    const aiVoiceEnabled = Boolean(
+      payload.aiVoiceEnabled === true ||
+        payload.outreachPlan?.aiVoice === true ||
+        voiceEnabled
+    );
+
+    const aiManagedEmailFollowUp = Boolean(
+      payload.aiManagedEmailFollowUp === true ||
+        payload.outreachPlan?.aiManagedEmailFollowUp === true ||
+        payload.outreachPlan?.aiChoosesFollowUpTiming === true
+    );
+
+    const emailEnabled = Boolean(
+      payload.emailEnabled === true ||
+        payload.outreachPlan?.emailEnabled === true ||
+        primaryChannel === "email" ||
+        aiManagedEmailFollowUp ||
+        cleanText(payload.emailAccountId || payload.senderEmail || payload.fromEmail)
+    );
 
     const dailyLimit = clampNumber(
       payload.dailyLimit ||
@@ -134,6 +185,21 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
         ? "external-import"
         : "google-places",
       externalImport: isExternalImport,
+      workspaceId: cleanText(payload.workspaceId || ""),
+
+      campaignType,
+      primaryChannel,
+      voiceEnabled,
+      aiVoiceEnabled,
+      emailEnabled,
+      aiManagedEmailFollowUp,
+      outreachPlan: sanitizeOutreachPlan(payload.outreachPlan, {
+        primaryChannel,
+        voiceEnabled,
+        aiVoiceEnabled,
+        emailEnabled,
+        aiManagedEmailFollowUp,
+      }),
 
       niche,
       category: niche,
@@ -159,6 +225,8 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
       validEmails: isExternalImport ? validEmails : 0,
       missingEmails: isExternalImport ? missingEmails : 0,
       duplicateEmails: isExternalImport ? duplicateEmails : 0,
+      validPhones: isExternalImport ? validPhones : 0,
+      missingPhones: isExternalImport ? missingPhones : 0,
       selectedSegment: cleanText(payload.selectedSegment || ""),
 
       leadMeta: isExternalImport
@@ -175,6 +243,8 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
             validEmails,
             missingEmails,
             duplicateEmails,
+            validPhones,
+            missingPhones,
             selectedSegment: cleanText(payload.selectedSegment || ""),
           }
         : {
@@ -325,13 +395,24 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
         "discovering"
       );
 
+      const campaignLeadRunId = `campaign-${campaign.id}`;
+      const campaignUser = {
+        id: campaign.userId || campaign.ownerId || "",
+        workspaceId: campaign.workspaceId || "",
+      };
+      const excludedIdentityKeys = scrapedLeadsService?.getIdentityKeys
+        ? scrapedLeadsService.getIdentityKeys(campaignUser)
+        : new Set();
+
       const result = await leadFinder.findLeads({
+        runId: campaignLeadRunId,
         niche: campaign.niche,
         location: campaign.location,
         radiusKm: campaign.radiusKm,
         limit: campaign.limit,
         qualityLevel: campaign.qualityLevel,
         exact: true,
+        excludeKeys: excludedIdentityKeys,
         onProgress: (event = {}) => {
           updateCampaignProgress(
             id,
@@ -348,6 +429,22 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
         result.leads || [],
         campaign
       );
+
+      if (leads.length && scrapedLeadsService?.saveBatch) {
+        scrapedLeadsService.saveBatch(campaignUser, result.leads || leads, {
+          runId: campaignLeadRunId,
+          niche: campaign.niche,
+          location: campaign.location,
+          requested: campaign.limit,
+          status: result.status || "complete",
+          source: "google-places-campaign",
+        });
+        scrapedLeadsService.finishRun?.(campaignUser, {
+          runId: campaignLeadRunId,
+          requested: campaign.limit,
+          status: result.status || "complete",
+        });
+      }
 
       if (!leads.length) {
         const error = new Error(
@@ -518,6 +615,16 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
       throw new Error("Campaign has no leads yet.");
     }
 
+    if (
+      normalizeCampaignChannel(campaign.primaryChannel) === "voice" ||
+      campaign.voiceEnabled === true ||
+      campaign.aiVoiceEnabled === true
+    ) {
+      throw new Error(
+        "This is an AI Calling campaign. Launch it from the Dialer/AI Voice workflow; email follow-up is triggered from call outcomes when configured."
+      );
+    }
+
     if (!email?.sendCampaignEmail) {
       throw new Error(
         "Email sending service is not connected. Pass email into createCampaignManager({ store, broadcast, leadFinder, email })."
@@ -541,7 +648,10 @@ export function createCampaignManager({ store, broadcast, leadFinder, email }) {
     }
 
     const stages = (campaign.pipeline || []).filter(
-      (stage) => stage.enabled !== false
+      (stage) =>
+        stage.enabled !== false &&
+        stage.aiTriggered !== true &&
+        stage.executionMode !== "ai_triggered"
     );
 
     const immediateEmailStages = stages.filter(
@@ -1094,16 +1204,87 @@ function validateCampaign(
 function sanitizePipeline(pipeline = []) {
   if (!Array.isArray(pipeline)) return [];
 
-  return pipeline.map((stage, index) => ({
-    id: stage.id || uid("stage"),
-    order: index,
-    name: String(stage.name || `Stage ${index + 1}`).slice(0, 90),
-    channel: stage.channel === "whatsapp" ? "whatsapp" : "email",
-    delayMinutes: Math.max(0, Number(stage.delayMinutes || 0)),
-    subject: String(stage.subject || "").slice(0, 180),
-    body: String(stage.body || "").slice(0, 5000),
-    enabled: stage.enabled !== false,
-  }));
+  return pipeline.map((stage, index) => {
+    const channel = normalizeCampaignChannel(stage.channel || "email");
+    const aiTriggered = Boolean(
+      stage.aiTriggered === true ||
+        stage.executionMode === "ai_triggered" ||
+        stage.triggerPolicy?.mode === "ai_decides"
+    );
+
+    return {
+      id: stage.id || uid("stage"),
+      order: index,
+      name: String(stage.name || `Stage ${index + 1}`).slice(0, 90),
+      channel,
+      delayMinutes: Math.max(0, Number(stage.delayMinutes || 0)),
+      subject: String(stage.subject || "").slice(0, 180),
+      body: String(stage.body || "").slice(0, 5000),
+      enabled: stage.enabled !== false,
+      aiTriggered,
+      executionMode: aiTriggered ? "ai_triggered" : "scheduled",
+      triggerPolicy: sanitizeTriggerPolicy(stage.triggerPolicy),
+    };
+  });
+}
+
+function sanitizeOutreachPlan(value = {}, defaults = {}) {
+  const source = value && typeof value === "object" ? value : {};
+
+  return {
+    strategy: cleanText(source.strategy || ""),
+    primaryChannel: normalizeCampaignChannel(
+      source.primaryChannel || defaults.primaryChannel || "email"
+    ),
+    aiVoice: Boolean(source.aiVoice === true || defaults.aiVoiceEnabled),
+    emailEnabled: Boolean(source.emailEnabled === true || defaults.emailEnabled),
+    aiManagedEmailFollowUp: Boolean(
+      source.aiManagedEmailFollowUp === true || defaults.aiManagedEmailFollowUp
+    ),
+    aiChoosesFollowUpTiming: Boolean(
+      source.aiChoosesFollowUpTiming === true ||
+        source.aiManagedEmailFollowUp === true ||
+        defaults.aiManagedEmailFollowUp
+    ),
+    digitalChannel: cleanText(source.digitalChannel || ""),
+    disclosureRequired: source.disclosureRequired === true,
+    recordingPolicy: cleanText(source.recordingPolicy || ""),
+    pipeline: Array.isArray(source.pipeline)
+      ? sanitizePipeline(source.pipeline)
+      : [],
+  };
+}
+
+function sanitizeTriggerPolicy(value = {}) {
+  if (!value || typeof value !== "object") return null;
+
+  const outcomes = Array.isArray(value.outcomes)
+    ? value.outcomes
+        .map((item) => cleanText(item).slice(0, 80))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
+
+  return {
+    mode: cleanText(value.mode || "ai_decides").slice(0, 80),
+    outcomes,
+    requireConsent: value.requireConsent !== false,
+    description: cleanText(value.description || "").slice(0, 500),
+  };
+}
+
+function normalizeCampaignChannel(value) {
+  const channel = cleanText(value).toLowerCase().replace(/[-\s]+/g, "_");
+
+  if (["voice", "ai_voice", "ai_calling", "phone", "call"].includes(channel)) {
+    return "voice";
+  }
+
+  if (["whatsapp", "wa"].includes(channel)) {
+    return "whatsapp";
+  }
+
+  return "email";
 }
 
 function normalizeImportedLeads(

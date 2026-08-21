@@ -227,22 +227,29 @@ export function createLeadFinder(options = {}) {
         ? input.signal
         : null;
 
+    const excludedIdentityKeys = normalizeExcludedLeadKeys(
+      input.excludeKeys || input.excludedKeys || input.seenLeadKeys
+    );
+
     const isAborted = () =>
       Boolean(signal?.aborted);
 
     async function emitLeadBatch(leads, meta = {}) {
       if (!onLeadBatch) return;
 
-      const normalized = dedupeLeads(
-        (Array.isArray(leads) ? leads : [])
-          .filter(Boolean)
-          .map((lead) =>
-            normalizeGoogleLead(lead, {
-              niche,
-              location,
-            })
-          )
-      ).filter(isRightLead);
+      const normalized = filterExcludedLeads(
+        dedupeLeads(
+          (Array.isArray(leads) ? leads : [])
+            .filter(Boolean)
+            .map((lead) =>
+              normalizeGoogleLead(lead, {
+                niche,
+                location,
+              })
+            )
+        ).filter(isRightLead),
+        excludedIdentityKeys
+      );
 
       if (!normalized.length) return;
 
@@ -318,10 +325,14 @@ export function createLeadFinder(options = {}) {
       Math.max(
         requestedLimit,
         exactMode
-          ? requestedLimit * 3
-          : requestedLimit * 2,
+          ? requestedLimit * (excludedIdentityKeys.size ? 6 : 3)
+          : requestedLimit * (excludedIdentityKeys.size ? 4 : 2),
         requestedLimit +
-          (exactMode ? 80 : 30)
+          (excludedIdentityKeys.size
+            ? Math.min(400, Math.max(160, requestedLimit * 2))
+            : exactMode
+              ? 80
+              : 30)
       )
     );
 
@@ -336,14 +347,20 @@ export function createLeadFinder(options = {}) {
 
     const exactFillPasses =
       exactMode
-        ? clampNumber(
-            Number(
-              process.env
-                .LEAD_EXACT_FILL_PASSES ||
-                2
-            ),
-            1,
-            3
+        ? Math.min(
+            3,
+            Math.max(
+              excludedIdentityKeys.size ? 3 : 1,
+              clampNumber(
+                Number(
+                  process.env
+                    .LEAD_EXACT_FILL_PASSES ||
+                    2
+                ),
+                1,
+                3
+              )
+            )
           )
         : 1;
 
@@ -355,6 +372,8 @@ export function createLeadFinder(options = {}) {
       qualityLevel,
       minScore,
       nicheVariants,
+      excludedIdentityCount:
+        excludedIdentityKeys.size,
       providerDiagnostics:
         placesProvider.getDiagnostics?.() || null,
     });
@@ -370,6 +389,8 @@ export function createLeadFinder(options = {}) {
         location,
         requestedLimit,
         provider: "google-places",
+        excludedIdentityCount:
+          excludedIdentityKeys.size,
       },
     });
 
@@ -391,14 +412,17 @@ export function createLeadFinder(options = {}) {
       if (fillPass > 0) {
         const currentlyUsable =
           rankLeads(
-            seeds.map((seed) =>
-              normalizeGoogleLead(
-                seed,
-                {
-                  niche,
-                  location,
-                }
-              )
+            filterExcludedLeads(
+              seeds.map((seed) =>
+                normalizeGoogleLead(
+                  seed,
+                  {
+                    niche,
+                    location,
+                  }
+                )
+              ),
+              excludedIdentityKeys
             ),
             {
               niche,
@@ -474,7 +498,8 @@ export function createLeadFinder(options = {}) {
             recoveryRoundOffset:
               fillPass * 2,
             forceRefresh:
-              fillPass > 0,
+              fillPass > 0 ||
+              excludedIdentityKeys.size > 0,
             signal,
             onProgress,
             onCandidateBatch:
@@ -517,14 +542,17 @@ export function createLeadFinder(options = {}) {
 
       const usableAfterPass =
         rankLeads(
-          seeds.map((seed) =>
-            normalizeGoogleLead(
-              seed,
-              {
-                niche,
-                location,
-              }
-            )
+          filterExcludedLeads(
+            seeds.map((seed) =>
+              normalizeGoogleLead(
+                seed,
+                {
+                  niche,
+                  location,
+                }
+              )
+            ),
+            excludedIdentityKeys
           ),
           {
             niche,
@@ -603,10 +631,15 @@ export function createLeadFinder(options = {}) {
       },
     });
 
+    const freshSeeds = filterExcludedLeads(
+      seeds,
+      excludedIdentityKeys
+    );
+
     const enrichLimit =
       remainingMs() > websiteTimeoutMs
         ? Math.min(
-            seeds.length,
+            freshSeeds.length,
             requestedLimit,
             maxEnrich
           )
@@ -630,7 +663,7 @@ export function createLeadFinder(options = {}) {
 
       enriched = (
         await mapWithConcurrency(
-          seeds.slice(0, enrichLimit),
+          freshSeeds.slice(0, enrichLimit),
           enrichConcurrency,
           async (seed, index) => {
             const normalizedSeed =
@@ -721,7 +754,7 @@ export function createLeadFinder(options = {}) {
       }
     }
 
-    const combined = seeds.map((seed) => {
+    const combined = freshSeeds.map((seed) => {
       const enrichedLead = leadKeys(seed)
         .map((key) => enrichedByKey.get(key))
         .find(Boolean);
@@ -733,12 +766,15 @@ export function createLeadFinder(options = {}) {
         });
     });
 
-    const ranked = rankLeads(combined, {
-      niche,
-      location,
-      minScore,
-      exact: exactMode,
-    });
+    const ranked = rankLeads(
+      filterExcludedLeads(combined, excludedIdentityKeys),
+      {
+        niche,
+        location,
+        minScore,
+        exact: exactMode,
+      }
+    );
 
     const leads = ranked.slice(
       0,
@@ -761,10 +797,12 @@ export function createLeadFinder(options = {}) {
         : "completed_empty";
 
     const message = exact
-      ? `Found exactly ${delivered} Google Places leads.`
+      ? `Found exactly ${delivered} fresh Google Places leads.`
       : delivered
-        ? `Found ${delivered} Google Places leads. ${shortfall} more were requested but were not available within the configured Google search limits.`
-        : "Google Places did not return any usable matching business leads for this search.";
+        ? `Found ${delivered} fresh Google Places leads. ${shortfall} more were requested but no additional unseen matching businesses were available within the configured Google search limits.`
+        : excludedIdentityKeys.size
+          ? "No new matching businesses were available after excluding leads already seen by this workspace."
+          : "Google Places did not return any usable matching business leads for this search.";
 
     progress(onProgress, {
       type: "lead-search-complete",
@@ -798,6 +836,9 @@ export function createLeadFinder(options = {}) {
         qualityLevel,
         minimumScore: minScore,
         candidateCount: seeds.length,
+        freshCandidateCount: freshSeeds.length,
+        excludedIdentityCount: excludedIdentityKeys.size,
+        filteredPreviouslySeenCount: Math.max(0, seeds.length - freshSeeds.length),
         enrichedCount: enriched.length,
         elapsedMs: Date.now() - startedAt,
         providerMeta:
@@ -816,6 +857,8 @@ export function createLeadFinder(options = {}) {
       shortfall,
       exact,
       candidateCount: seeds.length,
+      freshCandidateCount: freshSeeds.length,
+      excludedIdentityCount: excludedIdentityKeys.size,
       enrichedCount: enriched.length,
       elapsedMs: Date.now() - startedAt,
     });
@@ -1993,15 +2036,17 @@ function leadKeys(
   const keys = [];
 
   const placeId = cleanText(
-    lead?.placeId
-  );
+    lead?.placeId || lead?.place_id
+  ).toLowerCase();
 
   const host = getHostname(
-    lead?.website
+    lead?.website || lead?.domain
   );
 
   const phone = cleanText(
-    lead?.phone
+    lead?.phone ||
+      lead?.internationalPhoneNumber ||
+      lead?.nationalPhoneNumber
   ).replace(/\D/g, "");
 
   const email = cleanText(
@@ -2013,6 +2058,18 @@ function leadKeys(
       lead?.business
   );
 
+  const address = normalize(
+    lead?.address ||
+      [
+        lead?.street,
+        lead?.city,
+        lead?.state,
+        lead?.postalCode,
+      ]
+        .filter(Boolean)
+        .join(" ")
+  );
+
   if (placeId) {
     keys.push(
       `place:${placeId}`
@@ -2021,6 +2078,7 @@ function leadKeys(
 
   if (host) {
     keys.push(`host:${host}`);
+    keys.push(`domain:${host}`);
   }
 
   if (email) {
@@ -2035,17 +2093,56 @@ function leadKeys(
     );
   }
 
-  if (name) {
+  if (name && address) {
+    keys.push(
+      `business:${name}|${address}`
+    );
+  } else if (name) {
     keys.push(
       `name:${name}`
     );
   }
 
-  return keys.length
-    ? keys
-    : [
-        `random:${crypto.randomUUID()}`,
-      ];
+  return uniqueStrings(keys);
+}
+
+function normalizeExcludedLeadKeys(value) {
+  const values =
+    value instanceof Set
+      ? [...value]
+      : Array.isArray(value)
+        ? value
+        : value &&
+          typeof value !== "string" &&
+          typeof value[Symbol.iterator] === "function"
+          ? [...value]
+          : [];
+
+  return new Set(
+    values
+      .map((item) => cleanText(item).toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function isExcludedLead(lead, excludedKeys) {
+  if (!(excludedKeys instanceof Set) || !excludedKeys.size) {
+    return false;
+  }
+
+  return leadKeys(lead).some((key) =>
+    excludedKeys.has(cleanText(key).toLowerCase())
+  );
+}
+
+function filterExcludedLeads(leads, excludedKeys) {
+  if (!(excludedKeys instanceof Set) || !excludedKeys.size) {
+    return Array.isArray(leads) ? leads.filter(Boolean) : [];
+  }
+
+  return (Array.isArray(leads) ? leads : [])
+    .filter(Boolean)
+    .filter((lead) => !isExcludedLead(lead, excludedKeys));
 }
 
 async function settleWithin(
