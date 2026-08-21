@@ -442,9 +442,7 @@ async function streamClaudeReply({ text, context, onDelta }) {
 
   for await (const chunk of response.body) {
     lineBuffer += decoder.decode(chunk, { stream: true });
-    const lines = lineBuffer.split(/
-?
-/);
+    const lines = lineBuffer.split(/\r?\n/);
     lineBuffer = lines.pop() || "";
 
     for (const line of lines) {
@@ -454,9 +452,7 @@ async function streamClaudeReply({ text, context, onDelta }) {
 
   lineBuffer += decoder.decode();
   if (lineBuffer.trim()) {
-    for (const line of lineBuffer.split(/
-?
-/)) {
+    for (const line of lineBuffer.split(/\r?\n/)) {
       processLine(line);
     }
   }
