@@ -84,7 +84,7 @@ const defaultState = {
 
   settings: {
     app: {
-      workspaceName: "ReachFly.Ai Growth Workspace",
+      workspaceName: "ReachFlyAi Growth Workspace",
       defaultRadiusKm: 10,
       defaultLeadLimit: 100,
       complianceMode: true,
@@ -93,7 +93,7 @@ const defaultState = {
     },
     email: {
       provider: "gmail",
-      fromName: "ReachFly.Ai",
+      fromName: "ReachFlyAi",
       fromEmail: "",
       host: "smtp.gmail.com",
       port: 587,

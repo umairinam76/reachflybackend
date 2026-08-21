@@ -4198,8 +4198,8 @@ app.delete(
 );
 
 async function sendPasswordResetEmail({ to, resetUrl }) {
-  const subject = "Reset your ReachFly.Ai password";
-  const text = `Reset your ReachFly.Ai password using this secure link. It expires in 30 minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`;
+  const subject = "Reset your ReachFlyAi password";
+  const text = `Reset your ReachFlyAi password using this secure link. It expires in 30 minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`;
   const host = String(process.env.AUTH_SMTP_HOST || "").trim();
   const username = String(process.env.AUTH_SMTP_USERNAME || "").trim();
   const password = String(process.env.AUTH_SMTP_PASSWORD || "").trim();
@@ -4220,7 +4220,7 @@ async function sendPasswordResetEmail({ to, resetUrl }) {
       auth: { user: username, pass: password },
     });
     const fromName = String(
-      process.env.AUTH_SMTP_FROM_NAME || "ReachFly.Ai"
+      process.env.AUTH_SMTP_FROM_NAME || "ReachFlyAi"
     ).trim();
     try {
       await transport.sendMail({
@@ -4228,7 +4228,7 @@ async function sendPasswordResetEmail({ to, resetUrl }) {
         to,
         subject,
         text,
-        html: `<p>Reset your ReachFly.Ai password using the secure link below. It expires in 30 minutes.</p><p><a href="${resetUrl}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`,
+        html: `<p>Reset your ReachFlyAi password using the secure link below. It expires in 30 minutes.</p><p><a href="${resetUrl}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`,
       });
     } finally {
       try { transport.close?.(); } catch {}
@@ -6219,7 +6219,7 @@ app.put(
       workspaceName: String(
         req.body
           .workspaceName ||
-          "ReachFly.Ai Growth Workspace"
+          "ReachFlyAi Growth Workspace"
       ).slice(0, 120),
 
       brandTagline: String(

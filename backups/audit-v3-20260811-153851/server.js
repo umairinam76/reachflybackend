@@ -5560,7 +5560,7 @@ app.put(
       workspaceName: String(
         req.body
           .workspaceName ||
-          "ReachFly.Ai Growth Workspace"
+          "ReachFlyAi Growth Workspace"
       ).slice(0, 120),
 
       brandTagline: String(
