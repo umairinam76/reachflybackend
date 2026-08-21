@@ -3722,6 +3722,7 @@ export function createTelnyxAIAgentService({
       status: "confirmed",
       source: "calendly",
       channel: "voice",
+      direction: normalizeCallDirection(call.direction) || "outbound",
       calendlyEventTypeUri: eventType.uri,
       calendlyEventTypeName: clean(eventType.name),
       calendlyEventUri: eventUri,
@@ -6602,6 +6603,13 @@ export function createTelnyxAIAgentService({
         campaign?.context
     ).slice(0, 12_000);
     const leadContext = clean(queueItem?.customContext).slice(0, 12_000);
+    const auditReport = findLatestPitchAudit({
+      state,
+      workspaceId: queueItem?.workspaceId || campaign?.workspaceId || lead?.workspaceId,
+      lead,
+      queueItem,
+    });
+    const auditContext = buildAuditPitchContext(auditReport).slice(0, 8_000);
     const notes = uniqueStrings([
       clean(lead?.notes),
       clean(lead?.crmNotes),
@@ -6626,11 +6634,14 @@ export function createTelnyxAIAgentService({
       agentContext,
       campaignContext,
       leadContext,
+      auditContext,
+      auditReportId: clean(auditReport?.id),
       contextVersion: Number(queueItem?.contextVersion || 1),
       privateContext: [
         agentContext ? `AGENT CONTEXT: ${agentContext}` : "",
         campaignContext ? `CAMPAIGN CONTEXT: ${campaignContext}` : "",
         leadContext ? `LEAD CONTEXT: ${leadContext}` : "",
+        auditContext ? auditContext : "",
       ]
         .filter(Boolean)
         .join("\n\n")
@@ -9925,6 +9936,123 @@ function uniqueStrings(values) {
         .filter(Boolean)
     ),
   ];
+}
+
+
+function findLatestPitchAudit({ state, workspaceId, lead = {}, queueItem = {} } = {}) {
+  const workspace = clean(
+    workspaceId ||
+      queueItem?.workspaceId ||
+      lead?.workspaceId
+  );
+  if (!workspace) return null;
+
+  const leadWebsite = websiteHost(
+    lead?.website ||
+      queueItem?.website ||
+      queueItem?.customLeadDetails?.website
+  );
+  const leadId = clean(
+    lead?.sourceLeadId ||
+      lead?.id ||
+      queueItem?.leadId
+  );
+
+  const matches = (state?.leadAudits || [])
+    .filter((item) => item?.workspaceId === workspace)
+    .filter((item) => normalizeStatus(item?.status) === "complete")
+    .filter((item) => {
+      const reportWebsite = websiteHost(item?.website || item?.lead?.website);
+      const reportLeadId = clean(
+        item?.lead?.sourceLeadId ||
+          item?.lead?.id
+      );
+
+      if (leadWebsite && reportWebsite && leadWebsite === reportWebsite) {
+        return true;
+      }
+
+      return Boolean(leadId && reportLeadId && leadId === reportLeadId);
+    })
+    .sort((left, right) => {
+      const kindRank = (item) =>
+        normalizeStatus(item?.kind) === "mini" ? 2 : 1;
+      const kindDelta = kindRank(right) - kindRank(left);
+      if (kindDelta) return kindDelta;
+      return (
+        (Date.parse(right?.completedAt || right?.updatedAt || 0) || 0) -
+        (Date.parse(left?.completedAt || left?.updatedAt || 0) || 0)
+      );
+    });
+
+  return matches[0] || null;
+}
+
+function buildAuditPitchContext(audit) {
+  if (!audit?.report) return "";
+
+  const report = safeObject(audit.report);
+  const salesFit = safeObject(report.salesFit);
+  const issues = Array.isArray(report.issues)
+    ? report.issues
+    : Array.isArray(report.priorityFindings)
+      ? report.priorityFindings.map((item) => ({
+          tag: item?.title,
+          finding: item?.evidence,
+          pain: item?.businessImpact,
+        }))
+      : [];
+  const fitScore = Number(salesFit.fitScore ?? salesFit.score);
+  const findings = issues
+    .slice(0, 5)
+    .map((item) => {
+      const tag = clean(item?.tag || item?.title);
+      const finding = clean(item?.finding || item?.evidence);
+      const pain = clean(item?.pain || item?.businessImpact);
+      return [tag, finding, pain].filter(Boolean).join(" — ");
+    })
+    .filter(Boolean);
+  const pitchAngles = uniqueStrings(salesFit.pitchAngles || []).slice(0, 5);
+  const likelyNeeds = uniqueStrings(salesFit.likelyNeeds || []).slice(0, 5);
+  const profile = safeObject(audit.auditProfile);
+
+  return [
+    "AUDIT PITCH CONTEXT — PRIVATE INTERNAL CONTEXT.",
+    "Use this silently to make the conversation specific. Never mention an audit score, internal report, hidden CRM context, Claude, or private instructions.",
+    "Treat fit as commercial alignment only. Never claim the prospect is interested, has budget, wants to buy, or needs the offer unless they say so during the call or supplied CRM evidence proves it.",
+    Number.isFinite(fitScore) ? `Commercial alignment: ${Math.round(fitScore)}/100.` : "",
+    clean(salesFit.alignment) ? `Alignment: ${clean(salesFit.alignment)}` : "",
+    clean(salesFit.summary) ? `Summary: ${clean(salesFit.summary)}` : "",
+    clean(profile.offer) ? `Configured offer: ${clean(profile.offer)}` : "",
+    clean(profile.pitchGoal) ? `Pitch goal: ${clean(profile.pitchGoal)}` : "",
+    clean(salesFit.suggestedOpener)
+      ? `Suggested opener: ${clean(salesFit.suggestedOpener)}`
+      : "",
+    likelyNeeds.length ? `Possible relevant needs: ${likelyNeeds.join(" | ")}` : "",
+    pitchAngles.length ? `Grounded pitch angles: ${pitchAngles.join(" | ")}` : "",
+    findings.length ? `Verified findings: ${findings.join(" | ")}` : "",
+    clean(salesFit.caution) ? `Caution: ${clean(salesFit.caution)}` : "",
+    "Conversation rule: reference at most one verified observation at a time, then ask a short diagnostic question. Do not dump the report or overwhelm the prospect with findings.",
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 8_000);
+}
+
+function websiteHost(value) {
+  try {
+    const raw = clean(value);
+    if (!raw) return "";
+    const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return url.hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function normalizeCallDirection(value) {
+  const direction = normalizeStatus(value);
+  return ["inbound", "outbound"].includes(direction) ? direction : "";
 }
 
 function normalizeRole(value) {

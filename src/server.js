@@ -4871,6 +4871,7 @@ app.get(
       operationsService.list(req.user, {
         search: req.query?.search || "",
         status: req.query?.status || "all",
+        direction: req.query?.direction || "",
         limit: req.query?.limit,
         offset: req.query?.offset,
       })
@@ -6284,21 +6285,23 @@ app.put(
       req.workspaceContext ||
       getWorkspaceContext(req.user);
 
+    const currentApp =
+      store.read().workspaceSettings?.[context.workspaceId]?.app || {};
+
     const safe = {
       workspaceName: String(
         req.body
           .workspaceName ||
+          currentApp.workspaceName ||
           "ReachFlyAi Growth Workspace"
       ).slice(0, 120),
 
       brandTagline: String(
-        req.body
-          .brandTagline || ""
+        req.body.brandTagline ?? currentApp.brandTagline ?? ""
       ).slice(0, 180),
 
       brandWebsite: String(
-        req.body
-          .brandWebsite || ""
+        req.body.brandWebsite ?? currentApp.brandWebsite ?? ""
       )
         .trim()
         .slice(0, 240),
@@ -6307,6 +6310,7 @@ app.put(
         Number(
           req.body
             .defaultRadiusKm ||
+            currentApp.defaultRadiusKm ||
             10
         ),
 
@@ -6314,18 +6318,23 @@ app.put(
         Number(
           req.body
             .defaultLeadLimit ||
+            currentApp.defaultLeadLimit ||
             100
         ),
 
       complianceMode:
-        req.body
-          .complianceMode !==
-        false,
+        req.body.complianceMode === undefined
+          ? currentApp.complianceMode !== false
+          : req.body.complianceMode !== false,
 
       allowDemoFallback:
-        req.body
-          .allowDemoFallback !==
-        false,
+        req.body.allowDemoFallback === undefined
+          ? currentApp.allowDemoFallback !== false
+          : req.body.allowDemoFallback !== false,
+
+      auditProfile: sanitizeWorkspaceAuditProfile(
+        req.body.auditProfile ?? currentApp.auditProfile ?? {}
+      ),
     };
 
     store.update((state) => {
@@ -6342,10 +6351,16 @@ app.put(
 
       state.workspaceSettings[
         context.workspaceId
-      ].app = safe;
+      ].app = {
+        ...currentApp,
+        ...safe,
+      };
     });
 
-    res.json(safe);
+    res.json({
+      ...currentApp,
+      ...safe,
+    });
   }
 );
 
@@ -10633,6 +10648,34 @@ io.on("connection", (socket) => {
     );
   });
 });
+
+
+function sanitizeWorkspaceAuditProfile(value = {}) {
+  const criteria =
+    value?.criteria && typeof value.criteria === "object"
+      ? value.criteria
+      : {};
+
+  return {
+    businessNiche: String(value?.businessNiche || "").trim().slice(0, 180),
+    idealCustomer: String(value?.idealCustomer || "").trim().slice(0, 600),
+    offer: String(value?.offer || "").trim().slice(0, 800),
+    targetMarket: String(value?.targetMarket || "").trim().slice(0, 240),
+    pitchGoal: String(value?.pitchGoal || "").trim().slice(0, 600),
+    customInstructions: String(value?.customInstructions || "").trim().slice(0, 1600),
+    criteria: {
+      nicheFit: criteria.nicheFit !== false,
+      offerRelevance: criteria.offerRelevance !== false,
+      websiteConversion: criteria.websiteConversion !== false,
+      bookingFriction: criteria.bookingFriction !== false,
+      localVisibility: criteria.localVisibility !== false,
+      reviewsTrust: criteria.reviewsTrust !== false,
+      performance: criteria.performance !== false,
+      followUpOpportunity: criteria.followUpOpportunity !== false,
+      competitorGaps: criteria.competitorGaps !== false,
+    },
+  };
+}
 
 httpServer.requestTimeout =
   API_REQUEST_TIMEOUT_MS + 5_000;

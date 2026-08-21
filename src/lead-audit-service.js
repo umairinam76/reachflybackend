@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
 import dns from "node:dns/promises";
 import net from "node:net";
 import * as cheerio from "cheerio";
@@ -12,41 +11,16 @@ const ANTHROPIC_TIMEOUT_MS = Number(
 const AUTO_MINI_CONCURRENCY = clamp(
   process.env.AUDIT_AUTO_MINI_CONCURRENCY || 2,
   1,
-  2
+  6
 );
-const MAX_QUEUE_SIZE = clamp(process.env.AUDIT_MAX_QUEUE_SIZE || 2_000, 100, 5_000);
-const STALE_GENERATING_MS = clamp(
-  process.env.AUDIT_STALE_GENERATING_MS || 10 * 60 * 1000,
-  2 * 60 * 1000,
-  60 * 60 * 1000
-);
-const AUDIT_WATCHDOG_INTERVAL_MS = clamp(
-  process.env.AUDIT_WATCHDOG_INTERVAL_MS || 60 * 1000,
-  30 * 1000,
-  5 * 60 * 1000
-);
+const MAX_QUEUE_SIZE = clamp(process.env.AUDIT_MAX_QUEUE_SIZE || 500, 25, 2_000);
 const REPORT_TTL_MS = Number(
   process.env.AUDIT_REPORT_TTL_MS || 14 * 24 * 60 * 60 * 1000
 );
 const ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages";
-const GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT = "https://places.googleapis.com/v1/places:searchText";
-const GOOGLE_PLACES_DETAILS_ENDPOINT = "https://places.googleapis.com/v1/places";
-const PAGESPEED_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
-const PAGESPEED_TIMEOUT_MS = Number(process.env.AUDIT_PAGESPEED_TIMEOUT_MS || 45_000);
-const MINI_PUBLIC_FETCH_TIMEOUT_MS = Math.min(
-  FETCH_TIMEOUT_MS,
-  Number(process.env.AUDIT_MINI_PUBLIC_FETCH_TIMEOUT_MS || 10_000)
-);
-const MINI_PAGESPEED_TIMEOUT_MS = Math.min(
-  PAGESPEED_TIMEOUT_MS,
-  Number(process.env.AUDIT_MINI_PAGESPEED_TIMEOUT_MS || 12_000)
-);
-const MINI_ANTHROPIC_TIMEOUT_MS = Math.min(
-  ANTHROPIC_TIMEOUT_MS,
-  Number(process.env.AUDIT_MINI_ANTHROPIC_TIMEOUT_MS || 25_000)
-);
 const ANTHROPIC_VERSION = "2023-06-01";
-const DEFAULT_MODEL = "claude-fable-5";
+const DEFAULT_MODEL =
+  process.env.ANTHROPIC_AUDIT_MODEL || "claude-sonnet-4-20250514";
 
 const SOCIAL_HOSTS = new Set([
   "facebook.com",
@@ -88,24 +62,11 @@ const FREE_EMAIL_DOMAINS = new Set([
   "protonmail.com",
 ]);
 
-const priorityQueue = [];
-const miniQueue = [];
-const running = new Map();
-const BATCH_CHUNK_SIZE = clamp(
-  process.env.AUDIT_BATCH_CHUNK_SIZE || 10,
-  1,
-  50
-);
-const AUDIT_LOGGING = ["1", "true", "yes", "on"].includes(
-  String(process.env.AUDIT_DEBUG || "false").trim().toLowerCase()
-);
-const ALLOW_MINI_BATCH = ["1", "true", "yes", "on"].includes(
-  String(process.env.AUDIT_ALLOW_MINI_BATCH || "false").trim().toLowerCase()
-);
+const queue = [];
+const running = new Set();
 let serviceRef = null;
-let auditWatchdogTimer = null;
 
-export function createLeadAuditService({ store, workspaceService, reportTemplateProvider } = {}) {
+export function createLeadAuditService({ store, workspaceService } = {}) {
   if (!store) {
     throw new Error("createLeadAuditService requires a store.");
   }
@@ -117,124 +78,30 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     listReports,
     getReport,
     createPdf,
-    getQueueStats,
-    recoverStaleReports,
   };
 
   serviceRef = service;
-
-  // Startup recovery must not touch persisted application state until the
-  // asynchronous store hydration has completed. This service is constructed
-  // during module startup, before HTTP traffic begins.
-  void initializeAfterStoreReady();
-
-  async function initializeAfterStoreReady() {
-    try {
-      await store.ready();
-      resetInterruptedReportsOnStartup();
-      startAuditWatchdog();
-    } catch (error) {
-      console.error(
-        `[lead-audit] startup initialization failed ${JSON.stringify({
-          at: new Date().toISOString(),
-          message: error?.message || String(error),
-          code: error?.code || "",
-        })}`
-      );
-    }
-  }
+  resumeQueuedReports();
 
   function queueMiniBatch(user, input = {}) {
-    // Realtime production mode keeps the compatibility endpoint but disables
-    // background/bulk Mini creation unless explicitly enabled by environment.
-    // Normal callers must use queueMiniAudit() for the one lead they opened.
-    if (!ALLOW_MINI_BATCH) {
-      return {
-        accepted: 0,
-        created: 0,
-        reused: 0,
-        disabled: true,
-        reason: "Mini batch generation is disabled; open one lead to generate its Mini Audit in real time.",
-        concurrency: AUTO_MINI_CONCURRENCY,
-        queue: getQueueStats(),
-        reports: [],
-      };
-    }
-
-    const leads = Array.isArray(input.leads) ? input.leads.slice(0, 200) : [];
-    const snapshot = store.read();
+    const leads = Array.isArray(input.leads) ? input.leads : [];
     const accepted = [];
-    const newRecords = [];
-    let reusedCount = 0;
-    const syncRecords = [];
-    const replaceIds = new Set();
-    const enqueueIds = [];
-    const seenCacheKeys = new Map();
 
-    for (const rawLead of leads) {
-      const lead = rawLead?.lead && typeof rawLead.lead === "object"
-        ? { ...rawLead.lead, ...rawLead }
-        : rawLead || {};
-      const campaignType = normalizeCampaignType(
-        lead?.dailyCampaignType ||
-          lead?.campaignType ||
-          lead?.auditTrack ||
-          input.campaignType ||
-          "website"
-      );
-      const canAudit = campaignType === "gmb"
-        ? Boolean(
-            lead?.id || lead?.leadId || lead?.placeId || lead?.googlePlaceId ||
-            lead?.business || lead?.name || lead?.address || lead?.formattedAddress
-          )
-        : Boolean(lead?.website);
-
-      if (!canAudit) continue;
+    for (const lead of leads.slice(0, 250)) {
+      if (!lead?.website) continue;
 
       try {
-        const prepared = prepareQueuedReport(
-          user,
-          {
+        accepted.push(
+          queueReport(user, {
             ...input,
             lead,
-            campaignId: lead?.campaignId || input.campaignId || "",
-            leadId: lead?.leadId || lead?.id || "",
-            website: lead?.website || "",
-            campaignType,
+            website: lead.website,
             kind: "mini",
-            priority: false,
-            interactive: false,
-          },
-          snapshot
+          })
         );
-
-        const duplicateInBatch = seenCacheKeys.get(prepared.record.cacheKey);
-        if (duplicateInBatch) {
-          accepted.push(duplicateInBatch);
-          continue;
-        }
-        seenCacheKeys.set(prepared.record.cacheKey, prepared.record);
-        accepted.push(prepared.record);
-
-        if (prepared.reuse) {
-          reusedCount += 1;
-          if (input.syncExisting === true) {
-            syncRecords.push(prepared.record);
-          }
-          if (prepared.record.status === "queued") {
-            enqueueIds.push(prepared.record.id);
-          }
-          continue;
-        }
-
-        newRecords.push(prepared.record);
-        if (prepared.replaceId) replaceIds.add(prepared.replaceId);
-        enqueueIds.push(prepared.record.id);
       } catch (error) {
         accepted.push({
-          leadId: clean(lead?.leadId || lead?.id),
-          website: clean(lead?.website),
-          campaignType,
+          website: clean(lead.website),
           status: "failed",
           error: error.message,
           kind: "mini",
@@ -242,56 +109,17 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       }
     }
 
-    if (newRecords.length || syncRecords.length) {
-      store.update((draft) => {
-        if (!Array.isArray(draft.leadAudits)) {
-        draft.leadAudits = [];
-      }
-        if (replaceIds.size) {
-          draft.leadAudits = draft.leadAudits.filter(
-            (item) => !replaceIds.has(item.id)
-          );
-        }
-        if (newRecords.length) {
-          draft.leadAudits.unshift(...newRecords);
-        }
-        for (const record of [...newRecords, ...syncRecords]) {
-          syncAuditToLeadDraft(draft, record);
-        }
-      });
-    }
-
-    for (const id of enqueueIds) {
-      enqueue(id, { front: false });
-    }
-
     return {
       accepted: accepted.length,
-      created: newRecords.length,
-      reused: reusedCount,
-      batchSize: Math.min(BATCH_CHUNK_SIZE, 25),
-      concurrency: AUTO_MINI_CONCURRENCY,
-      queue: getQueueStats(),
       reports: accepted.map(publicReport),
     };
   }
 
   function queueMiniAudit(user, input = {}) {
-    // Mini Audit is the universal pre-call report for both Website and GMB.
-    // Campaign type stays separate and only changes what evidence is prioritized.
     return publicReport(
       queueReport(user, {
         ...input,
         kind: "mini",
-        priority: input.priority !== false,
-        interactive: input.interactive !== false,
-        campaignType: normalizeCampaignType(
-          input.campaignType ||
-            input.auditKind ||
-            input.lead?.dailyCampaignType ||
-            input.lead?.campaignType ||
-            "website"
-        ),
       })
     );
   }
@@ -299,7 +127,7 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
   function queueGeneratedReport(user, input = {}) {
     const kind = normalizeKind(input.kind);
 
-    if (!["competitor", "full"].includes(kind)) {
+    if (!['competitor', 'full'].includes(kind)) {
       throw createError(400, "Report kind must be competitor or full.");
     }
 
@@ -312,73 +140,32 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     );
   }
 
-  function getRuntimeTemplate(user, kind) {
-    return typeof reportTemplateProvider === "function"
-      ? reportTemplateProvider(user, kind)
-      : null;
-  }
-
-  function templateIsCustomized(template) {
-    return Boolean(
-      Number(template?.version || 0) > 0 ||
-      template?.examplePdf?.storagePath
-    );
-  }
-
-  function resolveRuntimeTemplate(user, kind, campaignType) {
-    // The production model exposes exactly three report types for BOTH tracks:
-    // Mini Audit (default), Competitor Analysis, and Full Audit.
-    // Website/GMB are tracks, not separate report kinds. PDFs are optional style references.
-    return getRuntimeTemplate(user, kind);
-  }
-
-  function prepareQueuedReport(user, input = {}, state = store.read()) {
+  function queueReport(user, input = {}) {
     const context = workspaceService?.getContext(user) || {
       user,
       workspaceId: user.workspaceId || user.id,
       workspace: null,
     };
-    const kind = normalizeKind(input.kind || "mini");
-    const campaignType = normalizeCampaignType(
-      input.campaignType ||
-        input.auditKind ||
-        input.lead?.dailyCampaignType ||
-        input.lead?.campaignType ||
-        kind
-    );
     const website = normalizeUrl(input.website || input.lead?.website);
-    const leadIdentity = clean(
-      input.leadId || input.lead?.id || input.placeId || input.lead?.placeId ||
-        input.business || input.lead?.business || input.lead?.name ||
-        input.location || input.lead?.address
-    );
-    const canResearchWithoutWebsite =
-      campaignType === "gmb" && Boolean(leadIdentity);
 
-    if (!website && !canResearchWithoutWebsite) {
-      throw createError(
-        400,
-        "A valid website URL is required for Website campaign audits."
-      );
+    if (!website) {
+      throw createError(400, "A valid website URL is required.");
     }
 
-    const reportTemplate = resolveRuntimeTemplate(user, kind, campaignType);
-    const templateKey =
-      reportTemplate?.templateId ||
-      reportTemplate?.id ||
-      `${reportTemplate?.name || "default"}:${reportTemplate?.version ?? 0}`;
-
-    const auditIdentity = clean(input.leadId || input.lead?.id) ||
-      (campaignType === "gmb"
-        ? clean(input.placeId || input.lead?.placeId || leadIdentity)
-        : website);
-    const auditTarget = `${campaignType}:${auditIdentity || website || leadIdentity}`;
+    const kind = normalizeKind(input.kind || "mini");
+    const state = store.read();
+    const workspaceProfile =
+      state.workspaceSettings?.[context.workspaceId]?.app?.auditProfile || {};
+    const auditProfile = normalizeAuditProfile({
+      ...workspaceProfile,
+      ...(input.auditProfile || input.profile || input.salesProfile || {}),
+    });
+    const profileHash = auditProfileHash(auditProfile);
     const cacheKey = reportCacheKey(
       context.workspaceId,
-      auditTarget,
+      website,
       kind,
-      templateKey,
-      campaignType
+      profileHash
     );
     const existing = (state.leadAudits || []).find(
       (item) => item.cacheKey === cacheKey
@@ -390,12 +177,8 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       ["queued", "generating", "complete"].includes(existing.status) &&
       (!existing.expiresAt || Date.parse(existing.expiresAt) > Date.now())
     ) {
-      return {
-        context,
-        record: existing,
-        reuse: true,
-        replaceId: "",
-      };
+      if (existing.status === "queued") enqueue(existing.id);
+      return existing;
     }
 
     const now = new Date().toISOString();
@@ -411,107 +194,30 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       status: "queued",
       kind,
       website,
-      campaignId: clean(input.campaignId || input.lead?.campaignId),
-      leadId: clean(input.leadId || input.lead?.id || input.lead?.leadId),
-      campaignType,
-      auditType: clean(input.auditType) ||
-        (kind === "mini"
-          ? `${campaignType === "gmb" ? "GMB" : "Website"} Mini Audit`
-          : kind === "competitor"
-            ? `${campaignType === "gmb" ? "GMB" : "Website"} Competitor Analysis`
-            : `${campaignType === "gmb" ? "GMB" : "Website"} Full Audit`),
       lead: sanitizeLead(input.lead || input),
-      niche: clean(
-        input.niche || input.lead?.dailyNiche || input.lead?.category
-      ),
-      location: clean(
-        input.location || input.lead?.dailyLocation || input.lead?.address
-      ),
-      resourceType: normalizeResourceType(
-        input.resourceType ||
-          input.lead?.dailyResourceType ||
-          input.lead?.resourceType ||
-          inferResourceType(
-            input.location || input.lead?.dailyLocation || input.lead?.address || "",
-            input.regionCode || input.lead?.dailyRegionCode || input.lead?.regionCode || ""
-          )
-      ),
-      country: clean(
-        input.country || input.lead?.dailyCountry || input.lead?.country || ""
-      ),
-      regionCode: clean(
-        input.regionCode || input.lead?.dailyRegionCode || input.lead?.regionCode || ""
-      ).toUpperCase(),
+      niche: clean(input.niche || input.lead?.category),
+      location: clean(input.location || input.lead?.address),
       brand: resolveBrand({ context, store }),
-      reportTemplate,
-      templateId: reportTemplate?.templateId || reportTemplate?.id || "default",
-      templateVersion: Number(reportTemplate?.version || 0),
-      templateName: reportTemplate?.name || "Default audit format",
+      auditProfile,
+      profileHash,
       report: null,
       evidence: null,
       provider: "anthropic",
-      source: clean(input.source || ""),
-      automatic: input.automatic === true,
-      interactive: input.interactive === true,
       error: "",
     };
 
-    return {
-      context,
-      record,
-      reuse: false,
-      replaceId: existing?.id || "",
-    };
-  }
-
-  function queueReport(user, input = {}) {
-    const prepared = prepareQueuedReport(user, input, store.read());
-    const record = prepared.record;
-
-    if (prepared.reuse) {
-      syncAuditToLead(record, {
-        campaignId: clean(input.campaignId || input.lead?.campaignId),
-        leadId: clean(input.leadId || input.lead?.id || input.lead?.leadId),
-      });
-
-      // An interactive caller open is also a recovery signal. If a persisted
-      // generating record has no live worker in this process, immediately put
-      // it back in the queue instead of making the caller wait for watchdog time.
-      if (
-        record.status === "generating" &&
-        input.interactive === true &&
-        !running.has(record.id)
-      ) {
-        updateRecord(record.id, {
-          status: "queued",
-          error: "",
-          updatedAt: new Date().toISOString(),
-        });
-        record.status = "queued";
-      }
-
-      if (record.status === "queued") {
-        enqueue(record.id, {
-          front: input.priority === true || input.interactive === true,
-        });
-      }
-      return record;
-    }
-
     store.update((draft) => {
-      draft.leadAudits = Array.isArray(draft.leadAudits) ? draft.leadAudits : [];
-      if (prepared.replaceId) {
-        draft.leadAudits = draft.leadAudits.filter(
-          (item) => item.id !== prepared.replaceId
-        );
+      draft.leadAudits = draft.leadAudits || [];
+
+      if (existing) {
+        const index = draft.leadAudits.findIndex((item) => item.id === existing.id);
+        if (index >= 0) draft.leadAudits.splice(index, 1);
       }
+
       draft.leadAudits.unshift(record);
-      syncAuditToLeadDraft(draft, record);
     });
 
-    enqueue(record.id, {
-      front: input.priority === true || input.interactive === true,
-    });
+    enqueue(record.id);
     return record;
   }
 
@@ -520,16 +226,10 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       workspaceId: user.workspaceId || user.id,
     };
     const website = filters.website ? normalizeUrl(filters.website) : "";
-    const leadId = clean(filters.leadId || "");
-    const track = clean(filters.track || filters.campaignType || "")
-      ? normalizeCampaignType(filters.track || filters.campaignType)
-      : "";
 
     return (store.read().leadAudits || [])
       .filter((item) => item.workspaceId === context.workspaceId)
-      .filter((item) => !leadId || clean(item.leadId || item.lead?.id) === leadId)
       .filter((item) => !website || item.website === website)
-      .filter((item) => !track || normalizeCampaignType(item.campaignType || item.kind) === track)
       .filter((item) => !filters.kind || item.kind === normalizeKind(filters.kind))
       .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
       .map(publicReport);
@@ -556,7 +256,7 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
 
     return {
       filename: safeFilename(
-        `${report.lead?.business || report.lead?.name || hostname(report.website)}-${report.campaignType || "website"}-${report.kind}-audit.pdf`
+        `${report.lead?.business || report.lead?.name || hostname(report.website)}-${report.kind}-audit.pdf`
       ),
       buffer: renderAuditPdf(report),
     };
@@ -564,163 +264,33 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
 
   return service;
 
-  function resetInterruptedReportsOnStartup() {
-    // Realtime mode never resumes a persisted queue after process restart.
-    // Any interrupted queued/generating record becomes not_started and will be
-    // recreated/replaced only if a caller opens that lead again.
-    const now = new Date().toISOString();
-    let reset = 0;
-
-    store.update((draft) => {
-      draft.leadAudits = Array.isArray(draft.leadAudits) ? draft.leadAudits : [];
-      for (const item of draft.leadAudits) {
-        if (!["queued", "generating"].includes(item.status)) continue;
-        item.status = "not_started";
-        item.error = "";
-        item.completedAt = "";
-        item.updatedAt = now;
-        syncAuditToLeadDraft(draft, item);
-        reset += 1;
+  function resumeQueuedReports() {
+    for (const item of store.read().leadAudits || []) {
+      if (["queued", "generating"].includes(item.status)) {
+        store.update((draft) => {
+          const target = (draft.leadAudits || []).find((entry) => entry.id === item.id);
+          if (target) target.status = "queued";
+        });
+        enqueue(item.id);
       }
-    });
-
-    if (reset) {
-      console.log(
-        `[lead-audit] realtime startup reset ${JSON.stringify({ reset })}`
-      );
     }
   }
 
-  function startAuditWatchdog() {
-    if (auditWatchdogTimer) clearInterval(auditWatchdogTimer);
-    auditWatchdogTimer = setInterval(
-      recoverStaleReports,
-      AUDIT_WATCHDOG_INTERVAL_MS
-    );
-    auditWatchdogTimer.unref?.();
-  }
-
-  function recoverStaleReports() {
-    // Do not turn persisted queued work into a background queue. The only audit
-    // that should run is one requested by a caller in this live process.
-    // If a generating record has no live worker and is stale, reset it so the
-    // next caller click can generate it again.
-    const nowMs = Date.now();
-    const snapshot = store.read();
-    const staleIds = [];
-
-    for (const item of snapshot.leadAudits || []) {
-      if (item.status !== "generating" || running.has(item.id)) continue;
-      const updatedMs = Date.parse(item.updatedAt || item.createdAt || 0);
-      if (Number.isFinite(updatedMs) && nowMs - updatedMs < STALE_GENERATING_MS) {
-        continue;
-      }
-      staleIds.push(item.id);
-    }
-
-    if (staleIds.length) {
-      const staleSet = new Set(staleIds);
-      store.update((draft) => {
-        for (const item of draft.leadAudits || []) {
-          if (!staleSet.has(item.id)) continue;
-          item.status = "not_started";
-          item.error = "";
-          item.completedAt = "";
-          item.updatedAt = new Date(nowMs).toISOString();
-          syncAuditToLeadDraft(draft, item);
-        }
-      });
-
-      auditLog("stale-reset", {
-        reset: staleIds.length,
-        ...getQueueStats(),
-      });
-    }
-
-    return {
-      recovered: 0,
-      reset: staleIds.length,
-      queue: getQueueStats(),
-    };
-  }
-
-  function getQueueStats() {
-    return {
-      concurrency: AUTO_MINI_CONCURRENCY,
-      batchSize: BATCH_CHUNK_SIZE,
-      queued: priorityQueue.length + miniQueue.length,
-      queuedMini: miniQueue.length,
-      queuedPriority: priorityQueue.length,
-      running: running.size,
-      runningJobs: [...running.entries()].map(([id, kind]) => ({ id, kind })),
-      capacity: MAX_QUEUE_SIZE,
-      staleGeneratingMs: STALE_GENERATING_MS,
-    };
-  }
-
-  function enqueue(id, { front = false } = {}) {
-    if (!id || running.has(id)) return;
-
-    const priorityIndex = priorityQueue.indexOf(id);
-    const miniIndex = miniQueue.indexOf(id);
-    if (priorityIndex >= 0 || miniIndex >= 0) {
-      if (front) {
-        if (priorityIndex >= 0) priorityQueue.splice(priorityIndex, 1);
-        if (miniIndex >= 0) miniQueue.splice(miniIndex, 1);
-        // An interactively opened Mini is the highest-value caller action and
-        // must jump ahead of background prefetch (and any older optional job).
-        priorityQueue.unshift(id);
-        scheduleWorkers();
-      }
-      return;
-    }
-
-    const record = (store.read().leadAudits || []).find((item) => item.id === id);
-    if (!record) return;
-
-    if (priorityQueue.length + miniQueue.length >= MAX_QUEUE_SIZE) {
-      updateRecord(id, {
-        status: "failed",
-        error: "Audit queue is full. Try again shortly.",
-        updatedAt: new Date().toISOString(),
-      });
-      return;
-    }
-
-    if (front) {
-      priorityQueue.unshift(id);
-    } else if (["mini", "website", "gmb"].includes(record.kind)) {
-      miniQueue.push(id);
-    } else {
-      priorityQueue.push(id);
-    }
-
-    auditLog("queued", { id, kind: record.kind, front, ...getQueueStats() });
+  function enqueue(id) {
+    if (!id || queue.includes(id) || running.has(id)) return;
+    if (queue.length >= MAX_QUEUE_SIZE) return;
+    queue.push(id);
     scheduleWorkers();
   }
 
-  function nextQueuedId() {
-    return priorityQueue.shift() || miniQueue.shift() || "";
-  }
-
   function scheduleWorkers() {
-    while (
-      running.size < AUTO_MINI_CONCURRENCY &&
-      (priorityQueue.length || miniQueue.length)
-    ) {
-      const id = nextQueuedId();
+    while (running.size < AUTO_MINI_CONCURRENCY && queue.length) {
+      const id = queue.shift();
       if (!id || running.has(id)) continue;
-
-      const record = (store.read().leadAudits || []).find((item) => item.id === id);
-      if (!record) continue;
-
-      running.set(id, record.kind);
-      auditLog("worker-start", { id, kind: record.kind, ...getQueueStats() });
-
+      running.add(id);
       void processRecord(id).finally(() => {
         running.delete(id);
-        auditLog("worker-finish", { id, kind: record.kind, ...getQueueStats() });
-        setImmediate(scheduleWorkers);
+        scheduleWorkers();
       });
     }
   }
@@ -738,10 +308,7 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
     record = (store.read().leadAudits || []).find((item) => item.id === id);
 
     try {
-      const track = normalizeCampaignType(record.campaignType || record.kind);
-      const evidence = track === "gmb"
-        ? await inspectGmbEvidence(record)
-        : await inspectWebsiteEvidence(record);
+      const evidence = await inspectLeadWebsite(record);
       let report;
       let provider = "anthropic";
 
@@ -750,16 +317,6 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
       } catch (error) {
         provider = "deterministic-fallback";
         report = buildFallbackReport(record, evidence, error);
-      }
-
-      if (
-        record.kind === "mini" &&
-        (!Array.isArray(report?.issues) || report.issues.length === 0) &&
-        !(report?.noMajorIssues === true && clean(report?.workingWell))
-      ) {
-        throw new Error(
-          "Mini Audit returned neither a verified issue nor a verified positive finding. Regenerate after evidence is available."
-        );
       }
 
       updateRecord(id, {
@@ -771,8 +328,6 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
-      const completed = (store.read().leadAudits || []).find((item) => item.id === id);
-      syncAuditToLead(completed);
     } catch (error) {
       updateRecord(id, {
         status: "failed",
@@ -780,141 +335,20 @@ export function createLeadAuditService({ store, workspaceService, reportTemplate
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
-      const failed = (store.read().leadAudits || []).find((item) => item.id === id);
-      syncAuditToLead(failed);
     }
-  }
-
-  function syncAuditToLeadDraft(draft, record, override = {}) {
-    if (!record) return;
-    const campaignId = clean(override.campaignId || record.campaignId);
-    const leadId = clean(override.leadId || record.leadId || record.lead?.id);
-    if (!leadId) return;
-
-    const campaignType = normalizeCampaignType(record.campaignType || record.kind);
-    const auditType = record.kind === "mini"
-      ? (campaignType === "gmb" ? "GMB Mini Audit" : "Website Mini Audit")
-      : record.kind === "competitor"
-        ? (campaignType === "gmb" ? "GMB Competitor Analysis" : "Website Competitor Analysis")
-        : (campaignType === "gmb" ? "GMB Full Audit" : "Website Full Audit");
-    const publicStatus = record.status === "complete" ? "ready" : record.status;
-    const miniStatus = record.status === "complete" ? "completed" : record.status;
-    const now = new Date().toISOString();
-
-    const campaigns = (draft.campaigns || []).filter((campaign) =>
-      !campaignId || campaign.id === campaignId
-    );
-    for (const campaign of campaigns) {
-      const lead = (campaign.leads || []).find((item) => item.id === leadId);
-      if (!lead) continue;
-      lead.dailyCampaignType = campaignType;
-      lead.campaignType = campaignType;
-
-      if (record.kind === "mini") {
-        lead.auditKind = "mini";
-        lead.auditTrack = campaignType;
-        lead.auditType = auditType;
-        lead.auditStatus = publicStatus;
-        lead.auditError = record.error || "";
-        lead.auditReportId = record.id;
-        lead.auditTemplateVersion = Number(record.templateVersion || 0);
-        lead.auditReport = record.status === "complete" ? record.report : null;
-        lead.miniAudit = record.status === "complete" ? record.report : lead.miniAudit;
-        lead.miniAuditStatus = miniStatus;
-        lead.miniAuditError = record.error || "";
-        lead.miniAuditReportId = record.id;
-      } else if (record.kind === "competitor") {
-        lead.competitorAuditTrack = campaignType;
-        lead.competitorAuditType = auditType;
-        lead.competitorAudit = record.status === "complete" ? record.report : lead.competitorAudit;
-        lead.competitorAuditStatus = record.status;
-        lead.competitorAuditError = record.error || "";
-        lead.competitorAuditReportId = record.id;
-      } else if (record.kind === "full") {
-        lead.fullAuditTrack = campaignType;
-        lead.fullAuditType = auditType;
-        lead.fullAudit = record.status === "complete" ? record.report : lead.fullAudit;
-        lead.fullAuditStatus = record.status;
-        lead.fullAuditError = record.error || "";
-        lead.fullAuditReportId = record.id;
-      }
-
-      lead.updatedAt = now;
-      break;
-    }
-
-    if (record.kind === "mini") {
-      for (const assignment of draft.salesAssignments || []) {
-        if (
-          assignment.leadId !== leadId ||
-          (record.workspaceId && assignment.workspaceId !== record.workspaceId) ||
-          (campaignId && assignment.campaignId && assignment.campaignId !== campaignId)
-        ) continue;
-        assignment.auditKind = "mini";
-        assignment.auditTrack = campaignType;
-        assignment.auditType = auditType;
-        assignment.auditStatus = publicStatus;
-        assignment.miniAuditStatus = miniStatus;
-        assignment.auditReportId = record.id;
-        assignment.miniAuditReportId = record.id;
-        assignment.auditError = record.error || "";
-        assignment.miniAuditError = record.error || "";
-        assignment.updatedAt = now;
-      }
-
-      for (const task of draft.teamTasks || []) {
-        if (
-          task.leadId !== leadId ||
-          (record.workspaceId && task.workspaceId !== record.workspaceId) ||
-          (campaignId && task.campaignId && task.campaignId !== campaignId)
-        ) continue;
-        task.auditKind = "mini";
-        task.auditTrack = campaignType;
-        task.auditType = auditType;
-        task.auditStatus = publicStatus;
-        task.miniAuditStatus = miniStatus;
-        task.auditReportId = record.id;
-        task.miniAuditReportId = record.id;
-        task.updatedAt = now;
-      }
-    }
-  }
-
-  function syncAuditToLead(record, override = {}) {
-    if (!record) return;
-    store.update((draft) => {
-      syncAuditToLeadDraft(draft, record, override);
-    });
   }
 
   function updateRecord(id, changes) {
     store.update((draft) => {
       const target = (draft.leadAudits || []).find((item) => item.id === id);
-      if (!target) return;
-      Object.assign(target, changes);
-      if (Object.prototype.hasOwnProperty.call(changes, "status")) {
-        syncAuditToLeadDraft(draft, target);
-      }
+      if (target) Object.assign(target, changes);
     });
   }
-
-}
-
-function auditLog(event, data = {}) {
-  if (!AUDIT_LOGGING) return;
-  console.log(`[lead-audit] ${event} ${JSON.stringify({
-    at: new Date().toISOString(),
-    event,
-    ...data,
-  })}`);
 }
 
 async function inspectLeadWebsite(record) {
   const url = await validatePublicUrl(record.website);
-  const response = await safeFetch(
-    url.toString(),
-    record.kind === "mini" ? MINI_PUBLIC_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS
-  );
+  const response = await safeFetch(url.toString());
   const $ = cheerio.load(response.html);
   const title = clean($("title").first().text());
   const metaDescription = clean($("meta[name='description']").attr("content"));
@@ -943,12 +377,14 @@ async function inspectLeadWebsite(record) {
     .flatMap((item) => collectSchemaPeople(item))
     .filter(Boolean);
   const emails = uniqueStrings([
+    record.lead?.email,
     ...links
       .filter((href) => href.startsWith("mailto:"))
       .map((href) => href.replace(/^mailto:/i, "").split("?")[0]),
     ...extractEmails(response.html),
   ]).filter(isLikelyEmail);
   const phones = uniqueStrings([
+    record.lead?.phone,
     ...links
       .filter((href) => href.startsWith("tel:"))
       .map((href) => href.replace(/^tel:/i, "")),
@@ -986,13 +422,6 @@ async function inspectLeadWebsite(record) {
     .map((_, element) => clean($(element).text()))
     .get()
     .find((value) => value.length >= 60 && value.length <= 450);
-  const canonical = normalizePageHref($("link[rel='canonical']").attr("href"), response.finalUrl);
-  const viewport = clean($("meta[name='viewport']").attr("content"));
-  const imageCount = $("img").length;
-  const imagesMissingAlt = $("img").filter((_, element) => !clean($(element).attr("alt"))).length;
-  const schemaTypes = uniqueStrings(
-    jsonLd.flatMap((item) => Array.isArray(item?.["@type"]) ? item["@type"] : [item?.["@type"]]).filter(Boolean)
-  ).slice(0, 20);
 
   return {
     fetchedAt: new Date().toISOString(),
@@ -1012,8 +441,6 @@ async function inspectLeadWebsite(record) {
       hostToName(rootHost),
     phone: phones[0] || "",
     email: emails[0] || "",
-    crmPhone: clean(record.lead?.phone),
-    crmEmail: isLikelyEmail(record.lead?.email) ? clean(record.lead?.email).toLowerCase() : "",
     websiteAddress: schemaAddresses[0] || extractAddress(bodyText),
     googleAddress: clean(record.lead?.address),
     decisionMaker:
@@ -1039,461 +466,9 @@ async function inspectLeadWebsite(record) {
     hasPrivacy: links.some((href) => /privacy/i.test(href)),
     hasTerms: links.some((href) => /terms|conditions/i.test(href)),
     hasSchema: jsonLd.length > 0,
-    schemaTypes,
-    canonical,
-    viewport,
-    imageCount,
-    imagesMissingAlt,
     lead: record.lead,
     niche: record.niche,
     location: record.location,
-  };
-}
-
-async function inspectWebsiteEvidence(record) {
-  let base;
-  let websiteFetchError = "";
-
-  try {
-    base = {
-      ...(await inspectLeadWebsite(record)),
-      websiteHtmlConfirmed: true,
-      websiteFetchStatus: "confirmed",
-      websiteFetchError: "",
-      verificationRequired: false,
-      notYetAssessed: [],
-    };
-  } catch (error) {
-    websiteFetchError =
-      clean(error?.message) ||
-      "Direct website HTML inspection could not be confirmed.";
-
-    const website =
-      normalizeUrl(
-        record.website ||
-          record.lead?.website ||
-          ""
-      ) || "";
-
-    const siteName =
-      clean(
-        record.lead?.business ||
-          record.lead?.name
-      ) ||
-      (website ? hostToName(hostname(website)) : "Business");
-
-    // A blocked/403/timeout website is an evidence limitation, not an audit
-    // failure. Keep every unverified website field explicitly unknown rather
-    // than converting unknown into a negative finding. PageSpeed, robots and
-    // sitemap probes still run independently below.
-    base = {
-      fetchedAt: new Date().toISOString(),
-      finalUrl: website,
-      domain: website ? hostname(website) : "",
-      status: 0,
-      title: "",
-      titleLength: null,
-      metaDescription: null,
-      generator: "",
-      platform: "",
-      siteName,
-      phone: "",
-      email: "",
-      crmPhone: clean(record.lead?.phone),
-      crmEmail: isLikelyEmail(record.lead?.email) ? clean(record.lead?.email).toLowerCase() : "",
-      websiteAddress: "",
-      googleAddress: clean(record.lead?.address),
-      decisionMaker: "",
-      businessHours: "",
-      description: "",
-      h1: [],
-      externalServiceLinks: [],
-      hasBooking: null,
-      bookingLinks: [],
-      hasChat: null,
-      testimonialCount: null,
-      hasStructuredReviews: null,
-      hasFax: null,
-      faxEvidence: [],
-      formCount: null,
-      formCtaCount: null,
-      hasContactForm: null,
-      hasPhoneLink: null,
-      hasEmailLink: null,
-      hasPrivacy: null,
-      hasTerms: null,
-      hasSchema: null,
-      schemaTypes: [],
-      canonical: "",
-      viewport: "",
-      imageCount: null,
-      imagesMissingAlt: null,
-      lead: record.lead,
-      niche: record.niche,
-      location: record.location,
-      websiteHtmlConfirmed: false,
-      websiteFetchStatus: "not_confirmed",
-      websiteFetchError,
-      verificationRequired: true,
-      notYetAssessed: [
-        "Homepage HTML/metadata — Not confirmed — verify on call",
-        "Website forms/booking/chat — Not confirmed — verify on call",
-        "Schema, headings, canonical and image alt text — Not confirmed — verify on call",
-      ],
-    };
-  }
-
-  const probeBaseUrl =
-    normalizeUrl(
-      base.finalUrl ||
-        record.website ||
-        record.lead?.website ||
-        ""
-    ) || "";
-
-  const [pageSpeed, robots, sitemap] = await Promise.all([
-    probeBaseUrl
-      ? inspectPageSpeed(
-          probeBaseUrl,
-          record.kind === "mini" ? MINI_PAGESPEED_TIMEOUT_MS : PAGESPEED_TIMEOUT_MS
-        )
-      : Promise.resolve({
-          mobile: {
-            status: "not_confirmed",
-            error: "Website URL was unavailable.",
-          },
-          desktop: {
-            status: "not_confirmed",
-            error: "Website URL was unavailable.",
-          },
-        }),
-    probeBaseUrl
-      ? probePublicTextFile(
-          new URL("/robots.txt", probeBaseUrl).toString()
-        )
-      : Promise.resolve({
-          found: false,
-          status: 0,
-          url: "",
-          sample: "",
-          error: "Website URL was unavailable.",
-        }),
-    probeBaseUrl
-      ? probePublicTextFile(
-          new URL("/sitemap.xml", probeBaseUrl).toString()
-        )
-      : Promise.resolve({
-          found: false,
-          status: 0,
-          url: "",
-          sample: "",
-          error: "Website URL was unavailable.",
-        }),
-  ]);
-
-  return {
-    ...base,
-    track: "website",
-    pageSpeed,
-    robots,
-    sitemap,
-  };
-}
-
-async function inspectPageSpeed(website, timeoutMs = PAGESPEED_TIMEOUT_MS) {
-  const strategies = ["mobile", "desktop"];
-  const entries = await Promise.all(
-    strategies.map(async (strategy) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-      try {
-        const url = new URL(PAGESPEED_ENDPOINT);
-        url.searchParams.set("url", website);
-        url.searchParams.set("strategy", strategy);
-        url.searchParams.append("category", "performance");
-        url.searchParams.append("category", "seo");
-        url.searchParams.append("category", "accessibility");
-        url.searchParams.append("category", "best-practices");
-
-        const response = await fetch(url, { signal: controller.signal });
-        const payload = await response.json().catch(() => null);
-        if (!response.ok || !payload?.lighthouseResult) {
-          return [strategy, {
-            status: "not_confirmed",
-            error: payload?.error?.message || `PageSpeed HTTP ${response.status}`,
-          }];
-        }
-
-        const lighthouse = payload.lighthouseResult;
-        const audits = lighthouse.audits || {};
-        const categories = lighthouse.categories || {};
-        const field = payload.loadingExperience?.metrics || {};
-        const score = (key) => Number.isFinite(categories[key]?.score)
-          ? Math.round(categories[key].score * 100)
-          : null;
-        const numeric = (key) => Number.isFinite(audits[key]?.numericValue)
-          ? audits[key].numericValue
-          : null;
-
-        return [strategy, {
-          status: "confirmed",
-          performance: score("performance"),
-          seo: score("seo"),
-          accessibility: score("accessibility"),
-          bestPractices: score("best-practices"),
-          lcpMs: field.LARGEST_CONTENTFUL_PAINT_MS?.percentile ?? numeric("largest-contentful-paint"),
-          cls: field.CUMULATIVE_LAYOUT_SHIFT_SCORE?.percentile ?? numeric("cumulative-layout-shift"),
-          inpMs: field.INTERACTION_TO_NEXT_PAINT?.percentile ?? null,
-          tbtMs: numeric("total-blocking-time"),
-          totalByteWeight: numeric("total-byte-weight"),
-          requestCount: Array.isArray(audits["network-requests"]?.details?.items)
-            ? audits["network-requests"].details.items.length
-            : null,
-          fetchedAt: new Date().toISOString(),
-        }];
-      } catch (error) {
-        return [strategy, {
-          status: "not_confirmed",
-          error: error?.name === "AbortError"
-            ? `PageSpeed timed out after ${timeoutMs}ms`
-            : clean(error?.message) || "PageSpeed request failed",
-        }];
-      } finally {
-        clearTimeout(timer);
-      }
-    })
-  );
-
-  return Object.fromEntries(entries);
-}
-
-async function probePublicTextFile(value) {
-  try {
-    let current = await validatePublicUrl(value);
-    for (let redirects = 0; redirects <= 3; redirects += 1) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), Math.min(FETCH_TIMEOUT_MS, 12_000));
-      try {
-        const response = await fetch(current, {
-          method: "GET",
-          redirect: "manual",
-          headers: { "user-agent": "ReachFlyAuditBot/3.0 (+public audit evidence)" },
-          signal: controller.signal,
-        });
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-          const location = response.headers.get("location");
-          if (!location) return { found: false, status: response.status, url: current.toString(), sample: "", error: "Redirect had no location" };
-          current = await validatePublicUrl(new URL(location, current).toString());
-          continue;
-        }
-        const text = response.ok ? (await response.text()).slice(0, 12_000) : "";
-        return { found: response.ok, status: response.status, url: current.toString(), sample: clean(text).slice(0, 2000) };
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-    return { found: false, status: 0, url: current.toString(), sample: "", error: "Too many redirects" };
-  } catch (error) {
-    return { found: false, status: 0, url: clean(value), sample: "", error: clean(error?.message) };
-  }
-}
-
-async function inspectGmbEvidence(record) {
-  const base = buildGmbSeedEvidence(record);
-  const apiKey = clean(process.env.GOOGLE_PLACES_API_KEY);
-  const lookupTimeoutMs = record.kind === "mini"
-    ? MINI_PUBLIC_FETCH_TIMEOUT_MS
-    : FETCH_TIMEOUT_MS;
-  let target = null;
-  let competitors = [];
-
-  if (apiKey) {
-    try {
-      const placeId = clean(record.lead?.placeId || record.lead?.googlePlaceId);
-      const targetQuery = `${base.siteName} ${record.location || base.googleAddress}`.trim();
-      const seededCategory = clean(record.niche || record.lead?.category);
-      const seededMarket = clean(record.location || base.googleAddress);
-
-      const targetPromise = placeId
-        ? fetchGooglePlaceDetails(placeId, apiKey, lookupTimeoutMs)
-        : searchGooglePlaces(targetQuery, apiKey, 1, lookupTimeoutMs)
-            .then((items) => items[0] || null);
-
-      // In normal caller data we already know niche + market. Run competitor
-      // discovery beside the target lookup instead of waiting for it first.
-      const seededCompetitorsPromise = seededCategory && seededMarket
-        ? searchGooglePlaces(
-            `${seededCategory} in ${seededMarket}`,
-            apiKey,
-            8,
-            lookupTimeoutMs
-          )
-        : null;
-
-      target = await targetPromise;
-
-      if (seededCompetitorsPromise) {
-        competitors = await seededCompetitorsPromise;
-      } else {
-        const categoryQuery = clean(
-          record.niche || record.lead?.category || target?.primaryType || "business"
-        );
-        const market = clean(
-          record.location || target?.formattedAddress || base.googleAddress
-        );
-        if (categoryQuery && market) {
-          competitors = await searchGooglePlaces(
-            `${categoryQuery} in ${market}`,
-            apiKey,
-            8,
-            lookupTimeoutMs
-          );
-        }
-      }
-
-      competitors = competitors
-        .filter((item) => item.id && item.id !== target?.id)
-        .filter((item) => normalize(item.displayName) !== normalize(target?.displayName || base.siteName))
-        .slice(0, 7);
-    } catch (error) {
-      base.googlePlacesError = clean(error?.message) || "Google Places evidence lookup failed";
-    }
-  }
-
-  const hours = target?.regularOpeningHours?.weekdayDescriptions || [];
-  return {
-    ...base,
-    track: "gmb",
-    placeId: target?.id || base.placeId || "",
-    gmbProfileUrl: target?.googleMapsUri || base.gmbProfileUrl || "",
-    siteName: target?.displayName || base.siteName,
-    phone: target?.internationalPhoneNumber || target?.nationalPhoneNumber || base.phone,
-    website: normalizeUrl(target?.websiteUri || record.website || record.lead?.website),
-    googleAddress: target?.formattedAddress || base.googleAddress,
-    category: clean(target?.primaryType || record.lead?.category || record.niche),
-    rating: Number.isFinite(target?.rating) ? target.rating : null,
-    reviewCount: Number.isFinite(target?.userRatingCount) ? target.userRatingCount : null,
-    businessHours: hours.join("; ") || base.businessHours,
-    businessStatus: clean(target?.businessStatus),
-    competitors: competitors.map((item) => ({
-      name: clean(item.displayName),
-      placeId: clean(item.id),
-      address: clean(item.formattedAddress),
-      rating: Number.isFinite(item.rating) ? item.rating : null,
-      reviewCount: Number.isFinite(item.userRatingCount) ? item.userRatingCount : null,
-      website: normalizeUrl(item.websiteUri),
-      mapsUrl: clean(item.googleMapsUri),
-      category: clean(item.primaryType),
-    })),
-    source: target ? "Google Places API + public web research" : "Lead identity + public web research",
-  };
-}
-
-async function fetchGooglePlaceDetails(placeId, apiKey, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${GOOGLE_PLACES_DETAILS_ENDPOINT}/${encodeURIComponent(placeId)}`, {
-      headers: {
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": "id,displayName,formattedAddress,nationalPhoneNumber,internationalPhoneNumber,websiteUri,rating,userRatingCount,regularOpeningHours,primaryType,types,googleMapsUri,businessStatus",
-      },
-      signal: controller.signal,
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(payload?.error?.message || `Google Places details HTTP ${response.status}`);
-    return normalizeGooglePlace(payload);
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error(`Google Places details timed out after ${timeoutMs}ms.`);
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function searchGooglePlaces(textQuery, apiKey, maxResultCount = 7, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.regularOpeningHours,places.primaryType,places.types,places.googleMapsUri,places.businessStatus",
-      },
-      body: JSON.stringify({ textQuery, maxResultCount: Math.max(1, Math.min(20, Number(maxResultCount || 7))) }),
-      signal: controller.signal,
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(payload?.error?.message || `Google Places search HTTP ${response.status}`);
-    return (payload?.places || []).map(normalizeGooglePlace);
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error(`Google Places search timed out after ${timeoutMs}ms.`);
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function normalizeGooglePlace(value = {}) {
-  return {
-    id: clean(value.id),
-    displayName: clean(value.displayName?.text || value.displayName),
-    formattedAddress: clean(value.formattedAddress),
-    nationalPhoneNumber: clean(value.nationalPhoneNumber),
-    internationalPhoneNumber: clean(value.internationalPhoneNumber),
-    websiteUri: normalizeUrl(value.websiteUri),
-    rating: Number(value.rating),
-    userRatingCount: Number(value.userRatingCount),
-    regularOpeningHours: value.regularOpeningHours || null,
-    primaryType: clean(value.primaryType),
-    types: Array.isArray(value.types) ? value.types.map(clean).filter(Boolean) : [],
-    googleMapsUri: clean(value.googleMapsUri),
-    businessStatus: clean(value.businessStatus),
-  };
-}
-
-function buildGmbSeedEvidence(record) {
-  const business = clean(record.lead?.business || record.lead?.name || "Business");
-  const address = clean(record.lead?.address || record.location);
-  return {
-    finalUrl: "",
-    domain: "",
-    siteName: business,
-    phone: clean(record.lead?.phone),
-    email: clean(record.lead?.email),
-    websiteAddress: "",
-    googleAddress: address,
-    decisionMaker: "",
-    businessHours: "",
-    description: `${business}${address ? ` serving ${address}` : ""}.`,
-    h1: [],
-    externalServiceLinks: [],
-    hasBooking: null,
-    bookingLinks: [],
-    hasChat: null,
-    testimonialCount: null,
-    hasStructuredReviews: null,
-    hasFax: false,
-    faxEvidence: [],
-    formCount: 0,
-    formCtaCount: 0,
-    hasContactForm: false,
-    hasPhoneLink: false,
-    hasEmailLink: false,
-    hasPrivacy: false,
-    hasTerms: false,
-    hasSchema: false,
-    titleLength: 0,
-    metaDescription: "",
-    platform: "",
-    lead: record.lead,
-    niche: record.niche,
-    location: record.location,
-    placeId: clean(record.lead?.placeId),
-    gmbProfileUrl: clean(record.lead?.gmbProfileUrl || record.lead?.googleMapsUri),
   };
 }
 
@@ -1506,56 +481,33 @@ async function generateWithClaude(record, evidence) {
 
   const kind = record.kind;
   const prompt = buildClaudePrompt(record, evidence);
-  const maxUses = kind === "competitor" ? 7 : 8;
-  // Mini audits are pre-call latency sensitive. All required Website/GMB evidence
-  // is collected before Claude runs, so avoid extra model-side web-search turns.
-  const maxTokens = kind === "mini" ? 3_200 : 8_000;
-  const effort = kind === "mini" ? "low" : "medium";
-  const tools = kind === "mini"
-    ? []
-    : [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-          max_uses: maxUses,
-        },
-      ];
-  const messages = [
+  const maxUses = kind === "mini" ? 4 : kind === "competitor" ? 7 : 8;
+  const maxTokens = kind === "mini" ? 3_000 : 6_000;
+  const tools = [
     {
-      role: "user",
-      content: buildClaudeUserContent(
-        record,
-        prompt
-      ),
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: maxUses,
     },
   ];
+  const messages = [{ role: "user", content: prompt }];
   let response = null;
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const body = {
-      model: DEFAULT_MODEL,
-      max_tokens: maxTokens,
-      output_config: { effort },
-      system: buildClaudeSystem(record),
-      messages,
-      ...(tools.length ? { tools } : {}),
-    };
-
     response = await callAnthropic({
       apiKey,
-      body,
-      timeoutMs: kind === "mini" ? MINI_ANTHROPIC_TIMEOUT_MS : ANTHROPIC_TIMEOUT_MS,
+      body: {
+        model: DEFAULT_MODEL,
+        max_tokens: maxTokens,
+        temperature: 0.1,
+        system: buildClaudeSystem(record),
+        messages,
+        tools,
+      },
     });
 
     if (response.stop_reason !== "pause_turn") break;
     messages.push({ role: "assistant", content: response.content });
-  }
-
-  if (response?.stop_reason === "refusal") {
-    const category = clean(response?.stop_details?.category);
-    throw new Error(
-      `Claude Fable 5 refused audit generation${category ? ` (${category})` : ""}.`
-    );
   }
 
   const text = (response?.content || [])
@@ -1572,148 +524,9 @@ async function generateWithClaude(record, evidence) {
   return normalizeGeneratedReport(record, evidence, parsed);
 }
 
-function buildClaudeUserContent(
-  record,
-  prompt
-) {
-  const blocks = [];
-  const example =
-    record.reportTemplate?.examplePdf;
-
-  if (
-    example?.storagePath &&
-    fs.existsSync(example.storagePath)
-  ) {
-    try {
-      const stat = fs.statSync(
-        example.storagePath
-      );
-
-      if (
-        stat.isFile() &&
-        stat.size > 0 &&
-        stat.size <= 15 * 1024 * 1024
-      ) {
-        const data = fs
-          .readFileSync(
-            example.storagePath
-          )
-          .toString("base64");
-
-        blocks.push({
-          type: "document",
-          source: {
-            type: "base64",
-            media_type:
-              "application/pdf",
-            data,
-          },
-          title:
-            clean(
-              example.originalName ||
-                `${record.kind}-audit-reference.pdf`
-            ).slice(0, 200),
-          context:
-            "Manager-approved formatting reference. Use it only for layout direction, section emphasis, writing style, and presentation conventions. Do not transfer facts from this example into the current lead report.",
-        });
-      }
-    } catch (error) {
-      auditLog(
-        "example-pdf-read-failed",
-        {
-          kind: record.kind,
-          templateVersion:
-            record.templateVersion || 0,
-          message:
-            error?.message ||
-            String(error),
-        }
-      );
-    }
-  }
-
-  blocks.push({
-    type: "text",
-    text: prompt,
-  });
-
-  return blocks.length === 1
-    ? prompt
-    : blocks;
-}
-
-function normalizeResourceType(value) {
-  const normalized = String(
-    value || ""
-  )
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_-]+/g, "_");
-
-  return [
-    "local",
-    "pakistan",
-    "pk",
-    "domestic",
-  ].includes(normalized)
-    ? "local"
-    : "international";
-}
-
-function inferResourceType(
-  location,
-  regionCode = ""
-) {
-  const region = String(
-    regionCode || ""
-  )
-    .trim()
-    .toUpperCase();
-
-  if (region === "PK") {
-    return "local";
-  }
-
-  const text = String(
-    location || ""
-  ).toLowerCase();
-
-  return [
-    "pakistan",
-    "karachi",
-    "lahore",
-    "islamabad",
-    "rawalpindi",
-    "faisalabad",
-    "multan",
-    "peshawar",
-    "sialkot",
-    "gujranwala",
-    "quetta",
-  ].some((item) =>
-    text.includes(item)
-  )
-    ? "local"
-    : "international";
-}
-
-function cleanMultiline(value) {
-  return String(value || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) =>
-      line
-        .replace(/[\t ]+/g, " ")
-        .trimEnd()
-    )
-    .join("\n")
-    .trim();
-}
-
-async function callAnthropic({ apiKey, body, timeoutMs = ANTHROPIC_TIMEOUT_MS }) {
+async function callAnthropic({ apiKey, body }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), ANTHROPIC_TIMEOUT_MS);
 
   try {
     const response = await fetch(ANTHROPIC_ENDPOINT, {
@@ -1739,7 +552,7 @@ async function callAnthropic({ apiKey, body, timeoutMs = ANTHROPIC_TIMEOUT_MS })
     return payload;
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error(`Anthropic audit timed out after ${timeoutMs}ms.`);
+      throw new Error(`Anthropic audit timed out after ${ANTHROPIC_TIMEOUT_MS}ms.`);
     }
     throw error;
   } finally {
@@ -1748,533 +561,444 @@ async function callAnthropic({ apiKey, body, timeoutMs = ANTHROPIC_TIMEOUT_MS })
 }
 
 function buildClaudeSystem(record) {
-  const managerGuidance = cleanMultiline(record.reportTemplate?.managerSystemPrompt || "");
+  const brandName = record.brand.name;
+  const brandWebsite = record.brand.website || "the parent workspace website";
 
   return [
-    "You are a professional audit engine for Website and Google Business Profile (GMB/GBP) audits.",
-    "Produce fast, mature, evidence-grounded reports that are technically accurate, commercially relevant, concise, and easy to skim before a call.",
-    "Website and GMB/GBP are independent audit tracks. Never blend their scores, evidence, or findings.",
-    "Preserve the exact JSON response schema supplied in the request. Do not add, remove, rename, or restructure fields.",
-    "Use verified input evidence first. Use public web research only when it materially fills a gap needed for the requested audit; avoid repetitive or low-value searches.",
-    "Never invent or estimate ratings, review counts, rankings, competitors, owners, technologies, addresses, hours, PageSpeed scores, Core Web Vitals, search positions, profile features, or URLs.",
-    "If a fact cannot be retrieved, write exactly: Not confirmed — verify on call. Missing or unavailable evidence is not automatically a negative finding.",
-    "Every negative finding must be supported by verified evidence and should connect a specific observation to a practical business impact and a clear source.",
-    "For Mini Audits, prefer 4-5 of the strongest materially different verified technical or logical findings when enough evidence exists. If only 2-3 strong findings are verified, return only those; never pad the report with weak or invented issues.",
-    "Website audits should prioritize relevant search/SEO signals, PageSpeed and Core Web Vitals when confirmed, robots.txt, sitemap.xml, HTTPS, schema, mobile viewport, title/meta/H1, canonical, image alt text, conversion paths, trust signals, local/service-page strength, and other evidence-backed visibility or conversion issues.",
-    "GMB/GBP audits should prioritize rating and review strength, review volume versus nearby competitors, business status, category relevance, hours, address/phone/website accuracy, profile completeness signals that are actually available, local competitive standing, and evidence-backed visibility opportunities. Never invent Maps or local-pack rankings.",
-    "Before declaring a Website audit clean, actively check the available evidence for robots.txt disallow rules, sitemap.xml, HTTPS, structured data/schema, mobile viewport, and PageSpeed performance, SEO, accessibility, and best-practices scores. Do not treat performance score alone as the technical audit.",
-    "Select high-signal findings that can affect visibility, rankings, trust, user experience, customer acquisition, conversion, or local competitiveness. Avoid duplicate, cosmetic, or low-impact observations.",
-    "If no material issue is verified, do not manufacture one; use the existing no-major-issues/working-well fields required by the response schema and provide one concise verified strength.",
+    `You are a senior technical auditor and sales-intelligence analyst working for ${brandName} (${brandWebsite}).`,
+    "You research only publicly accessible website content and public search results.",
+    "Never invent a finding, performance score, ranking, owner, opening hours, address mismatch, competitor, technology, buying signal, intent signal, or prospect interest.",
+    "When a workspace audit profile is supplied, use it only to evaluate commercial alignment and pitch relevance. Fit is not proof of buyer intent.",
     "Do not run active security scans. Do not claim legal, accessibility, privacy, or security compliance.",
-    "Competitor Analysis is client-facing: descriptive findings only, with no internal service pitch, pricing, recommendations, or sales talking points.",
-    "Full Audit is internal-only and may contain an opportunity/build plan.",
-    "Return exactly one valid JSON object, with no markdown fences and no prose outside JSON.",
-    "Any manager PDF is optional and controls presentation/style only; never copy its facts into another lead.",
-    managerGuidance ? `Workspace style guidance: ${managerGuidance}` : "",
-  ].filter(Boolean).join(" ");
+    "Return one valid JSON object only. Do not use markdown fences and do not add prose before or after JSON.",
+    "When the supplied homepage evidence conflicts with a search result, identify the conflict and cite the public source in the source field.",
+  ].join(" ");
 }
 
 function buildClaudePrompt(record, evidence) {
   const brand = record.brand;
-  const track = normalizeCampaignType(record.campaignType || record.lead?.dailyCampaignType || record.lead?.campaignType || "website");
-  const isGmb = track === "gmb";
-  const today = new Date().toISOString().slice(0, 10);
   const base = {
     reportKind: record.kind,
-    auditTrack: track,
-    business_name: clean(record.lead?.business || record.lead?.name || evidence.siteName),
-    website_url: record.website || evidence.website || "",
-    gmb_profile_url: clean(record.lead?.gmbProfileUrl || record.lead?.googleMapsUri || evidence.gmbProfileUrl),
-    place_id: clean(record.lead?.placeId || evidence.placeId),
-    city_market: clean(record.location || record.lead?.address),
-    primary_search_term: clean(record.niche || record.lead?.category),
-    industry: clean(record.niche || record.lead?.category),
-    agency_name: brand.name || "ReachFly",
-    audit_date: today,
-    verifiedEvidence: evidence,
-    template: {
-      name: record.reportTemplate?.name || record.templateName || "ReachFly default",
-      lengthGuidance: record.reportTemplate?.lengthGuidance || "",
-      instructions: record.reportTemplate?.instructions || "",
-    },
-  };
-
-  const gmbWeights = {
-    reviewVolumeVsCompetitors: 25,
-    ratingWeightedBySample: 15,
-    hoursAccuracy: 10,
-    businessNameCategoryKeywordPresence: 10,
-    addressPrecision: 5,
-    photosVisualAssets: 10,
-    descriptionServicesCompleteness: 10,
-    reviewRecencyVelocity: 10,
-    ownerReviewResponses: 5,
-  };
-  const websiteWeights = {
-    searchRankingPosition: 25,
-    technicalSeoPerformance: 20,
-    localServicePageDepth: 15,
-    conversionPath: 15,
-    domainConsolidation: 10,
-    onPageTrustSignals: 15,
+    website: record.website,
+    lead: record.lead,
+    niche: record.niche,
+    location: record.location,
+    brand,
+    auditProfile: record.auditProfile || normalizeAuditProfile({}),
+    verifiedHomepageEvidence: evidence,
+    generatedDate: new Date().toISOString().slice(0, 10),
   };
 
   if (record.kind === "mini") {
-    const shape = {
-      track,
-      title: `${isGmb ? "GMB" : "Website"} Mini Audit`,
-      score10: 0,
-      grade: "A|B|C|D|F",
-      currentStanding: "",
-      hook: "",
-      suggestedOpener: "",
-      noMajorIssues: false,
-      workingWell: "",
-      snapshot: isGmb ? {
-        businessName: "", category: "", phone: "", address: "", website: "", rating: null, reviewCount: null, businessHours: "", whatTheyDo: "",
-      } : {
-        businessName: "", phone: "", email: "", website: "", platform: "", decisionMaker: "Not confirmed — verify on call", businessHours: "Not confirmed — verify on call", whatTheyDo: "", mobilePageSpeed: null, searchPosition: "",
+    return `${JSON.stringify(base)}\n\nResearch the business using live web search before writing. Search for the business's Google, Yelp, and other public directory listings; compare their address and phone with the supplied website and lead evidence. Search for the primary category plus city and identify whether the business appears prominently and which 2-4 real competitors appear instead. Use only facts you can verify. Return exactly this JSON shape:\n${JSON.stringify(
+      {
+        header: {
+          confidentiality: "INTERNAL - SALES TEAM USE ONLY - DO NOT SEND TO CLIENT",
+          brandLine: `${brand.name.toUpperCase()} · MINI AUDIT REPORT · YYYY-MM-DD`,
+          title: "Business Name - Mini Audit",
+          subtitle: "One page. Everything you need before you dial.",
+        },
+        snapshot: {
+          businessName: "",
+          phone: "",
+          email: "",
+          website: "domain",
+          platform: "",
+          decisionMaker: "Not publicly identified - verify on call",
+          businessHours: "Not publicly listed - verify on call",
+          whatTheyDo: "",
+        },
+        salesFit: {
+          fitScore: 0,
+          alignment: "",
+          summary: "",
+          likelyNeeds: [""],
+          pitchAngles: [""],
+          suggestedOpener: "",
+          caution: "Commercial fit is not proof of buyer intent.",
+        },
+        issues: [
+          {
+            tag: "precise technical label",
+            finding: "One verified factual sentence the rep can say aloud.",
+            pain: "One short plain-English business consequence sentence with no fix.",
+            source: "Public URL or supplied homepage evidence",
+          },
+        ],
+        footer: `INTERNAL USE ONLY. Do not forward this document to the client. Findings sourced from ${evidence.domain} public page source and public directories, YYYY-MM-DD. Send the Client Audit Report (technical, no recommendations) after the call. ${brand.name} - ${brand.website || "workspace"}`,
       },
-      issues: [{ tag: "", finding: "", pain: "", source: "" }],
-      footer: "",
-    };
-    return `${JSON.stringify(base)}\n\nGenerate ONLY the ${isGmb ? "GMB" : "Website"} Mini Audit. This is the DEFAULT fast pre-call audit: keep it concise, mature, high-signal, and easy to skim in about 15 seconds. ${isGmb ? `Use this GMB scoring framework: ${JSON.stringify(gmbWeights)}. Use the supplied Google Places/profile evidence first and research the target plus 5-7 nearby competitors only when needed. Prioritize rating/review strength, review-volume gaps, local competitive standing, business status, category/profile accuracy, hours and other verified profile signals. Include one sharp evidence-based hook, 4-5 strongest materially different verified technical/logical talking points when enough evidence exists, and a natural suggested opener.` : `Use this Website scoring framework: ${JSON.stringify(websiteWeights)}. Use the supplied live website and PageSpeed mobile/desktop evidence first, then live search only when needed. Prioritize search/SEO standing, technical performance/CWV when confirmed, robots/sitemap/HTTPS/schema/mobile viewport/on-page signals, conversion paths, trust signals and local/service-page opportunity. Include one sharp evidence-based hook, 4-5 strongest materially different verified technical/logical talking points when enough evidence exists, and a natural suggested opener.`} For every issue, tag is a short label, finding is one specific verified observation, pain is the practical business impact, and source identifies the supporting evidence. Do not create weak findings just to reach five; if only 2-3 strong issues are verified, return only those. Grade scale: A >= 8.0, B >= 6.5, C >= 5.0, D >= 3.5, F < 3.5. Every issue must be verified. If no material issue is verified, set noMajorIssues=true, issues=[], and workingWell to one concise verified strength so the caller sees "✓ No major issues found — [what is actually working]". If something cannot be confirmed, say Not confirmed — verify on call. Preserve the response format exactly and return this JSON shape with no additional fields:\n${JSON.stringify(shape, null, 2)}`;
+      null,
+      2
+    )}\nRules: include 6-10 issues, prioritized with address/NAP conflicts, domain authority fragmentation, and search visibility before minor issues. Each issue finding must be exactly one sentence. Each issue pain must be exactly one sentence. salesFit must compare the verified business evidence to auditProfile.businessNiche, auditProfile.idealCustomer, auditProfile.offer, auditProfile.targetMarket, auditProfile.pitchGoal, auditProfile.customInstructions and the enabled auditProfile.criteria. fitScore is commercial alignment from 0-100, not buying intent. Do not say the prospect is interested, ready to buy, needs the offer, or has budget unless supplied CRM/public evidence explicitly proves it. suggestedOpener must be one short conversational opener that references at most one verified observation and then asks a question. pitchAngles must stay grounded in verified findings and the configured offer. Include no objection notes, founded/size field, unsupported recommendations, or extra sections.`;
   }
 
   if (record.kind === "competitor") {
-    const shape = isGmb ? {
-      track,
-      title: "GMB Competitor Analysis",
-      atAGlance: { rating: null, reviewCount: null, hoursStatus: "", score10: 0, grade: "" },
-      marketQuery: "",
-      targetVisibility: "",
-      competitors: [{ name: "", distance: "", rating: null, reviewCount: null, location: "", evidence: [""] }],
-      profileFindings: [{ title: "", evidence: "", whyItMatters: "" }],
-      competitiveGaps: [{ title: "", evidence: "", businessImpact: "" }],
-      whatThisConfirms: "",
-      disclaimer: "",
-    } : {
-      track,
-      title: "Website Competitor Analysis",
-      atAGlance: { searchStatus: "", localPageStatus: "", directoryStatus: "", mobilePageSpeed: null, score10: 0, grade: "" },
-      marketQuery: "",
-      targetVisibility: "",
-      competitors: [{ name: "", domain: "", location: "", observedAdvantages: [""], evidence: [""] }],
-      visibilityTable: [],
-      directoryTable: [],
-      technicalTable: [],
-      scoreTable: [],
-      competitiveGaps: [{ title: "", evidence: "", businessImpact: "" }],
-      whatThisConfirms: "",
-      disclaimer: "",
-    };
-    return `${JSON.stringify(base)}\n\nGenerate ONLY the ${isGmb ? "GMB" : "Website"} Competitor Analysis. This is CLIENT-FACING and must contain no internal service pitch, pricing, recommendations, or sales talking points. ${isGmb ? "Find 5-7 nearby competitors when possible and compare rating/reviews/hours/profile signals." : "Run the exact customer search, identify 3 competitors ranking above the target (or top 3 if target does not rank), compare local/service pages, directories, conversion/trust, and best-effort technical health."} Use only verified live evidence. Return exactly this JSON shape:\n${JSON.stringify(shape, null, 2)}`;
+    return `${JSON.stringify(base)}\n\nResearch live search results for the business's category and city. Identify 3-5 real direct competitors and compare only publicly verifiable website, local-search, review, conversion, and trust signals. Return exactly this JSON shape:\n${JSON.stringify(
+      {
+        title: "Competitor Analysis",
+        executiveSummary: "",
+        marketQuery: "",
+        targetVisibility: "",
+        competitors: [
+          {
+            name: "",
+            domain: "",
+            location: "",
+            observedAdvantages: [""],
+            evidence: ["public URL or search observation"],
+          },
+        ],
+        competitiveGaps: [
+          { title: "", evidence: "", businessImpact: "" },
+        ],
+        salesTalkingPoints: [""],
+        disclaimer: "",
+      },
+      null,
+      2
+    )}`;
   }
 
-  const shape = isGmb ? {
-    track,
-    title: "GMB Full Audit",
-    internalHeader: `INTERNAL — ${String(brand.name || "REACHFLY").toUpperCase()} USE ONLY — DO NOT SEND TO CLIENT`,
-    executiveSummary: "",
-    score10: 0,
-    grade: "",
-    businessIdentification: {},
-    sectionScores: [],
-    priorityFindings: [{ title: "", severity: "critical|high|medium", evidence: "", businessImpact: "", recommendation: "", source: "" }],
-    reviewAnalysis: [],
-    competitors: [],
-    keywordAnalysis: [],
-    localSeoProminence: "",
-    rankingOpportunity: "",
-    notYetAssessed: [""],
-    roadmap: [{ phase: "", timeframe: "", actions: [""] }],
-    methodology: "",
-    disclaimer: "",
-  } : {
-    track,
-    title: "Website Full Audit",
-    internalHeader: `INTERNAL — ${String(brand.name || "REACHFLY").toUpperCase()} USE ONLY — DO NOT SEND TO CLIENT`,
-    executiveSummary: "",
-    score10: 0,
-    grade: "",
-    businessIdentification: {},
-    sectionScores: [],
-    technicalLiveResults: {},
-    priorityFindings: [{ title: "", severity: "critical|high|medium", evidence: "", businessImpact: "", recommendation: "", source: "" }],
-    seoTrustAudit: [],
-    competitors: [],
-    keywordAnalysis: [],
-    rankingTests: [],
-    notYetAssessed: [""],
-    roadmap: [{ phase: "", timeframe: "", actions: [""] }],
-    methodology: "",
-    disclaimer: "",
-  };
-  return `${JSON.stringify(base)}\n\nGenerate ONLY the ${isGmb ? "GMB" : "Website"} Full Audit. This is INTERNAL ONLY. ${isGmb ? `Use the GMB weighted score ${JSON.stringify(gmbWeights)} and include business identification, score table, issues, review analysis, local competitors, keyword/local SEO, prominence, ranking opportunity, not-yet-assessed fields, and a build plan.` : `Use the Website weighted score ${JSON.stringify(websiteWeights)} and include the actual PageSpeed mobile/desktop results, CWV, HTTPS, title/meta/H1, alt text, canonical, sitemap, robots, schema, mobile viewport, page weight/request count when confirmed; then SEO/trust, issues, competitors, keyword/ranking tests, not-yet-assessed fields, and a build plan.`} Grade scale: A >= 8.0, B >= 6.5, C >= 5.0, D >= 3.5, F < 3.5. Never estimate technical scores. Return exactly this JSON shape:\n${JSON.stringify(shape, null, 2)}`;
+  return `${JSON.stringify(base)}\n\nProduce a detailed evidence-grounded website audit using the supplied homepage evidence and live web research. Include technical, SEO, local visibility, conversion, trust, content, and competitor observations. Recommendations may appear only in this full report. Return exactly this JSON shape:\n${JSON.stringify(
+    {
+      title: "Full Website Audit",
+      executiveSummary: "",
+      score: 0,
+      strengths: [""],
+      priorityFindings: [
+        {
+          title: "",
+          severity: "critical|high|medium|low",
+          evidence: "",
+          businessImpact: "",
+          recommendation: "",
+          source: "",
+        },
+      ],
+      technicalReview: [
+        { item: "", status: "pass|warning|fail", evidence: "" },
+      ],
+      seoAndLocalVisibility: [
+        { item: "", status: "pass|warning|fail", evidence: "" },
+      ],
+      conversionAndTrust: [
+        { item: "", status: "pass|warning|fail", evidence: "" },
+      ],
+      competitorSummary: "",
+      roadmap: [
+        { phase: "", timeframe: "", actions: [""] },
+      ],
+      disclaimer: "",
+    },
+    null,
+    2
+  )}`;
 }
 
 function normalizeGeneratedReport(record, evidence, value) {
-  const track = normalizeCampaignType(record.campaignType || record.kind);
-  const isGmb = track === "gmb";
-  const score10 = normalizeScore10(value.score10 ?? value.score);
-  const grade = clean(value.grade) || gradeFromTen(score10);
-
-  if (["website", "gmb"].includes(record.kind)) {
-    // Backward compatibility only for historical queued records. New requests never create these kinds.
-    return {
-      title: clean(value.title) || `${record.kind === "gmb" ? "GMB" : "Website"} Legacy Audit`,
-      summary: clean(value.summary || value.executiveSummary),
-      score: Math.round(score10 * 10),
-      score10,
-      grade,
-      findings: Array.isArray(value.findings) ? value.findings.slice(0, 12) : [],
-      disclaimer: clean(value.disclaimer) || "Historical compatibility report.",
-    };
-  }
-
   if (record.kind === "mini") {
-    const normalizedIssues = (Array.isArray(value.issues) ? value.issues : [])
+    const issues = Array.isArray(value.issues) ? value.issues : [];
+    const normalizedIssues = issues
       .map((item) => ({
-        tag: clean(item.tag || item.title),
-        finding: oneSentence(item.finding || item.evidence),
-        pain: oneSentence(item.pain || item.businessImpact || item.whyItMatters),
+        tag: clean(item.tag),
+        finding: oneSentence(item.finding),
+        pain: oneSentence(item.pain),
         source: clean(item.source),
       }))
-      .filter((item) => item.tag && item.finding && item.pain && item.source)
-      .slice(0, 5);
+      .filter((item) => item.tag && item.finding && item.pain)
+      .slice(0, 10);
 
     const fallback = buildFallbackMini(record, evidence);
     const finalIssues = [...normalizedIssues];
-    for (const item of fallback.issues || []) {
-      if (finalIssues.length >= 5) break;
-      if (!finalIssues.some((existing) => normalize(existing.tag) === normalize(item.tag))) finalIssues.push(item);
-    }
-    const noMajorIssues = Boolean(value.noMajorIssues) && !finalIssues.length;
-    const workingWell = clean(value.workingWell);
-    if (!finalIssues.length && !(noMajorIssues && workingWell)) {
-      // Claude may return no issue when the verified evidence is genuinely healthy.
-      // In that case the supplied audit contract requires an explicit positive
-      // "No major issues found" talking point rather than inventing a problem.
-      const fallbackPositive = clean(fallback.workingWell);
-      if (!fallbackPositive) {
-        throw new Error("Mini Audit returned neither a verified issue nor a verified positive finding.");
+
+    for (const item of fallback.issues) {
+      if (finalIssues.length >= 6) break;
+      if (!finalIssues.some((existing) => normalize(existing.tag) === normalize(item.tag))) {
+        finalIssues.push(item);
       }
     }
 
-    const finalNoMajorIssues = !finalIssues.length;
-    const finalWorkingWell = workingWell || clean(fallback.workingWell);
-    const snapshotValue = value.snapshot || {};
     return {
-      track,
-      title: clean(value.title) || `${isGmb ? "GMB" : "Website"} Mini Audit`,
-      score10,
-      score: Math.round(score10 * 10),
-      grade,
-      currentStanding: clean(value.currentStanding),
-      hook: clean(value.hook),
-      suggestedOpener: clean(value.suggestedOpener),
-      noMajorIssues: finalNoMajorIssues,
-      workingWell: finalWorkingWell,
       header: {
-        confidentiality: "INTERNAL - SALES TEAM USE ONLY - DO NOT SEND TO CLIENT",
-        brandLine: `${record.brand.name.toUpperCase()} · ${isGmb ? "GMB" : "WEBSITE"} MINI AUDIT · ${new Date().toISOString().slice(0, 10)}`,
-        title: clean(value.header?.title) || `${clean(snapshotValue.businessName) || evidence.siteName || record.lead?.business || "Business"} - ${isGmb ? "GMB" : "Website"} Mini Audit`,
-        subtitle: "One screen. Everything you need before you dial.",
+        confidentiality:
+          "INTERNAL - SALES TEAM USE ONLY - DO NOT SEND TO CLIENT",
+        brandLine: `${record.brand.name.toUpperCase()} · MINI AUDIT REPORT · ${new Date()
+          .toISOString()
+          .slice(0, 10)}`,
+        title: `${clean(value.header?.title) || clean(value.snapshot?.businessName) || evidence.siteName} - Mini Audit`,
+        subtitle: "One page. Everything you need before you dial.",
       },
       snapshot: {
-        businessName: clean(snapshotValue.businessName) || evidence.siteName || record.lead?.business || record.lead?.name,
-        phone: clean(snapshotValue.phone) || evidence.phone || "Not confirmed — verify on call",
-        email: clean(snapshotValue.email) || evidence.email || "Not confirmed — verify on call",
-        website: clean(snapshotValue.website) || evidence.website || evidence.domain || record.website || "Not confirmed — verify on call",
-        platform: clean(snapshotValue.platform) || evidence.platform || (isGmb ? "Google Business Profile" : "Not confirmed — verify on call"),
-        decisionMaker: clean(snapshotValue.decisionMaker) || evidence.decisionMaker || "Not confirmed — verify on call",
-        businessHours: clean(snapshotValue.businessHours) || evidence.businessHours || "Not confirmed — verify on call",
-        whatTheyDo: clean(snapshotValue.whatTheyDo) || evidence.description || "Not confirmed — verify on call",
-        category: clean(snapshotValue.category) || evidence.category || record.niche || "",
-        address: clean(snapshotValue.address) || evidence.googleAddress || record.location || "",
-        rating: numberOrNull(snapshotValue.rating ?? evidence.rating),
-        reviewCount: numberOrNull(snapshotValue.reviewCount ?? evidence.reviewCount),
-        mobilePageSpeed: numberOrNull(snapshotValue.mobilePageSpeed ?? evidence.pageSpeed?.mobile?.performance),
-        searchPosition: clean(snapshotValue.searchPosition),
+        businessName:
+          clean(value.snapshot?.businessName) || evidence.siteName,
+        phone: clean(value.snapshot?.phone) || evidence.phone || "Not publicly listed - verify on call",
+        email: clean(value.snapshot?.email) || evidence.email || "Not publicly listed - verify on call",
+        website: clean(value.snapshot?.website) || evidence.domain,
+        platform: clean(value.snapshot?.platform) || evidence.platform || "Not identifiable from public source",
+        decisionMaker:
+          clean(value.snapshot?.decisionMaker) ||
+          evidence.decisionMaker ||
+          "Not publicly identified - verify on call",
+        businessHours:
+          clean(value.snapshot?.businessHours) ||
+          evidence.businessHours ||
+          "Not publicly listed - verify on call",
+        whatTheyDo:
+          clean(value.snapshot?.whatTheyDo) ||
+          evidence.description ||
+          "Not clearly stated on the reviewed homepage.",
       },
-      issues: finalIssues,
-      footer: clean(value.footer) || `INTERNAL USE ONLY. ${isGmb ? "GMB" : "Website"} findings are kept separate and based on public evidence observed ${new Date().toISOString().slice(0, 10)}.`,
+      salesFit: normalizeSalesFit(
+        value.salesFit,
+        record,
+        finalIssues,
+        evidence
+      ),
+      issues: finalIssues.slice(0, 10),
+      footer:
+        clean(value.footer) ||
+        `INTERNAL USE ONLY. Do not forward this document to the client. Findings sourced from ${evidence.domain} public page source and public directories, ${new Date()
+          .toISOString()
+          .slice(0, 10)}. Send the Client Audit Report (technical, no recommendations) after the call. ${record.brand.name} - ${record.brand.website || "workspace"}`,
     };
   }
 
   if (record.kind === "competitor") {
-    const competitors = (Array.isArray(value.competitors) ? value.competitors : [])
-      .slice(0, isGmb ? 7 : 5)
-      .map((item) => ({
-        name: clean(item.name),
-        domain: clean(item.domain),
-        distance: clean(item.distance),
-        location: clean(item.location || item.address),
-        rating: numberOrNull(item.rating),
-        reviewCount: numberOrNull(item.reviewCount),
-        observedAdvantages: toStringArray(item.observedAdvantages, 6),
-        evidence: toStringArray(item.evidence, 8),
-      }))
-      .filter((item) => item.name || item.domain);
-    if (!competitors.length) throw new Error("Competitor Analysis did not return verified competitors.");
-
     return {
-      track,
-      title: clean(value.title) || `${isGmb ? "GMB" : "Website"} Competitor Analysis`,
-      atAGlance: value.atAGlance && typeof value.atAGlance === "object" ? value.atAGlance : {},
-      score10,
-      score: Math.round(score10 * 10),
-      grade,
+      title: clean(value.title) || "Competitor Analysis",
       executiveSummary: clean(value.executiveSummary),
       marketQuery: clean(value.marketQuery),
       targetVisibility: clean(value.targetVisibility),
-      competitors,
-      profileFindings: Array.isArray(value.profileFindings) ? value.profileFindings.slice(0, 10) : [],
-      visibilityTable: Array.isArray(value.visibilityTable) ? value.visibilityTable.slice(0, 10) : [],
-      directoryTable: Array.isArray(value.directoryTable) ? value.directoryTable.slice(0, 10) : [],
-      technicalTable: Array.isArray(value.technicalTable) ? value.technicalTable.slice(0, 10) : [],
-      scoreTable: Array.isArray(value.scoreTable) ? value.scoreTable.slice(0, 10) : [],
-      competitiveGaps: (Array.isArray(value.competitiveGaps) ? value.competitiveGaps : []).slice(0, 10).map((item) => ({
-        title: clean(item.title), evidence: clean(item.evidence), businessImpact: clean(item.businessImpact || item.whyItMatters),
-      })),
-      whatThisConfirms: clean(value.whatThisConfirms),
-      salesTalkingPoints: [],
-      disclaimer: clean(value.disclaimer) || "Client-facing comparison based only on verified public evidence; no recommendations or pricing included.",
+      competitors: Array.isArray(value.competitors)
+        ? value.competitors.slice(0, 5).map((item) => ({
+            name: clean(item.name),
+            domain: clean(item.domain),
+            location: clean(item.location),
+            observedAdvantages: toStringArray(item.observedAdvantages, 6),
+            evidence: toStringArray(item.evidence, 6),
+          }))
+        : [],
+      competitiveGaps: Array.isArray(value.competitiveGaps)
+        ? value.competitiveGaps.slice(0, 10).map((item) => ({
+            title: clean(item.title),
+            evidence: clean(item.evidence),
+            businessImpact: clean(item.businessImpact),
+          }))
+        : [],
+      salesTalkingPoints: toStringArray(value.salesTalkingPoints, 8),
+      disclaimer:
+        clean(value.disclaimer) ||
+        "Based only on publicly accessible websites and search results observed at the report date.",
     };
   }
 
-  const findings = (Array.isArray(value.priorityFindings) ? value.priorityFindings : []).slice(0, 15).map((item) => ({
-    title: clean(item.title),
-    severity: normalizeSeverity(item.severity),
-    evidence: clean(item.evidence),
-    businessImpact: clean(item.businessImpact),
-    recommendation: clean(item.recommendation),
-    source: clean(item.source),
-  })).filter((item) => item.title && item.evidence);
-  if (!findings.length) throw new Error("Full Audit produced no verified priority findings.");
-
   return {
-    track,
-    title: clean(value.title) || `${isGmb ? "GMB" : "Website"} Full Audit`,
-    internalHeader: clean(value.internalHeader) || `INTERNAL — ${String(record.brand.name || "REACHFLY").toUpperCase()} USE ONLY — DO NOT SEND TO CLIENT`,
+    title: clean(value.title) || "Full Website Audit",
     executiveSummary: clean(value.executiveSummary),
-    score10,
-    score: Math.round(score10 * 10),
-    grade,
-    businessIdentification: value.businessIdentification && typeof value.businessIdentification === "object" ? value.businessIdentification : {},
-    sectionScores: Array.isArray(value.sectionScores) ? value.sectionScores.slice(0, 20) : [],
+    score: clamp(value.score || evidenceFallbackScore(evidence), 0, 100),
     strengths: toStringArray(value.strengths, 8),
-    priorityFindings: findings,
-    technicalLiveResults: value.technicalLiveResults && typeof value.technicalLiveResults === "object" ? value.technicalLiveResults : (evidence.pageSpeed || {}),
+    priorityFindings: Array.isArray(value.priorityFindings)
+      ? value.priorityFindings.slice(0, 12).map((item) => ({
+          title: clean(item.title),
+          severity: normalizeSeverity(item.severity),
+          evidence: clean(item.evidence),
+          businessImpact: clean(item.businessImpact),
+          recommendation: clean(item.recommendation),
+          source: clean(item.source),
+        }))
+      : [],
     technicalReview: normalizeReviewRows(value.technicalReview),
     seoAndLocalVisibility: normalizeReviewRows(value.seoAndLocalVisibility),
     conversionAndTrust: normalizeReviewRows(value.conversionAndTrust),
-    reviewAnalysis: Array.isArray(value.reviewAnalysis) ? value.reviewAnalysis.slice(0, 20) : [],
-    competitors: Array.isArray(value.competitors) ? value.competitors.slice(0, 10) : [],
-    seoTrustAudit: Array.isArray(value.seoTrustAudit) ? value.seoTrustAudit.slice(0, 20) : [],
-    keywordAnalysis: Array.isArray(value.keywordAnalysis) ? value.keywordAnalysis.slice(0, 30) : [],
-    rankingTests: Array.isArray(value.rankingTests) ? value.rankingTests.slice(0, 20) : [],
-    localSeoProminence: clean(value.localSeoProminence),
-    rankingOpportunity: clean(value.rankingOpportunity),
     competitorSummary: clean(value.competitorSummary),
-    notYetAssessed: toStringArray(value.notYetAssessed, 20),
-    roadmap: Array.isArray(value.roadmap) ? value.roadmap.slice(0, 6).map((item) => ({ phase: clean(item.phase), timeframe: clean(item.timeframe), actions: toStringArray(item.actions, 8) })) : [],
-    methodology: clean(value.methodology),
-    disclaimer: clean(value.disclaimer) || "Internal evidence-grounded audit. Re-verify time-sensitive public metrics before the call.",
+    roadmap: Array.isArray(value.roadmap)
+      ? value.roadmap.slice(0, 4).map((item) => ({
+          phase: clean(item.phase),
+          timeframe: clean(item.timeframe),
+          actions: toStringArray(item.actions, 6),
+        }))
+      : [],
+    disclaimer:
+      clean(value.disclaimer) ||
+      "This report is based on publicly accessible pages and search results. It is not a security penetration test, legal review, accessibility certification, or guarantee of commercial performance.",
   };
 }
 
-function normalizeScore10(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Number(Math.max(0, Math.min(number > 10 ? number / 10 : number, 10)).toFixed(2));
-}
-
-function gradeFromTen(value) {
-  const score = Number(value || 0);
-  if (score >= 8) return "A";
-  if (score >= 6.5) return "B";
-  if (score >= 5) return "C";
-  if (score >= 3.5) return "D";
-  return "F";
-}
-
-function numberOrNull(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
 function buildFallbackReport(record, evidence, error) {
-  if (record.kind !== "mini") {
-    throw new Error(`Live ${record.kind} research failed: ${error.message}`);
+  if (record.kind === "mini") {
+    return {
+      ...buildFallbackMini(record, evidence),
+      generationNote: `Claude fallback used: ${error.message}`,
+    };
   }
+
+  if (record.kind === "competitor") {
+    return {
+      title: "Competitor Analysis",
+      executiveSummary:
+        "Live competitor research could not be completed. The report contains only verified observations from the target website.",
+      marketQuery: [record.niche, record.location].filter(Boolean).join(" "),
+      targetVisibility: "Not verified - rerun when Claude web search is available.",
+      competitors: [],
+      competitiveGaps: buildFallbackMini(record, evidence).issues.map((item) => ({
+        title: item.tag,
+        evidence: item.finding,
+        businessImpact: item.pain,
+      })),
+      salesTalkingPoints: [],
+      disclaimer: `Claude research unavailable: ${error.message}`,
+    };
+  }
+
   const mini = buildFallbackMini(record, evidence);
-  if (!mini.issues?.length && !mini.workingWell) {
-    throw new Error(`Mini Audit live research failed and no verified fallback findings or positive evidence were available: ${error.message}`);
-  }
   return {
-    ...mini,
-    generationNote: `Claude fallback used: ${error.message}`,
+    title: "Full Website Audit",
+    executiveSummary:
+      "This fallback report contains verified homepage observations only. Live competitor research and expanded narrative generation were unavailable.",
+    score: evidenceFallbackScore(evidence),
+    strengths: fallbackStrengths(evidence),
+    priorityFindings: mini.issues.map((item) => ({
+      title: item.tag,
+      severity: "medium",
+      evidence: item.finding,
+      businessImpact: item.pain,
+      recommendation: fallbackRecommendation(item.tag),
+      source: item.source,
+    })),
+    technicalReview: [],
+    seoAndLocalVisibility: [],
+    conversionAndTrust: [],
+    competitorSummary: "Not verified - rerun when Claude web search is available.",
+    roadmap: [],
+    disclaimer: `Claude generation unavailable: ${error.message}`,
   };
 }
 
 function buildFallbackMini(record, evidence) {
-  const track = normalizeCampaignType(record.campaignType || record.kind);
-  const isGmb = track === "gmb";
   const issues = [];
-  const add = (tag, finding, pain, source = evidence.finalUrl || evidence.gmbProfileUrl || evidence.source || "Verified public evidence") => {
-    if (issues.length >= 5 || !clean(finding) || !clean(pain)) return;
-    issues.push({ tag, finding: oneSentence(finding), pain: oneSentence(pain), source: clean(source) || "Verified public evidence" });
+  const add = (tag, finding, pain, source = evidence.finalUrl) => {
+    if (issues.length >= 10) return;
+    issues.push({ tag, finding: oneSentence(finding), pain: oneSentence(pain), source });
   };
 
-  if (isGmb) {
-    const targetReviews = numberOrNull(evidence.reviewCount);
-    const competitorReviews = (evidence.competitors || []).map((item) => Number(item.reviewCount)).filter(Number.isFinite);
-    const maxCompetitorReviews = competitorReviews.length ? Math.max(...competitorReviews) : null;
-    if (targetReviews !== null && maxCompetitorReviews !== null && targetReviews < maxCompetitorReviews) {
-      add("review volume gap", `${evidence.siteName} has ${targetReviews} Google reviews while the strongest verified nearby competitor has ${maxCompetitorReviews}.`, "Lower review volume can reduce trust when customers compare nearby options.", evidence.gmbProfileUrl || "Google Places API");
-    }
-    const rating = numberOrNull(evidence.rating);
-    const competitorRatings = (evidence.competitors || []).map((item) => Number(item.rating)).filter(Number.isFinite);
-    const maxRating = competitorRatings.length ? Math.max(...competitorRatings) : null;
-    if (rating !== null && maxRating !== null && rating < maxRating) {
-      add("rating disadvantage", `${evidence.siteName} has a verified Google rating of ${rating}, below a nearby competitor at ${maxRating}.`, "A visible rating disadvantage can push comparison shoppers toward another listing.", evidence.gmbProfileUrl || "Google Places API");
-    }
-    if (evidence.businessStatus && normalize(evidence.businessStatus) !== "operational") {
-      add("profile business status", `Google Places reports the business status as ${evidence.businessStatus}.`, "An unexpected public status can stop customers from choosing or contacting the business.", evidence.gmbProfileUrl || "Google Places API");
-    }
-    return makeFallbackMiniReport(record, evidence, issues, track);
-  }
-
-  const websiteHtmlConfirmed = evidence.websiteHtmlConfirmed !== false;
-
   if (
-    websiteHtmlConfirmed &&
     evidence.websiteAddress &&
     evidence.googleAddress &&
     normalize(evidence.websiteAddress) !== normalize(evidence.googleAddress)
   ) {
-    add("NAP citation conflict", `The website address is shown as ${evidence.websiteAddress}, while the lead/Google address is ${evidence.googleAddress}.`, "Customers can lose confidence or arrive at the wrong location.");
-  }
-  if (evidence.pageSpeed?.mobile?.status === "confirmed" && Number(evidence.pageSpeed.mobile.performance) < 50) {
-    add("slow mobile PageSpeed", `Google PageSpeed measured the mobile performance score at ${evidence.pageSpeed.mobile.performance}/100.`, "A slow mobile experience can lose high-intent visitors before they contact the business.", "Google PageSpeed Insights API");
-  }
-  if (evidence.pageSpeed?.mobile?.status === "confirmed" && Number(evidence.pageSpeed.mobile.seo) < 80) {
-    add("PageSpeed SEO score gap", `Google PageSpeed measured the mobile SEO score at ${evidence.pageSpeed.mobile.seo}/100.`, "Technical SEO gaps can actively suppress organic search ranking.", "Google PageSpeed Insights API");
-  }
-  if (evidence.pageSpeed?.mobile?.status === "confirmed" && Number(evidence.pageSpeed.mobile.accessibility) < 80) {
-    add("PageSpeed accessibility score gap", `Google PageSpeed measured the mobile accessibility score at ${evidence.pageSpeed.mobile.accessibility}/100.`, "Accessibility gaps can turn away visitors using assistive technology and are an increasingly common compliance concern.", "Google PageSpeed Insights API");
-  }
-  if (websiteHtmlConfirmed && !evidence.metaDescription) {
-    add("missing meta description", "The reviewed homepage does not provide a meta description.", "Searchers may see an unclear or inconsistent search preview.");
-  }
-  if (websiteHtmlConfirmed && !evidence.hasBooking && !evidence.hasChat) {
     add(
-      evidence.hasContactForm ? "static contact path" : "no conversion path",
-      evidence.hasContactForm
-        ? "The reviewed site relies on a contact form without detected booking or live chat."
-        : "The reviewed homepage has no detected booking, live chat, or contact form.",
-      evidence.hasContactForm
-        ? "High-intent visitors cannot complete the next step immediately."
-        : "Visitors have no immediate way to take the next step, which can lose high-intent traffic entirely."
+      "NAP citation conflict",
+      `The website address is shown as ${evidence.websiteAddress}, while the Google lead record shows ${evidence.googleAddress}.`,
+      "Customers can lose confidence or arrive at the wrong location."
     );
   }
-  if (websiteHtmlConfirmed && Number(evidence.imagesMissingAlt || 0) > 0) {
-    add("image alt text gaps", `${evidence.imagesMissingAlt} images on the reviewed homepage have no non-empty alt text.`, "Missing descriptive image text weakens page clarity for search engines and assistive technology.");
-  }
-  if (websiteHtmlConfirmed && !evidence.hasSchema) {
-    add("no structured data", "No JSON-LD schema markup (e.g. LocalBusiness/Organization) was found on the homepage.", "Search engines have less signal to show rich results like hours, ratings, or a map panel.");
-  }
-  if (websiteHtmlConfirmed && !/width\s*=\s*device-width/i.test(evidence.viewport || "")) {
-    add("no mobile viewport tag", "The homepage does not declare a responsive mobile viewport meta tag.", "Mobile visitors are likely to see a desktop-scaled layout, which increases bounce on phones.");
-  }
-  if (evidence.finalUrl && /^http:\/\//i.test(evidence.finalUrl)) {
-    add("no HTTPS", "The site was reachable over plain HTTP rather than HTTPS.", "Browsers flag the site as \"Not Secure,\" which can reduce visitor trust and hurt search ranking.");
-  }
-  if (evidence.robots?.found && /disallow:\s*\/\s*(?:$|\n)/i.test(evidence.robots.sample || "")) {
-    add("robots.txt blocks indexing", "robots.txt contains a rule disallowing the entire site from search crawlers.", "The site may be effectively invisible in organic search results.", evidence.robots.url || "robots.txt");
-  }
-  if (evidence.robots && evidence.robots.error === undefined && !evidence.robots.found && evidence.robots.status && evidence.robots.status !== 404) {
-    // robots.txt returned something other than a clean 404/200 (e.g. blocked) — surface it rather than staying silent.
-    add("robots.txt not reachable", `robots.txt returned HTTP ${evidence.robots.status} instead of a normal 200 or 404.`, "An unusual robots.txt response can indicate broader access or hosting issues worth confirming.", evidence.robots.url || "robots.txt");
-  }
-  if (evidence.sitemap && !evidence.sitemap.found && probeSucceeded(evidence)) {
-    add("no sitemap.xml", "No sitemap.xml was found at the expected path.", "Search engines may take longer to discover and index new or updated pages.");
+
+  if (evidence.externalServiceLinks.length) {
+    add(
+      "domain authority fragmentation",
+      `The website sends visitors to separate service domains including ${evidence.externalServiceLinks.slice(0, 3).join(", ")}.`,
+      "The business experience is split across multiple destinations."
+    );
   }
 
-  return makeFallbackMiniReport(record, evidence, issues, track);
-}
-
-function probeSucceeded(evidence) {
-  // Only treat a missing sitemap as a finding when the site itself was reachable,
-  // so we don't pile on extra "issues" when the whole domain is already unreachable.
-  return evidence.websiteHtmlConfirmed !== false;
-}
-
-function makeFallbackMiniReport(record, evidence, issues, track) {
-  const isGmb = track === "gmb";
-  let workingWell = "";
-
-  if (!issues.length && isGmb) {
-    const rating = numberOrNull(evidence.rating);
-    const reviews = numberOrNull(evidence.reviewCount);
-    if (rating !== null && reviews !== null) {
-      workingWell = `${evidence.siteName || record.lead?.business || "The business"} has a verified Google rating of ${rating} from ${reviews} reviews.`;
-    } else if (normalize(evidence.businessStatus) === "operational") {
-      workingWell = "Google Places confirms the business profile is operational.";
-    }
+  if (evidence.titleLength > 60) {
+    add(
+      "title tag exceeds SERP display limit",
+      `The homepage title contains ${evidence.titleLength} characters.`,
+      "Important wording may be cut off before searchers see it."
+    );
   }
 
-  if (!issues.length && !isGmb) {
-    if (evidence.pageSpeed?.mobile?.status === "confirmed" && Number(evidence.pageSpeed.mobile.performance) >= 50) {
-      workingWell = `Google PageSpeed measured mobile performance at ${evidence.pageSpeed.mobile.performance}/100.`;
-    } else if (evidence.websiteHtmlConfirmed !== false && evidence.metaDescription) {
-      workingWell = "The reviewed homepage has a verified meta description in place.";
-    } else if (evidence.websiteHtmlConfirmed !== false && (evidence.hasBooking || evidence.hasChat)) {
-      workingWell = "The reviewed website provides a verified direct booking or chat conversion path.";
-    } else if (evidence.websiteHtmlConfirmed === false) {
-      workingWell = `Direct homepage inspection was not confirmed (${clean(evidence.websiteFetchError) || "website access was blocked"}). Only independently verified evidence is shown; remaining website fields are Not confirmed — verify on call.`;
-    }
+  if (!evidence.metaDescription) {
+    add(
+      "missing meta description",
+      "The reviewed homepage does not provide a meta description.",
+      "Searchers may see an unclear or inconsistent preview."
+    );
+  }
+
+  if (!evidence.hasBooking) {
+    add(
+      "no online booking mechanism detected",
+      "No public online booking or scheduling link was detected on the reviewed homepage.",
+      "Ready prospects may have to wait for someone to respond."
+    );
+  }
+
+  if (!evidence.hasChat) {
+    add(
+      "no after-hours capture mechanism",
+      "No live chat or AI assistant was detected on the reviewed homepage.",
+      "Visitors outside business hours may leave without making contact."
+    );
+  }
+
+  if (!evidence.hasStructuredReviews && evidence.testimonialCount <= 1) {
+    add(
+      "no structured review system",
+      "No structured review display and no substantial testimonial section were detected on the reviewed homepage.",
+      "New visitors receive limited proof before deciding to enquire."
+    );
+  }
+
+  if (evidence.hasFax) {
+    add(
+      "outdated contact channel listed",
+      "A fax contact method is publicly listed on the reviewed website.",
+      "The contact experience can feel dated to prospective customers."
+    );
+  }
+
+  if (evidence.hasContactForm && !evidence.hasBooking && !evidence.hasChat) {
+    add(
+      "static contact form dependency",
+      "The primary detected conversion path is a static contact form without booking or live assistance.",
+      "High-intent visitors cannot complete the next step immediately."
+    );
+  }
+
+  if (!evidence.hasPhoneLink && evidence.phone) {
+    add(
+      "phone number is not click-to-call",
+      "A phone number is available, but no clickable telephone link was detected on the homepage.",
+      "Mobile visitors face extra effort before they can call."
+    );
+  }
+
+  if (!evidence.hasEmailLink && evidence.email) {
+    add(
+      "email address is not click-to-email",
+      "An email address is available, but no clickable email link was detected on the homepage.",
+      "Visitors face extra friction when trying to contact the business."
+    );
   }
 
   return {
-    track,
-    title: `${isGmb ? "GMB" : "Website"} Mini Audit`,
-    score10: 0,
-    score: 0,
-    grade: "",
-    currentStanding: "",
-    hook: issues[0]?.finding || "",
-    suggestedOpener: "",
-    noMajorIssues: !issues.length && Boolean(workingWell),
-    workingWell,
-    verificationRequired: Boolean(evidence.verificationRequired),
-    notYetAssessed: Array.isArray(evidence.notYetAssessed)
-      ? evidence.notYetAssessed.slice(0, 12)
-      : [],
     header: {
       confidentiality: "INTERNAL - SALES TEAM USE ONLY - DO NOT SEND TO CLIENT",
-      brandLine: `${record.brand.name.toUpperCase()} · ${isGmb ? "GMB" : "WEBSITE"} MINI AUDIT · ${new Date().toISOString().slice(0, 10)}`,
-      title: `${evidence.siteName || record.lead?.business || "Business"} - ${isGmb ? "GMB" : "Website"} Mini Audit`,
-      subtitle: "One screen. Everything you need before you dial.",
+      brandLine: `${record.brand.name.toUpperCase()} · MINI AUDIT REPORT · ${new Date()
+        .toISOString()
+        .slice(0, 10)}`,
+      title: `${evidence.siteName} - Mini Audit`,
+      subtitle: "One page. Everything you need before you dial.",
     },
     snapshot: {
-      businessName: evidence.siteName || record.lead?.business || record.lead?.name,
-      phone: evidence.phone || "Not confirmed — verify on call",
-      email: evidence.email || "Not confirmed — verify on call",
-      website: evidence.website || evidence.domain || record.website || "Not confirmed — verify on call",
-      platform: isGmb ? "Google Business Profile" : (evidence.platform || "Not confirmed — verify on call"),
-      decisionMaker: evidence.decisionMaker || "Not confirmed — verify on call",
-      businessHours: evidence.businessHours || "Not confirmed — verify on call",
-      whatTheyDo: evidence.description || "Not confirmed — verify on call",
-      category: evidence.category || record.niche || "",
-      address: evidence.googleAddress || record.location || "",
-      rating: numberOrNull(evidence.rating),
-      reviewCount: numberOrNull(evidence.reviewCount),
-      mobilePageSpeed: numberOrNull(evidence.pageSpeed?.mobile?.performance),
+      businessName: evidence.siteName,
+      phone: evidence.phone || "Not publicly listed - verify on call",
+      email: evidence.email || "Not publicly listed - verify on call",
+      website: evidence.domain,
+      platform: evidence.platform || "Not identifiable from public source",
+      decisionMaker:
+        evidence.decisionMaker || "Not publicly identified - verify on call",
+      businessHours:
+        evidence.businessHours || "Not publicly listed - verify on call",
+      whatTheyDo: evidence.description,
     },
-    issues: issues.slice(0, 5),
-    footer: `INTERNAL USE ONLY. ${isGmb ? "GMB" : "Website"} findings only; verify time-sensitive public details before the call.`,
+    salesFit: buildFallbackSalesFit(record, evidence, issues),
+    issues: issues.slice(0, 10),
+    footer: `INTERNAL USE ONLY. Do not forward this document to the client. Findings sourced from ${evidence.domain} public page source and public directories, ${new Date()
+      .toISOString()
+      .slice(0, 10)}. Send the Client Audit Report (technical, no recommendations) after the call. ${record.brand.name} - ${record.brand.website || "workspace"}`,
   };
 }
 
@@ -2317,34 +1041,8 @@ function sanitizeLead(input = {}) {
     phone: clean(input.phone),
     address: clean(input.address),
     category: clean(input.category),
-    placeId: clean(input.placeId || input.googlePlaceId),
-    gmbProfileUrl: clean(input.gmbProfileUrl || input.googleMapsUri || input.googleMapsUrl),
+    placeId: clean(input.placeId),
     qualityScore: Number(input.qualityScore || input.confidence || 0),
-    dailyNiche: clean(input.dailyNiche || input.niche),
-    dailyLocation: clean(input.dailyLocation || input.location),
-    dailyResourceType: normalizeResourceType(
-      input.dailyResourceType ||
-        input.resourceType ||
-        inferResourceType(
-          input.dailyLocation ||
-            input.location ||
-            input.address ||
-            "",
-          input.dailyRegionCode ||
-            input.regionCode ||
-            ""
-        )
-    ),
-    dailyCountry: clean(
-      input.dailyCountry ||
-        input.country ||
-        ""
-    ),
-    dailyRegionCode: clean(
-      input.dailyRegionCode ||
-        input.regionCode ||
-        ""
-    ).toUpperCase(),
   };
 }
 
@@ -2360,34 +1058,12 @@ function publicReport(record, { includeEvidence = false } = {}) {
     expiresAt: record.expiresAt,
     status: record.status,
     kind: record.kind,
-    campaignType: record.campaignType || normalizeCampaignType(record.kind),
-    track: record.campaignType || normalizeCampaignType(record.kind),
-    auditType: record.auditType || "",
-    campaignId: record.campaignId || "",
-    leadId: record.leadId || record.lead?.id || "",
     website: record.website,
     lead: record.lead,
     niche: record.niche,
     location: record.location,
-    resourceType:
-      record.resourceType ||
-      "international",
-    country: record.country || "",
-    regionCode:
-      record.regionCode || "",
-    template: {
-      id:
-        record.templateId ||
-        "default",
-      version:
-        Number(
-          record.templateVersion || 0
-        ),
-      name:
-        record.templateName ||
-        "Default audit format",
-    },
     brand: record.brand,
+    auditProfile: record.auditProfile || null,
     report: record.report,
     provider: record.provider,
     error: record.error,
@@ -2395,43 +1071,145 @@ function publicReport(record, { includeEvidence = false } = {}) {
   };
 }
 
-function reportCacheKey(
-  workspaceId,
-  website,
-  kind,
-  templateKey = "default",
-  campaignType = "website"
-) {
+function reportCacheKey(workspaceId, website, kind, profileHash = "") {
   return crypto
     .createHash("sha256")
-    .update(
-      `${workspaceId}|${normalizeCampaignType(campaignType)}|${kind}|${website}|${templateKey}`
-    )
+    .update(`${workspaceId}|${kind}|${website}|${profileHash}`)
     .digest("hex");
 }
 
-async function safeFetch(value, timeoutMs = FETCH_TIMEOUT_MS) {
+function auditProfileHash(profile = {}) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(normalizeAuditProfile(profile)))
+    .digest("hex")
+    .slice(0, 20);
+}
+
+function normalizeAuditProfile(value = {}) {
+  const criteria = value.criteria && typeof value.criteria === "object"
+    ? value.criteria
+    : {};
+
+  return {
+    businessNiche: clean(value.businessNiche).slice(0, 180),
+    idealCustomer: clean(value.idealCustomer).slice(0, 600),
+    offer: clean(value.offer).slice(0, 800),
+    targetMarket: clean(value.targetMarket).slice(0, 240),
+    pitchGoal: clean(value.pitchGoal).slice(0, 600),
+    customInstructions: clean(value.customInstructions).slice(0, 1600),
+    criteria: {
+      nicheFit: criteria.nicheFit !== false,
+      offerRelevance: criteria.offerRelevance !== false,
+      websiteConversion: criteria.websiteConversion !== false,
+      bookingFriction: criteria.bookingFriction !== false,
+      localVisibility: criteria.localVisibility !== false,
+      reviewsTrust: criteria.reviewsTrust !== false,
+      performance: criteria.performance !== false,
+      followUpOpportunity: criteria.followUpOpportunity !== false,
+      competitorGaps: criteria.competitorGaps !== false,
+    },
+  };
+}
+
+function normalizeSalesFit(value = {}, record, issues = [], evidence = {}) {
+  const fallback = buildFallbackSalesFit(record, evidence, issues);
+  const score = Number(value?.fitScore ?? value?.score);
+
+  return {
+    fitScore: Number.isFinite(score)
+      ? clamp(score, 0, 100)
+      : fallback.fitScore,
+    alignment: clean(value?.alignment) || fallback.alignment,
+    summary: clean(value?.summary) || fallback.summary,
+    likelyNeeds: toStringArray(value?.likelyNeeds, 8).length
+      ? toStringArray(value?.likelyNeeds, 8)
+      : fallback.likelyNeeds,
+    pitchAngles: toStringArray(value?.pitchAngles, 8).length
+      ? toStringArray(value?.pitchAngles, 8)
+      : fallback.pitchAngles,
+    suggestedOpener:
+      oneSentence(value?.suggestedOpener) || fallback.suggestedOpener,
+    caution:
+      clean(value?.caution) ||
+      "Commercial fit is based on public evidence and workspace targeting context; it is not proof of prospect interest or buying intent.",
+  };
+}
+
+function buildFallbackSalesFit(record, evidence = {}, issues = []) {
+  const profile = normalizeAuditProfile(record?.auditProfile || {});
+  const issueList = Array.isArray(issues) ? issues : [];
+  const businessNiche = normalize(profile.businessNiche);
+  const leadNiche = normalize(record?.niche || record?.lead?.category);
+  const nicheAligned =
+    Boolean(businessNiche && leadNiche) &&
+    (businessNiche.includes(leadNiche) || leadNiche.includes(businessNiche));
+  const hasOffer = Boolean(profile.offer);
+  const evidenceDepth = Math.min(10, issueList.length);
+  const score = clamp(
+    40 +
+      (nicheAligned ? 20 : 0) +
+      (hasOffer ? 10 : 0) +
+      Math.min(20, evidenceDepth * 2),
+    0,
+    100
+  );
+  const likelyNeeds = issueList
+    .map((item) => clean(item?.pain || item?.businessImpact))
+    .filter(Boolean)
+    .slice(0, 5);
+  const pitchAngles = issueList
+    .map((item) => {
+      const finding = clean(item?.finding || item?.evidence);
+      if (!finding) return "";
+      return profile.offer
+        ? `${finding} Connect the conversation to ${profile.offer} only if the prospect confirms this is a real priority.`
+        : finding;
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+  const firstFinding = clean(
+    issueList.find((item) => item?.finding || item?.evidence)?.finding ||
+      issueList.find((item) => item?.finding || item?.evidence)?.evidence
+  );
+  const business = clean(record?.lead?.business || record?.lead?.name || evidence?.siteName || "the business");
+
+  return {
+    fitScore: score,
+    alignment: nicheAligned
+      ? `Strong niche alignment with ${profile.businessNiche || record?.niche || "the workspace target"}`
+      : profile.businessNiche
+        ? `Potential fit to review against ${profile.businessNiche}`
+        : "Commercial fit requires workspace targeting context",
+    summary: hasOffer
+      ? `Verified public findings can be compared with the configured offer: ${profile.offer}.`
+      : "Verified public findings are ready for a specific sales conversation.",
+    likelyNeeds,
+    pitchAngles,
+    suggestedOpener: firstFinding
+      ? `I was looking at ${business} and noticed ${lowerFirst(firstFinding)} I wanted to ask how you are handling that today.`
+      : `I wanted to ask how ${business} is currently handling lead conversion and follow-up.`,
+    caution:
+      "Commercial fit is based on public evidence and workspace targeting context; it is not proof of prospect interest or buying intent.",
+  };
+}
+
+function lowerFirst(value) {
+  const text = clean(value);
+  return text ? `${text.charAt(0).toLowerCase()}${text.slice(1)}` : "";
+}
+
+async function safeFetch(value) {
   let current = await validatePublicUrl(value);
 
   for (let redirectCount = 0; redirectCount <= 4; redirectCount += 1) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let resolvedIp = "";
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     try {
-      const lookup = await dns.lookup(current.hostname);
-      resolvedIp = lookup?.address || "";
-      if (resolvedIp && isPrivateIp(resolvedIp)) {
-        throw createError(400, "The website resolves to a private or unsupported address.");
-      }
-
       const response = await fetch(current, {
         method: "GET",
         redirect: "manual",
-        // Pin the connection to the address we just validated so DNS cannot be
-        // repointed to a private/internal address between the check and the
-        // actual request (DNS-rebinding protection). Falls back to normal
-        // resolution if the runtime fetch implementation ignores `dispatcher`.
         headers: {
           "user-agent": "ReachFlyAuditBot/2.0 (+public website audit)",
           accept: "text/html,application/xhtml+xml",
@@ -2715,43 +1493,9 @@ function renderAuditPdf(audit) {
   const brand = audit.brand?.name || "ReachFly.Ai";
   const report = audit.report || {};
 
-  const track = normalizeCampaignType(audit.campaignType || audit.track || audit.kind);
-  pdf.header(brand, `${track.toUpperCase()} ${audit.kind.toUpperCase()} AUDIT REPORT`, audit.website || audit.lead?.gmbProfileUrl || audit.lead?.googleMapsUri || "");
+  pdf.header(brand, `${audit.kind.toUpperCase()} AUDIT REPORT`, audit.website);
 
-  if (["website", "gmb"].includes(audit.kind)) {
-    pdf.heading(
-      report.title ||
-        (audit.kind === "gmb" ? "GMB / Local Visibility Audit" : "Website / Technology Audit"),
-      19
-    );
-    pdf.paragraph(report.summary || "");
-    if (Number.isFinite(Number(report.score))) {
-      pdf.score(Number(report.score || 0));
-    }
-    if (audit.kind === "gmb") {
-      pdf.keyValue("Profile status", report.profileStatus || "Not verified");
-      pdf.keyValue("Local visibility", report.localVisibility || "Not verified");
-    }
-    pdf.section("VERIFIED FINDINGS");
-    (report.findings || []).forEach((item, index) => {
-      pdf.subheading(`${index + 1}. ${item.title || "Finding"} [${String(item.severity || "medium").toUpperCase()}]`);
-      pdf.keyValue("Evidence", item.evidence);
-      pdf.keyValue("Business impact", item.businessImpact);
-      if (item.approvedSalesWording) {
-        pdf.keyValue("Approved sales wording", item.approvedSalesWording);
-      }
-      if (item.source) pdf.muted(item.source);
-    });
-    if (report.approvedOpeningLine) {
-      pdf.section("APPROVED OPENING LINE");
-      pdf.paragraph(report.approvedOpeningLine);
-    }
-    if (report.suggestedNextStep) {
-      pdf.section("SUGGESTED NEXT STEP");
-      pdf.paragraph(report.suggestedNextStep);
-    }
-    pdf.footerNote(report.disclaimer || "Public-source caller audit.");
-  } else  if (audit.kind === "mini") {
+  if (audit.kind === "mini") {
     pdf.heading(report.header?.title || "Mini Audit", 18);
     pdf.muted(report.header?.subtitle || "One page. Everything you need before you dial.");
     pdf.section("BUSINESS SNAPSHOT");
@@ -2789,7 +1533,7 @@ function renderAuditPdf(audit) {
     pdf.bullets(report.salesTalkingPoints || []);
     pdf.footerNote(report.disclaimer || "Public-source competitor analysis.");
   } else {
-    pdf.heading(report.title || `${track === "gmb" ? "GMB" : "Website"} Full Audit`, 19);
+    pdf.heading(report.title || "Full Website Audit", 19);
     pdf.paragraph(report.executiveSummary);
     pdf.score(Number(report.score || 0));
     pdf.section("STRENGTHS");
@@ -3141,30 +1885,8 @@ function isLikelyEmail(value) {
 }
 
 function normalizeKind(value) {
-  const kind = normalize(value || "mini").replace(/ /g, "_");
-  const aliases = {
-    website: "website",
-    website_audit: "website",
-    technology: "website",
-    technology_audit: "website",
-    tech: "website",
-    gmb: "gmb",
-    gmb_audit: "gmb",
-    google_business_profile: "gmb",
-    local_visibility: "gmb",
-    mini: "mini",
-    mini_audit: "mini",
-    competitor: "competitor",
-    competitor_analysis: "competitor",
-    full: "full",
-    full_audit: "full",
-  };
-  return aliases[kind] || "mini";
-}
-
-function normalizeCampaignType(value) {
-  const kind = normalizeKind(value);
-  return kind === "gmb" ? "gmb" : "website";
+  const kind = normalize(value || "mini");
+  return ["mini", "competitor", "full"].includes(kind) ? kind : "mini";
 }
 
 function normalizePageHref(value, base = "") {
@@ -3248,8 +1970,8 @@ function toPdfText(value) {
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[–—]/g, "-")
-    .replace(/[""]/g, '"')
-    .replace(/['']/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
     .replace(/[^\x20-\x7E\xA0-\xFF]/g, "?");
 }
 

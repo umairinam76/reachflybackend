@@ -85,6 +85,13 @@ export function createOperationsService({ store, workspaceService, emit = () => 
       );
     }
 
+    const direction = normalizeDirection(options.direction);
+    if (direction) {
+      records = records.filter(
+        (item) => normalizeDirection(item.direction) === direction
+      );
+    }
+
     const search = clean(options.search).toLowerCase();
     if (search) {
       records = records.filter((item) =>
@@ -324,6 +331,7 @@ export function createOperationsService({ store, workspaceService, emit = () => 
       status: "confirmed",
       source: booking.provider || "google-calendar",
       channel: "voice",
+      direction: normalizeDirection(call.direction) || "outbound",
       campaignId: call.campaignId,
       leadId: call.leadId,
       callId: call.id,
@@ -411,6 +419,7 @@ function connectionActivityToOperation(activity = {}, call = {}) {
     status: "confirmed",
     source: "google-calendar",
     channel: "voice",
+    direction: normalizeDirection(call?.direction) || "outbound",
     campaignId: clean(call?.campaignId),
     leadId: clean(call?.leadId),
     callId: clean(activity.callId || call?.id),
@@ -443,6 +452,7 @@ function meetingToOperation(meeting = {}) {
     status: normalizeStatus(meeting.status || "confirmed"),
     source: clean(meeting.source || "reachfly-ai-voice"),
     channel: clean(meeting.channel || "voice"),
+    direction: normalizeDirection(meeting.direction) || "outbound",
     campaignId: clean(meeting.campaignId),
     leadId: clean(meeting.leadId),
     callId: clean(meeting.callId),
@@ -472,6 +482,7 @@ function normalizeRecord(value = {}) {
     status: normalizeStatus(value.status || "confirmed"),
     source: clean(value.source || "reachfly"),
     channel: clean(value.channel || "workspace"),
+    direction: normalizeDirection(value.direction),
     campaignId: clean(value.campaignId),
     leadId: clean(value.leadId),
     callId: clean(value.callId),
@@ -494,6 +505,12 @@ function findWorkspace(state, workspaceId) {
     state.workspaceSettings?.[workspaceId] ||
     null
   );
+}
+
+
+function normalizeDirection(value) {
+  const direction = normalizeStatus(value);
+  return ["inbound", "outbound"].includes(direction) ? direction : "";
 }
 
 function normalizeDate(value) {
