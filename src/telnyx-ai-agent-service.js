@@ -1136,7 +1136,7 @@ export function createTelnyxAIAgentService({
       addActivity(draft, {
         workspaceId: ctx.workspaceId,
         type: "website_analyzed",
-        title: "Company website analyzed with Claude",
+        title: "Company website analyzed with ReachFly AI",
         detail: `${crawl.pages.length} page${crawl.pages.length === 1 ? "" : "s"} analyzed from ${normalizedUrl.hostname}.`,
         actorId: user.id,
         createdAt: now,
@@ -1685,17 +1685,27 @@ export function createTelnyxAIAgentService({
     ) || null;
   }
 
-  function inboundOpeningMessage(agent) {
+  function inboundOpeningMessage(agent, language = "") {
     const company = clean(agent?.companyName) || "our team";
     const name =
       clean(agent?.spokenName) ||
       clean(agent?.name) ||
       "ReachFly";
-    const configured = clean(agent?.inboundGreeting);
+    const resolvedLanguage = normalizeAgentLanguage(
+      language || agent?.primaryLanguage || "en"
+    );
+    const configured = resolveLanguageOpening(
+      agent,
+      resolvedLanguage,
+      "inbound"
+    );
     return configured
       ? renderRuntimeMessage(configured, {
           company_name: company,
           agent_name: name,
+          language: resolvedLanguage,
+          greeting_name: "there",
+          first_name: "",
         })
       : `Thanks for calling ${company}. I'm ${name}, the team's AI phone assistant. How can I help?`;
   }
@@ -1832,6 +1842,33 @@ export function createTelnyxAIAgentService({
       eventType: "elevenlabs.inbound-initiated",
     });
 
+    const inboundLanguage = normalizeAgentLanguage(
+      payload.language ||
+        payload.language_code ||
+        payload.detected_language ||
+        agent.primaryLanguage ||
+        "en"
+    );
+    const inboundHistory = buildPreviousCallerInteractions({
+      state,
+      workspaceId: agent.workspaceId,
+      phone: callerNumber,
+      excludeCallId: storedCall.id,
+    });
+    const businessMemory = buildBusinessMemoryContext(agent);
+    const inboundPrivateContext = [
+      clean(agent.inboundInstructions)
+        ? `INBOUND WORKFLOW: ${clean(agent.inboundInstructions)}`
+        : "",
+      businessMemory,
+      inboundHistory.length
+        ? `PREVIOUS CALLER INTERACTIONS: ${JSON.stringify(inboundHistory)}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+      .slice(0, 12000);
+
     return {
       type: "conversation_initiation_client_data",
       user_id: callerNumber || storedCall.id,
@@ -1852,16 +1889,24 @@ export function createTelnyxAIAgentService({
         campaign: "Inbound",
         crm_notes_history: "",
         pain_points: "",
-        previous_interactions: "",
+        previous_interactions: JSON.stringify(inboundHistory).slice(0, 6000),
         available_meeting_slots: "",
+        primary_language: normalizeAgentLanguage(agent.primaryLanguage || "en"),
+        supported_languages: normalizeSupportedLanguages(
+          agent.supportedLanguages,
+          agent.primaryLanguage
+        ).join(","),
+        active_language: inboundLanguage,
+        business_timezone: clean(agent.businessTimezone || agent.bookingTimezone),
+        business_hours: formatBusinessHours(agent),
         private_context:
-          clean(agent.inboundInstructions) ||
+          inboundPrivateContext ||
           "Handle this inbound caller according to the configured ReachFly inbound workflow.",
         calendly_url: clean(
           process.env.REACHFLY_AI_AGENT_CALENDLY_URL ||
             process.env.CALENDLY_BOOKING_URL
         ),
-        reachfly_opening_message: inboundOpeningMessage(agent),
+        reachfly_opening_message: inboundOpeningMessage(agent, inboundLanguage),
       },
     };
   }
@@ -1901,7 +1946,7 @@ export function createTelnyxAIAgentService({
     if (config.websiteUrl && !config.websiteIntelligence?.analyzedAt) {
       throw httpError(
         422,
-        "Analyze the website with Claude before saving the voice agent."
+        "Analyze the website before saving the voice agent so ReachFly AI has verified business context."
       );
     }
     if (!config.complianceConfirmed) {
@@ -2225,7 +2270,7 @@ export function createTelnyxAIAgentService({
         workspaceId: ctx.workspaceId,
         type: "agent_saved",
         title: existing ? "Voice agent updated" : "Voice agent created",
-        detail: `${agent.name} is linked to ElevenAgent ${elevenLabsAgentId} over Telnyx SIP.`,
+        detail: `${agent.name} is configured and ready on the ReachFly managed voice network.`,
         actorId: user.id,
         createdAt: now,
       });
@@ -6490,6 +6535,18 @@ export function createTelnyxAIAgentService({
       "Never claim, imply, or role-play that you are a human employee. If the caller asks whether you are AI, answer directly and briefly.",
       `Configured calling mode: ${normalizeCallingMode(config.callingMode)}.`,
 
+      `# Language`,
+      `Primary language: ${normalizeAgentLanguage(config.primaryLanguage || "en")}. Supported languages: ${normalizeSupportedLanguages(config.supportedLanguages, config.primaryLanguage).join(", ")}.`,
+      config.autoDetectLanguage !== false
+        ? "If the caller clearly speaks one of the supported languages, naturally continue in that language. Do not switch to an unsupported language."
+        : `Stay in the configured primary language (${normalizeAgentLanguage(config.primaryLanguage || "en")}) unless the workflow explicitly instructs otherwise.`,
+
+      `# Business brain`,
+      compactPromptText(buildBusinessMemoryContext(config), 4000),
+      clean(config.systemPrompt)
+        ? `Business-authored system instructions (follow them when they do not conflict with ReachFly safety, privacy, compliance, tool, or workspace rules): ${compactPromptText(config.systemPrompt, 4000)}`
+        : "",
+
       `# Direction rules`,
       "If {{call_direction}} is inbound: the person called the business. Help first. Understand why they called, capture only necessary details, answer using business context, qualify when relevant, book only confirmed appointments, and transfer or create a follow-up when the configured workflow requires it.",
       "If {{call_direction}} is outbound: you called the prospect. Keep the opening brief, use the disclosure, diagnose the business problem before pitching, respect calling/suppression rules, and work toward the campaign outcome.",
@@ -6579,6 +6636,9 @@ export function createTelnyxAIAgentService({
       "Never narrate tool mechanics or internal reasoning.",
 
       `# Ending`,
+      clean(config.closingMessage)
+        ? `Preferred closing line when appropriate: ${clean(config.closingMessage)}`
+        : "",
       "End the call when the prospect clearly says goodbye, declines, requests do-not-call, a confirmed next step is complete, or telephony fails.",
       "Do not end merely because of silence or latency.",
       "Keep the final line short and natural.",
@@ -6614,6 +6674,13 @@ export function createTelnyxAIAgentService({
       ...(Array.isArray(agent?.availableMeetingSlots) ? agent.availableMeetingSlots : []),
     ].filter(Boolean).slice(0, 20);
     const agentContext = clean(agent?.agentContext).slice(0, 12_000);
+    const businessMemory = buildBusinessMemoryContext(agent).slice(0, 12_000);
+    const previousCallHistory = buildPreviousCallerInteractions({
+      state,
+      workspaceId: queueItem?.workspaceId || campaign?.workspaceId || lead?.workspaceId || agent?.workspaceId,
+      phone: custom.phone || lead?.phone || queueItem?.phone,
+      leadId: lead?.id || lead?._id || queueItem?.leadId,
+    });
     const campaignContext = clean(
       queueItem?.campaignContext ||
         campaign?.voiceContext ||
@@ -6647,16 +6714,21 @@ export function createTelnyxAIAgentService({
       timezone: clean(queueItem?.timezone || lead?.timezone || lead?.timeZone || agent?.defaultLeadTimezone) || DEFAULT_LEAD_TIMEZONE,
       crmNotesHistory: notes.join(" | ").slice(0, 5000),
       painPoints,
-      previousInteractions: history,
+      previousInteractions: [...history, ...previousCallHistory].slice(0, 24),
       availableMeetingSlots: slots,
       agentContext,
+      businessMemory,
       campaignContext,
       leadContext,
       auditContext,
       auditReportId: clean(auditReport?.id),
       contextVersion: Number(queueItem?.contextVersion || 1),
       privateContext: [
+        businessMemory ? businessMemory : "",
         agentContext ? `AGENT CONTEXT: ${agentContext}` : "",
+        previousCallHistory.length
+          ? `PREVIOUS CALL MEMORY: ${JSON.stringify(previousCallHistory)}`
+          : "",
         campaignContext ? `CAMPAIGN CONTEXT: ${campaignContext}` : "",
         leadContext ? `LEAD CONTEXT: ${leadContext}` : "",
         auditContext ? auditContext : "",
@@ -6673,14 +6745,21 @@ export function createTelnyxAIAgentService({
       findWorkspaceAgent(store.read(), call.workspaceId, call.agentId) ||
       findWorkspaceAgent(store.read(), call.workspaceId) ||
       {};
+    const activeLanguage = normalizeAgentLanguage(
+      call.language || runtimeAgent.primaryLanguage || "en"
+    );
     const outboundOpening = renderRuntimeMessage(
       resolveAssistantGreetingTemplate(
-        call.agentGreeting || runtimeAgent.greeting || "",
+        resolveLanguageOpening(runtimeAgent, activeLanguage, "outbound") ||
+          call.agentGreeting ||
+          runtimeAgent.greeting ||
+          "",
         runtimeAgent
       ),
       {
         greeting_name: clean(value.firstName) || "there",
         first_name: clean(value.firstName) || "there",
+        lead_name: clean(value.fullName) || clean(value.firstName) || "there",
         company_name:
           clean(
             runtimeAgent.companyName
@@ -6689,6 +6768,7 @@ export function createTelnyxAIAgentService({
           clean(
             runtimeAgent.spokenName || runtimeAgent.name
           ) || "ReachFly",
+        language: activeLanguage,
       }
     );
 
@@ -6713,6 +6793,14 @@ export function createTelnyxAIAgentService({
       campaign: clean(value.campaign),
       pain_points: JSON.stringify(value.painPoints || []).slice(0, 4000),
       previous_interactions: JSON.stringify(value.previousInteractions || []).slice(0, 6000),
+      primary_language: normalizeAgentLanguage(runtimeAgent.primaryLanguage || "en"),
+      supported_languages: normalizeSupportedLanguages(
+        runtimeAgent.supportedLanguages,
+        runtimeAgent.primaryLanguage
+      ).join(","),
+      active_language: activeLanguage,
+      business_timezone: clean(runtimeAgent.businessTimezone || runtimeAgent.bookingTimezone),
+      business_hours: formatBusinessHours(runtimeAgent),
       timezone: clean(value.timezone) || DEFAULT_LEAD_TIMEZONE,
       available_meeting_slots: JSON.stringify(value.availableMeetingSlots || []).slice(0, 4000),
       private_context: clean(value.privateContext).slice(0, 8000),
@@ -7905,6 +7993,152 @@ function isUsefulWebsitePath(pathname) {
   return true;
 }
 
+function normalizeAgentLanguage(value) {
+  const raw = clean(value).toLowerCase().replace(/_/g, "-");
+  if (!raw) return "en";
+  const base = raw.split("-")[0];
+  const supported = new Set([
+    "en", "es", "fr", "de", "pt", "it", "nl", "ar", "hi", "ur",
+    "zh", "ja", "ko", "ru", "tr", "pl", "id", "vi", "uk",
+  ]);
+  return supported.has(base) ? base : "en";
+}
+
+function normalizeSupportedLanguages(value, primaryValue = "en") {
+  const primary = normalizeAgentLanguage(primaryValue);
+  const source = Array.isArray(value)
+    ? value
+    : clean(value)
+      ? clean(value).split(/[,\s]+/)
+      : [];
+  return uniqueStrings([
+    primary,
+    ...source.map((item) => normalizeAgentLanguage(item)),
+  ]).slice(0, 20);
+}
+
+function normalizeLanguageMap(value, maxLength = 3000) {
+  const source = safeObject(value);
+  const result = {};
+  for (const [key, rawValue] of Object.entries(source)) {
+    const language = normalizeAgentLanguage(key);
+    const text = clean(rawValue).slice(0, maxLength);
+    if (text) result[language] = text;
+  }
+  return result;
+}
+
+function normalizeBusinessHours(value) {
+  const source = safeObject(value);
+  const result = {};
+  const days = [
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  ];
+
+  for (const day of days) {
+    const raw = source[day] ?? source[day.slice(0, 3)];
+    if (raw === undefined || raw === null || raw === "") continue;
+    if (raw === false) {
+      result[day] = { closed: true, open: "", close: "" };
+      continue;
+    }
+    if (typeof raw === "string") {
+      const text = clean(raw).slice(0, 120);
+      if (text) result[day] = text;
+      continue;
+    }
+    const item = safeObject(raw);
+    const closed = item.closed === true || item.enabled === false;
+    result[day] = {
+      closed,
+      open: closed ? "" : clean(item.open || item.start || item.from).slice(0, 12),
+      close: closed ? "" : clean(item.close || item.end || item.to).slice(0, 12),
+    };
+  }
+  return result;
+}
+
+function formatBusinessHours(agent = {}) {
+  const source = safeObject(agent.businessHours);
+  const dayLabels = {
+    monday: "Mon", tuesday: "Tue", wednesday: "Wed", thursday: "Thu",
+    friday: "Fri", saturday: "Sat", sunday: "Sun",
+  };
+  const rows = Object.entries(dayLabels)
+    .map(([day, label]) => {
+      const raw = source[day];
+      if (!raw) return "";
+      if (typeof raw === "string") return `${label}: ${clean(raw)}`;
+      const item = safeObject(raw);
+      if (item.closed === true) return `${label}: closed`;
+      const open = clean(item.open);
+      const close = clean(item.close);
+      return open || close ? `${label}: ${open || "?"}-${close || "?"}` : "";
+    })
+    .filter(Boolean);
+
+  if (rows.length) return rows.join("; ").slice(0, 1200);
+  const start = Number(agent.inboundBusinessHoursStart);
+  const end = Number(agent.inboundBusinessHoursEnd);
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    return `Daily ${String(start).padStart(2, "0")}:00-${String(end).padStart(2, "0")}:00`;
+  }
+  return "";
+}
+
+function resolveLanguageOpening(agent = {}, language = "en", direction = "outbound") {
+  const normalizedLanguage = normalizeAgentLanguage(language || agent.primaryLanguage || "en");
+  const languageGreetings = normalizeLanguageMap(agent.languageGreetings, 3000);
+  const localized = clean(languageGreetings[normalizedLanguage]);
+  if (localized) return localized;
+  if (direction === "inbound") {
+    return clean(agent.inboundGreeting || agent.greeting);
+  }
+  return clean(agent.greeting || agent.outboundGreeting);
+}
+
+function buildBusinessMemoryContext(agent = {}) {
+  const knowledge = clean(agent.businessKnowledge).slice(0, 12000);
+  const hours = formatBusinessHours(agent);
+  const timezone = clean(agent.businessTimezone || agent.bookingTimezone);
+  const parts = [
+    knowledge ? `BUSINESS KNOWLEDGE: ${knowledge}` : "",
+    hours ? `BUSINESS HOURS: ${hours}` : "",
+    timezone ? `BUSINESS TIMEZONE: ${timezone}` : "",
+  ].filter(Boolean);
+  return parts.join("\n").slice(0, 14000);
+}
+
+function buildPreviousCallerInteractions({
+  state,
+  workspaceId,
+  phone = "",
+  leadId = "",
+  excludeCallId = "",
+}) {
+  const normalizedPhone = normalizePhone(phone);
+  const normalizedLeadId = clean(leadId);
+  return (state?.telnyxAiAgentCalls || [])
+    .filter((item) => {
+      if (clean(item?.workspaceId) !== clean(workspaceId)) return false;
+      if (excludeCallId && clean(item?.id) === clean(excludeCallId)) return false;
+      const phoneMatch = normalizedPhone && [item?.callerNumber, item?.toNumber, item?.fromNumber]
+        .map(normalizePhone)
+        .includes(normalizedPhone);
+      const leadMatch = normalizedLeadId && clean(item?.leadId) === normalizedLeadId;
+      return Boolean(phoneMatch || leadMatch);
+    })
+    .sort((a, b) => Date.parse(b?.updatedAt || b?.createdAt || 0) - Date.parse(a?.updatedAt || a?.createdAt || 0))
+    .slice(0, 8)
+    .map((item) => ({
+      direction: clean(item?.direction),
+      status: clean(item?.status),
+      outcome: clean(item?.outcome),
+      summary: clean(item?.summary || item?.notes || item?.disposition).slice(0, 600),
+      createdAt: clean(item?.createdAt || item?.initiatedAt || item?.updatedAt),
+    }));
+}
+
 function normalizeAgentInput({
   input,
   existing,
@@ -7921,6 +8155,68 @@ function normalizeAgentInput({
       normalizeStatus(input.purpose || existing?.purpose || "sales") || "sales",
     agentContext:
       clean(input.agentContext ?? existing?.agentContext).slice(0, 24_000),
+    systemPrompt:
+      clean(
+        input.systemPrompt ??
+          input.systemInstructions ??
+          input.customSystemPrompt ??
+          existing?.systemPrompt
+      ).slice(0, 24_000),
+    businessKnowledge:
+      clean(
+        input.businessKnowledge ??
+          input.businessContext ??
+          input.businessMemory ??
+          existing?.businessKnowledge
+      ).slice(0, 24_000),
+    businessTimezone:
+      clean(
+        input.businessTimezone ??
+          existing?.businessTimezone ??
+          input.bookingTimezone ??
+          existing?.bookingTimezone
+      ) || "America/New_York",
+    businessHours: normalizeBusinessHours(
+      input.businessHours ?? existing?.businessHours
+    ),
+    primaryLanguage: normalizeAgentLanguage(
+      input.primaryLanguage ??
+        input.defaultLanguage ??
+        existing?.primaryLanguage ??
+        "en"
+    ),
+    supportedLanguages: normalizeSupportedLanguages(
+      input.supportedLanguages ?? existing?.supportedLanguages,
+      input.primaryLanguage ??
+        input.defaultLanguage ??
+        existing?.primaryLanguage ??
+        "en"
+    ),
+    autoDetectLanguage:
+      input.autoDetectLanguage !== undefined
+        ? input.autoDetectLanguage !== false
+        : existing?.autoDetectLanguage !== false,
+    languageVoices: normalizeLanguageMap(
+      input.languageVoices ?? existing?.languageVoices,
+      180
+    ),
+    languageGreetings: normalizeLanguageMap(
+      input.languageGreetings ?? existing?.languageGreetings,
+      3000
+    ),
+    closingMessage:
+      clean(
+        input.closingMessage ??
+          input.closingScript ??
+          input.outboundClosing ??
+          existing?.closingMessage
+      ).slice(0, 3000),
+    afterHoursMessage:
+      clean(
+        input.afterHoursMessage ??
+          input.inboundAfterHoursMessage ??
+          existing?.afterHoursMessage
+      ).slice(0, 3000),
     emailConnectionId:
       clean(input.emailConnectionId ?? existing?.emailConnectionId),
     calendarConnectionId:
@@ -7948,7 +8244,13 @@ function normalizeAgentInput({
           process.env.REACHFLY_AI_AGENT_SPOKEN_NAME
       ) || "James",
     greeting:
-      clean(input.greeting || existing?.greeting) ||
+      clean(
+        input.greeting ||
+          input.outboundGreeting ||
+          input.openingMessage ||
+          input.openingScript ||
+          existing?.greeting
+      ) ||
       "Hey {{greeting_name}} — {{agent_name}} from {{company_name}}. Quick heads-up: I’m an AI-powered sales agent for the team, and this call may be recorded. I’ll keep it brief... are you happy with how your website is turning visitors into qualified enquiries, or do you feel some opportunities are slipping through?",
     disclosure:
       clean(input.disclosure || existing?.disclosure) ||
@@ -8019,6 +8321,8 @@ function normalizeAgentInput({
       ) || "general",
     inboundGreeting: clean(
       input.inboundGreeting ||
+        input.inboundOpeningMessage ||
+        input.inboundOpeningScript ||
         existing?.inboundGreeting ||
         "Thanks for calling {{company_name}}. I'm {{agent_name}}, the team's AI phone assistant. How can I help?"
     ),
@@ -8378,7 +8682,7 @@ function buildAssistantPayload({
         : {}),
     },
     transcription: {
-      language: "en",
+      language: normalizeAgentLanguage(config.primaryLanguage || "en"),
       model: "deepgram/flux",
       settings: {
         eager_eot_threshold: eagerEotThreshold,
@@ -8475,6 +8779,11 @@ function buildAssistantInstructions(config) {
     `Your spoken name is ${config.spokenName || config.name}. You are the outbound AI sales assistant for ${config.companyName}.`,
     config.disclosure,
     `Style: ${compactPromptText(config.persona, 360)}`,
+    `Primary language: ${normalizeAgentLanguage(config.primaryLanguage || "en")}. Supported languages: ${normalizeSupportedLanguages(config.supportedLanguages, config.primaryLanguage).join(", ")}. Auto-detect supported language: ${config.autoDetectLanguage !== false ? "yes" : "no"}.`,
+    buildBusinessMemoryContext(config),
+    clean(config.systemPrompt)
+      ? `Business-authored system instructions (subordinate to safety, privacy, compliance and tool rules): ${compactPromptText(config.systemPrompt, 2400)}`
+      : "",
     buildWebsiteKnowledgeBlock(config.websiteIntelligence),
     !hasWebsiteKnowledge && config.offer
       ? `Offer: ${compactPromptText(config.offer, 220)}`
@@ -8502,6 +8811,9 @@ function buildAssistantInstructions(config) {
     "- Never pretend to be human. Keep the AI disclosure brief and natural.",
     "- Respect stop or do-not-call requests immediately and end politely.",
     "- Only book after exact date/time/timezone confirmation. Use tools only when needed; never narrate internal reasoning or tool mechanics.",
+    clean(config.closingMessage)
+      ? `- When the conversation is ending naturally, prefer this configured closing when it fits: ${compactPromptText(config.closingMessage, 500)}`
+      : "",
     "- Do not collect payment-card, government-ID, health, password, authentication-code, or similarly sensitive information.",
   ]
     .filter(Boolean)
@@ -8688,6 +9000,25 @@ function buildRuntimeGreeting({ agent, lead, queueItem, call }) {
         process.env.REACHFLY_AI_AGENT_SPOKEN_NAME ||
         agent?.name
     ) || "James";
+  const language = normalizeAgentLanguage(
+    call?.language ||
+      queueItem?.language ||
+      details.language ||
+      agent?.primaryLanguage ||
+      "en"
+  );
+  const configured = resolveLanguageOpening(agent, language, "outbound");
+
+  if (configured) {
+    return renderRuntimeMessage(configured, {
+      greeting_name: firstName || "there",
+      first_name: firstName || "there",
+      lead_name: fullName || firstName || "there",
+      company_name: company,
+      agent_name: speakerName,
+      language,
+    });
+  }
 
   const painQuestion =
     "are you happy with how your website is turning visitors into qualified enquiries, or do you feel some opportunities are slipping through?";
