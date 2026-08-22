@@ -2871,6 +2871,48 @@ function requireWorkspacePermission(
  * Lead generation and campaign mutation are available to workspace owners,
  * administrators and managers. Callers continue to work assigned leads only.
  */
+function requireOperationsAccess(
+  req,
+  res,
+  next
+) {
+  const context =
+    req.workspaceContext ||
+    getWorkspaceContext(req.user);
+
+  const role = String(
+    context?.role ||
+      req.user?.workspaceRole ||
+      req.user?.role ||
+      ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const accountType = String(
+    req.user?.accountType ||
+      req.user?.workspaceType ||
+      context?.workspace?.accountType ||
+      context?.workspace?.type ||
+      ""
+  )
+    .trim()
+    .toLowerCase();
+
+  if (
+    accountType === "individual" ||
+    ["owner", "admin", "manager"].includes(role)
+  ) {
+    return next();
+  }
+
+  return res.status(403).json({
+    error:
+      "Your workspace role does not have access to AI business operations.",
+    code: "OPERATIONS_ACCESS_REQUIRED",
+  });
+}
+
 function requireLeadGenerationManager(
   req,
   res,
@@ -4956,7 +4998,7 @@ app.delete(
 app.get(
   "/api/operations",
   requireAuth,
-  requireLeadGenerationManager,
+  requireOperationsAccess,
   (req, res) => {
     res.set("Cache-Control", "no-store");
     res.json(
@@ -4974,7 +5016,7 @@ app.get(
 app.post(
   "/api/operations",
   requireAuth,
-  requireLeadGenerationManager,
+  requireOperationsAccess,
   asyncRoute(async (req, res) => {
     const result = operationsService.create(req.user, req.body || {});
     res.set("Cache-Control", "no-store");
@@ -4985,7 +5027,7 @@ app.post(
 app.patch(
   "/api/operations/:id",
   requireAuth,
-  requireLeadGenerationManager,
+  requireOperationsAccess,
   asyncRoute(async (req, res) => {
     const result = operationsService.update(
       req.user,
@@ -8073,13 +8115,22 @@ app.post(
     }
 
     // Backward-compatible fallback for agents still using the existing
-    // Calendly/current booking workflow.
-    res.json(
-      await telnyxAiAgentService.bookMeeting({
-        headers: req.headers,
-        body: req.body || {},
-      })
-    );
+    // Calendly/current booking workflow. Persist the successful result into
+    // the same Operations stream so the customer journey stays connected.
+    const body = req.body || {};
+    const booking = await telnyxAiAgentService.bookMeeting({
+      headers: req.headers,
+      body,
+    });
+
+    if (booking?.ok !== false && booking?.booked !== false) {
+      operationsService.recordVoiceBooking({
+        body,
+        booking: { ...booking, provider: booking?.provider || "calendly" },
+      });
+    }
+
+    res.json(booking);
   })
 );
 
@@ -8130,6 +8181,92 @@ app.post(
         body: req.body || {},
       })
     );
+  })
+);
+
+/*
+ * Operational voice tools. These routes intentionally reuse the Voice Agent
+ * tool-secret validation inside getCriticalLiveData before touching workspace
+ * operational memory. The call id then scopes every read/write to the call's
+ * workspace inside operationsService.
+ */
+app.post(
+  "/api/telnyx/ai-agent/tools/record-order",
+  asyncRoute(async (req, res) => {
+    const body = { ...(req.query || {}), ...(req.body || {}) };
+
+    telnyxAiAgentService.getCriticalLiveData({
+      headers: req.headers,
+      body: { ...body, key: "call_status" },
+    });
+
+    const result = operationsService.recordVoiceOrder({
+      callId:
+        body.reachfly_call_id ||
+        body.reachflyCallId ||
+        body.call_id ||
+        body.callId ||
+        "",
+      body,
+      order: body.order && typeof body.order === "object" ? body.order : body,
+    });
+
+    res.status(result?.recorded === false ? 404 : 200).json(result);
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/tools/record-operation",
+  asyncRoute(async (req, res) => {
+    const body = { ...(req.query || {}), ...(req.body || {}) };
+
+    telnyxAiAgentService.getCriticalLiveData({
+      headers: req.headers,
+      body: { ...body, key: "call_status" },
+    });
+
+    const result = operationsService.recordVoiceOperation({
+      callId:
+        body.reachfly_call_id ||
+        body.reachflyCallId ||
+        body.call_id ||
+        body.callId ||
+        "",
+      body,
+      operation:
+        body.operation && typeof body.operation === "object"
+          ? body.operation
+          : body,
+      defaultOperationType:
+        body.operation_type || body.operationType || "booking",
+      defaultStatus: body.status || "confirmed",
+    });
+
+    res.status(result?.recorded === false ? 404 : 200).json(result);
+  })
+);
+
+app.post(
+  "/api/telnyx/ai-agent/tools/customer-memory",
+  asyncRoute(async (req, res) => {
+    const body = { ...(req.query || {}), ...(req.body || {}) };
+
+    telnyxAiAgentService.getCriticalLiveData({
+      headers: req.headers,
+      body: { ...body, key: "call_status" },
+    });
+
+    const result = operationsService.getCustomerMemoryForCall({
+      callId:
+        body.reachfly_call_id ||
+        body.reachflyCallId ||
+        body.call_id ||
+        body.callId ||
+        "",
+      limit: body.limit,
+    });
+
+    res.status(result?.ok === false ? 404 : 200).json(result);
   })
 );
 
