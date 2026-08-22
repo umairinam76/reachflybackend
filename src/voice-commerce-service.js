@@ -4,20 +4,25 @@ const TELNYX_API_BASE = "https://api.telnyx.com/v2";
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io";
 const DEFAULT_QUOTE_TTL_MS = 10 * 60_000;
 const DEFAULT_AI_CALL_PRICE_MINOR = 100;
+const DEFAULT_NUMBER_MARKUP_PERCENT = 100;
 const DEFAULT_VOICE_BUNDLE_CREDITS = [25, 100, 250];
 const CODESYNC_WORKSPACE_ID = "codesync-labs-workspace";
 
 /**
  * Paid Voice onboarding commerce.
  *
- * This service intentionally keeps provider secrets server-side and separates:
- *   1) number inventory/quote,
- *   2) Safepay payment,
- *   3) Telnyx provisioning,
- *   4) ElevenLabs SIP-trunk import/agent assignment.
+ * ReachFly-owned Voice commerce.
  *
- * A customer is never treated as owning a number until the verified payment
- * webhook has been processed and provisioning reaches an active state.
+ * Customer-facing rule:
+ *   1) ReachFly sets the retail price.
+ *   2) The customer pays ReachFly once through Safepay.
+ *   3) Only after payment succeeds does ReachFly spend its own carrier balance
+ *      to provision the selected business number.
+ *   4) A bundle can include the number and AI call credits in that same charge.
+ *
+ * Provider names, provider costs, and provider identifiers remain server-side.
+ * A workspace is never treated as owning a number until payment has succeeded
+ * and provisioning reaches an active state.
  */
 
 function normalizeCallingMode(value) {
@@ -167,9 +172,17 @@ export function createVoiceCommerceService({
       },
       testMode: {
         enabled: isVoiceCommerceTestMode(),
+        safepayEnvironment: getSafepayEnvironment(),
         inventory: isVoiceCommerceTestMode() ? "simulated" : "telnyx",
         provisioning: isVoiceCommerceTestMode() ? "shared_test_route" : "telnyx",
         realInboundAvailable: !isVoiceCommerceTestMode(),
+        mixedModeBlocked: isUnsafeSandboxLiveMode(),
+        numberPurchasesUseSafepay: true,
+      },
+      funding: {
+        numberPurchases: "customer_checkout_then_reachfly_funding",
+        customerCardRequired: true,
+        note: "Customers pay ReachFly once. ReachFly then provisions the selected business number from its own carrier balance.",
       },
       purchaseReadiness,
       numberConnection: {
@@ -183,10 +196,15 @@ export function createVoiceCommerceService({
         aiConnectedCallPriceMinor: getAiConnectedCallPriceMinor(),
         aiConnectedCallCurrency: getAiConnectedCallCurrency(),
         connectedCallBillingUnit: "connected_call",
+        numberMarkupPercent: getNumberMarkupPercent(),
       },
       billing: {
-        type: "initial_activation",
-        includesFirstMonthProviderCost: true,
+        type: "reachfly_single_checkout",
+        numberPurchasePaymentProvider: "safepay",
+        customerCardRequired: true,
+        singleChargeForNumberAndBundle: true,
+        includesFirstMonthNumberService: true,
+        recurringNumberPricingMode: "reachfly_monthly",
         recurringRenewalCheckoutImplemented: false,
       },
     };
@@ -231,11 +249,11 @@ export function createVoiceCommerceService({
         ok: true,
         quoteId,
         expiresAt,
-        items,
+        items: items.map(publicNumberQuoteItem),
         callingMode: normalizeCallingMode(input.callingMode),
         testMode: true,
         pricingNote:
-          "Sandbox inventory is simulated for QA. Safepay checkout/webhooks remain real sandbox events; no Telnyx number is purchased.",
+          "ReachFly test checkout is enabled. Use a Safepay sandbox test card; the number activation is simulated and no live carrier purchase occurs.",
       };
     }
 
@@ -274,23 +292,28 @@ export function createVoiceCommerceService({
     const quoteId = crypto.randomUUID();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + getQuoteTtlMs()).toISOString();
-    const setupFeeMinor = nonNegativeInteger(
-      process.env.VOICE_NUMBER_SETUP_FEE_MINOR,
-      0
-    );
-    const markupMinor = nonNegativeInteger(
-      process.env.VOICE_NUMBER_MARKUP_MINOR,
-      0
-    );
+    // ReachFly owns the retail price. By default the number is sold at a 100%
+    // markup over the underlying first-month activation cost (2x cost). Keep
+    // setup fee at zero so the requested margin is predictable and transparent
+    // in ReachFly's internal economics.
+    const setupFeeMinor = 0;
+    const markupPercent = getNumberMarkupPercent();
 
     const items = providerItems.map((item) => {
       const cost = item?.cost_information || {};
       const currency = clean(cost.currency || "USD").toUpperCase();
-      const upfrontMinor = decimalMoneyToMinor(cost.upfront_cost);
-      const monthlyMinor = decimalMoneyToMinor(cost.monthly_cost);
-      const amountMinor = Math.max(
+      const providerUpfrontMinor = decimalMoneyToMinor(cost.upfront_cost);
+      const providerMonthlyMinor = decimalMoneyToMinor(cost.monthly_cost);
+      const providerInitialMinor = Math.max(0, providerUpfrontMinor + providerMonthlyMinor);
+      const markupMinor = Math.round(providerInitialMinor * (markupPercent / 100));
+      const initialChargeMinor = Math.max(
         1,
-        upfrontMinor + monthlyMinor + setupFeeMinor + markupMinor
+        providerInitialMinor + markupMinor + setupFeeMinor
+      );
+      const monthlyMarkupMinor = Math.round(providerMonthlyMinor * (markupPercent / 100));
+      const monthlyChargeMinor = Math.max(
+        providerMonthlyMinor > 0 ? 1 : 0,
+        providerMonthlyMinor + monthlyMarkupMinor
       );
       return {
         phoneNumber: normalizePhone(item.phone_number),
@@ -308,17 +331,27 @@ export function createVoiceCommerceService({
           ? item.features.map((feature) => clean(feature?.name)).filter(Boolean)
           : [],
         currency,
-        providerUpfrontMinor: upfrontMinor,
-        providerMonthlyMinor: monthlyMinor,
-        setupFeeMinor,
+
+        // Internal economics. These stay in the stored quote/order and are
+        // stripped from customer-facing responses.
+        providerUpfrontMinor,
+        providerMonthlyMinor,
+        providerInitialMinor,
+        markupPercent,
         markupMinor,
-        initialChargeMinor: amountMinor,
+        monthlyMarkupMinor,
+        setupFeeMinor,
+
+        // ReachFly retail pricing.
+        initialChargeMinor,
+        monthlyChargeMinor,
         bundles: getVoiceBundleCatalog()
           .filter((bundle) => bundle.currency === currency)
           .map((bundle) => ({
             ...bundle,
-            numberInitialChargeMinor: amountMinor,
-            totalInitialChargeMinor: amountMinor + bundle.callCreditAmountMinor,
+            numberInitialChargeMinor: initialChargeMinor,
+            numberMonthlyChargeMinor: monthlyChargeMinor,
+            totalInitialChargeMinor: initialChargeMinor + bundle.callCreditAmountMinor,
           })),
       };
     }).filter((item) => item.phoneNumber);
@@ -344,10 +377,10 @@ export function createVoiceCommerceService({
       ok: true,
       quoteId,
       expiresAt,
-      items,
+      items: items.map(publicNumberQuoteItem),
       callingMode: normalizeCallingMode(input.callingMode),
       pricingNote:
-        "Initial checkout includes the provider upfront cost, the first provider monthly charge, and any server-configured ReachFly setup/markup fee.",
+        "ReachFly shows its own retail price. The initial checkout includes the first month of number service; ongoing number service is priced monthly by ReachFly when the underlying number has a recurring cost.",
     };
   }
 
@@ -368,13 +401,22 @@ export function createVoiceCommerceService({
       throw httpError(404, "The phone-number quote was not found.", "NUMBER_QUOTE_NOT_FOUND");
     }
     if (Date.parse(quote.expiresAt || "") <= Date.now()) {
-      throw httpError(409, "This phone-number quote has expired. Search again before checkout.", "NUMBER_QUOTE_EXPIRED");
+      throw httpError(
+        409,
+        "This phone-number quote has expired. Search again before buying it.",
+        "NUMBER_QUOTE_EXPIRED"
+      );
     }
+
     const item = (quote.items || []).find(
       (candidate) => normalizePhone(candidate.phoneNumber) === phoneNumber
     );
     if (!item) {
-      throw httpError(404, "The selected number is not part of this quote.", "NUMBER_NOT_IN_QUOTE");
+      throw httpError(
+        404,
+        "The selected number is not part of this quote.",
+        "NUMBER_NOT_IN_QUOTE"
+      );
     }
 
     const alreadyOwned = (state.voicePhoneNumbers || []).find(
@@ -386,97 +428,152 @@ export function createVoiceCommerceService({
         )
     );
     if (alreadyOwned) {
-      throw httpError(409, "This workspace already has this business number.", "NUMBER_ALREADY_OWNED");
+      throw httpError(
+        409,
+        "This workspace already has this business number.",
+        "NUMBER_ALREADY_OWNED"
+      );
     }
 
-    const existingPending = (state.voiceNumberOrders || []).find(
-      (order) =>
-        order.workspaceId === ctx.workspaceId &&
-        normalizePhone(order.phoneNumber) === phoneNumber &&
-        ["creating", "payment_pending", "paid", "provisioning", "pending_activation", "active"].includes(
-          normalizeStatus(order.status)
-        )
-    );
-    if (existingPending) {
-      if (existingPending.checkoutUrl && existingPending.status === "payment_pending") {
-        return { ok: true, reused: true, checkoutUrl: existingPending.checkoutUrl, order: publicOrder(existingPending) };
-      }
-      throw httpError(409, "A purchase already exists for this business number.", "NUMBER_ORDER_EXISTS");
-    }
-
-    const now = new Date().toISOString();
-
-    // Payment retries must reuse the most recent unpaid failed order for this
-    // workspace + phone number. Creating a fresh order on every declined card
-    // produced duplicate rows and made recovery confusing.
-    const reusableFailedOrder = (state.voiceNumberOrders || [])
+    const existingOrder = (state.voiceNumberOrders || [])
       .filter(
-        (candidate) =>
-          candidate.workspaceId === ctx.workspaceId &&
-          normalizePhone(candidate.phoneNumber) === phoneNumber &&
-          normalizeStatus(candidate.status) === "payment_failed" &&
-          !candidate.paidAt &&
-          !candidate.telnyxOrderId
+        (order) =>
+          order.workspaceId === ctx.workspaceId &&
+          normalizePhone(order.phoneNumber) === phoneNumber &&
+          (order.productType || "voice_number") === "voice_number"
       )
       .sort(byNewest)[0] || null;
 
+    if (existingOrder) {
+      const existingStatus = normalizeStatus(existingOrder.status);
+      if (
+        existingOrder.checkoutUrl &&
+        ["creating", "payment_pending"].includes(existingStatus)
+      ) {
+        return {
+          ok: true,
+          reused: true,
+          checkoutRequired: true,
+          checkoutUrl: existingOrder.checkoutUrl,
+          order: publicOrder(existingOrder),
+        };
+      }
+      if (["paid", "provisioning", "pending_activation", "active"].includes(existingStatus)) {
+        return {
+          ok: true,
+          reused: true,
+          checkoutRequired: false,
+          checkoutUrl: "",
+          order: publicOrder(existingOrder),
+        };
+      }
+    }
+
+    const providerRequiredMinor = Math.max(
+      0,
+      Math.round(Number(item.providerUpfrontMinor || 0)) +
+        Math.round(Number(item.providerMonthlyMinor || 0))
+    );
+    const amountMinor = Math.max(1, Math.round(Number(item.initialChargeMinor || 0)));
+    const monthlyChargeMinor = Math.max(0, Math.round(Number(item.monthlyChargeMinor || 0)));
+
+    let carrierFunding = null;
+    if (!isVoiceCommerceTestMode()) {
+      try {
+        carrierFunding = await getTelnyxFundingSnapshot();
+      } catch {
+        throw httpError(
+          503,
+          "ReachFly number funding is temporarily unavailable. Please try again shortly.",
+          "REACHFLY_NUMBER_FUNDING_UNAVAILABLE"
+        );
+      }
+      if (
+        Number.isFinite(carrierFunding.availableMinor) &&
+        carrierFunding.availableMinor < providerRequiredMinor
+      ) {
+        throw httpError(
+          409,
+          "This number is temporarily unavailable for purchase because ReachFly cannot fund its activation right now. Please try another number or try again later.",
+          "REACHFLY_NUMBER_FUNDING_UNAVAILABLE"
+        );
+      }
+    }
+
+    const now = new Date().toISOString();
+    const reusableFailedOrder =
+      existingOrder && normalizeStatus(existingOrder.status) === "payment_failed"
+        ? existingOrder
+        : null;
+    const orderId = reusableFailedOrder?.id || crypto.randomUUID();
     const order = {
       ...(reusableFailedOrder || {}),
-      id: reusableFailedOrder?.id || crypto.randomUUID(),
+      id: orderId,
       workspaceId: ctx.workspaceId,
       userId: clean(user?.id),
       quoteId,
       phoneNumber,
       callingMode: normalizeCallingMode(input.callingMode || quote.callingMode),
       source: "reachfly_purchase",
+      productType: "voice_number",
       currency: clean(item.currency || "USD").toUpperCase(),
-      amountMinor: Math.round(Number(item.initialChargeMinor || 0)),
+      amountMinor,
+      numberAmountMinor: amountMinor,
+      monthlyChargeMinor,
+
+      // Internal economics. Never expose these provider-specific values to the
+      // customer-facing UI.
       providerUpfrontMinor: Math.round(Number(item.providerUpfrontMinor || 0)),
       providerMonthlyMinor: Math.round(Number(item.providerMonthlyMinor || 0)),
-      setupFeeMinor: Math.round(Number(item.setupFeeMinor || 0)),
+      providerCostMinor: providerRequiredMinor,
+      markupPercent: Number(item.markupPercent || getNumberMarkupPercent()),
       markupMinor: Math.round(Number(item.markupMinor || 0)),
-      provider: item.testMode ? "test_telnyx" : "telnyx",
+      monthlyMarkupMinor: Math.round(Number(item.monthlyMarkupMinor || 0)),
+      setupFeeMinor: Math.round(Number(item.setupFeeMinor || 0)),
+      reachflyGrossMarginMinor: Math.max(0, amountMinor - providerRequiredMinor),
+      reachflyMonthlyGrossMarginMinor: Math.max(
+        0,
+        monthlyChargeMinor - Math.round(Number(item.providerMonthlyMinor || 0))
+      ),
+      carrierAvailableMinorAtCheckout:
+        carrierFunding && Number.isFinite(carrierFunding.availableMinor)
+          ? carrierFunding.availableMinor
+          : null,
+
+      provider: item.testMode ? "test_carrier" : "carrier",
       testMode: Boolean(item.testMode || quote.testMode),
       paymentProvider: "safepay",
+      fundingMode: "customer_checkout_then_reachfly_funding",
+      customerPaymentRequired: true,
       providerTracker: "",
       checkoutUrl: "",
-      checkoutCreatedAt: "",
-      telnyxOrderId: "",
-      elevenLabsPhoneNumberId: "",
+      telnyxOrderId: reusableFailedOrder?.telnyxOrderId || "",
+      elevenLabsPhoneNumberId: reusableFailedOrder?.elevenLabsPhoneNumberId || "",
       status: "creating",
       error: "",
       paymentFailureCode: "",
       paymentFailureCategory: "",
       paymentFailureAction: "",
       paymentFailureRetryable: true,
-      paymentFailedAt: "",
-      retryCount: Number(reusableFailedOrder?.retryCount || 0) +
-        (reusableFailedOrder ? 1 : 0),
-      lastRetryAt: reusableFailedOrder ? now : "",
+      paidAt: reusableFailedOrder?.paidAt || "",
       createdAt: reusableFailedOrder?.createdAt || now,
       updatedAt: now,
+      retryCount: reusableFailedOrder
+        ? Math.max(0, Number(reusableFailedOrder.retryCount || 0)) + 1
+        : 0,
+      lastRetryAt: reusableFailedOrder ? now : "",
     };
-
-    if (!order.amountMinor || order.amountMinor <= 0) {
-      throw httpError(422, "The number checkout amount is not configured.", "NUMBER_PRICE_NOT_CONFIGURED");
-    }
 
     store.update((draft) => {
       ensureStateShape(draft);
-      if (reusableFailedOrder) {
-        const target = draft.voiceNumberOrders.find(
-          (candidate) => candidate.id === reusableFailedOrder.id
-        );
-        if (target) Object.assign(target, order);
-      } else {
-        draft.voiceNumberOrders.unshift(order);
-      }
+      const index = draft.voiceNumberOrders.findIndex((candidate) => candidate.id === orderId);
+      if (index >= 0) draft.voiceNumberOrders[index] = order;
+      else draft.voiceNumberOrders.unshift(order);
     });
 
     try {
       const returnPath = normalizeReturnPath(
-        input.returnPath ||
-          "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers"
+        input.returnPath || "/app/phone-numbers?view=buy"
       );
       const checkout = await createSafepayCheckout({
         amountMinor: order.amountMinor,
@@ -490,49 +587,67 @@ export function createVoiceCommerceService({
           numberPayment: "cancelled",
           order: order.id,
         }),
-        metadata: {
-          order_id: order.id,
-        },
+        metadata: { order_id: order.id },
       });
 
       let updated = null;
       store.update((draft) => {
         ensureStateShape(draft);
-        const target = draft.voiceNumberOrders.find((candidate) => candidate.id === order.id);
+        const target = draft.voiceNumberOrders.find(
+          (candidate) => candidate.id === order.id
+        );
         if (!target) return;
         target.providerTracker = checkout.tracker;
         target.checkoutUrl = checkout.checkoutUrl;
         target.checkoutCreatedAt = new Date().toISOString();
         target.status = "payment_pending";
         target.updatedAt = target.checkoutCreatedAt;
+        appendActivity(draft, {
+          workspaceId: target.workspaceId,
+          actorId: target.userId,
+          type: "voice_number_checkout_created",
+          title: `ReachFly checkout created for ${target.phoneNumber}`,
+          detail: `One checkout will collect ${formatProviderMoney(target.amountMinor, target.currency)} before ReachFly provisions the number.`,
+          createdAt: target.checkoutCreatedAt,
+        });
         updated = { ...target };
       });
 
       return {
         ok: true,
+        checkoutRequired: true,
         checkoutUrl: checkout.checkoutUrl,
         order: publicOrder(updated || order),
       };
     } catch (error) {
+      const failure = normalizeCheckoutCreationFailure(error);
       store.update((draft) => {
         ensureStateShape(draft);
-        const target = draft.voiceNumberOrders.find((candidate) => candidate.id === order.id);
+        const target = draft.voiceNumberOrders.find(
+          (candidate) => candidate.id === order.id
+        );
         if (!target) return;
         target.status = "payment_failed";
-        target.error = clean(error?.message || String(error)).slice(0, 1200);
-        target.updatedAt = new Date().toISOString();
+        target.error = failure.message;
+        target.paymentFailureCode = failure.code;
+        target.paymentFailureCategory = failure.category;
+        target.paymentFailureRetryable = failure.retryable;
+        target.paymentFailureAction = failure.action;
+        target.paymentFailedAt = new Date().toISOString();
+        target.updatedAt = target.paymentFailedAt;
       });
       throw httpError(
         error?.statusCode || 502,
-        error?.message || "Could not create business-number checkout.",
-        "VOICE_NUMBER_CHECKOUT_FAILED"
+        failure.message,
+        "VOICE_NUMBER_CHECKOUT_FAILED",
+        failure
       );
     }
   }
 
   async function createBundleCheckout(user, input = {}) {
     const ctx = assertPurchaser(user);
-    assertNumberCheckoutReady();
+    assertBundleCheckoutReady();
     const quoteId = clean(input.quoteId);
     const phoneNumber = normalizePhone(input.phoneNumber);
     const bundleId = clean(input.bundleId);
@@ -572,14 +687,14 @@ export function createVoiceCommerceService({
     if (!bundle) {
       throw httpError(
         422,
-        "This Voice Agent bundle is not available.",
+        "This ReachFly bundle is not available.",
         "VOICE_BUNDLE_NOT_CONFIGURED"
       );
     }
     if (bundle.currency !== clean(item.currency || "USD").toUpperCase()) {
       throw httpError(
         422,
-        "The selected bundle currency does not match the phone-number quote.",
+        "The selected bundle currency does not match the number price.",
         "VOICE_BUNDLE_CURRENCY_MISMATCH"
       );
     }
@@ -600,54 +715,105 @@ export function createVoiceCommerceService({
       );
     }
 
-    const existingPending = (state.voiceNumberOrders || []).find(
-      (order) =>
-        order.workspaceId === ctx.workspaceId &&
-        normalizePhone(order.phoneNumber) === phoneNumber &&
-        ["creating", "payment_pending", "paid", "provisioning", "pending_activation", "active"].includes(
-          normalizeStatus(order.status)
-        )
-    );
-    if (existingPending) {
+    const existingOrder = (state.voiceNumberOrders || [])
+      .filter(
+        (order) =>
+          order.workspaceId === ctx.workspaceId &&
+          normalizePhone(order.phoneNumber) === phoneNumber &&
+          order.productType === "voice_bundle"
+      )
+      .sort(byNewest)[0] || null;
+
+    if (existingOrder) {
+      const existingStatus = normalizeStatus(existingOrder.status);
       if (
-        existingPending.checkoutUrl &&
-        normalizeStatus(existingPending.status) === "payment_pending" &&
-        existingPending.productType === "voice_bundle" &&
-        existingPending.bundleId === bundle.id
+        existingOrder.bundleId === bundle.id &&
+        existingOrder.checkoutUrl &&
+        ["creating", "payment_pending"].includes(existingStatus)
       ) {
         return {
           ok: true,
           reused: true,
-          checkoutUrl: existingPending.checkoutUrl,
-          order: publicOrder(existingPending),
+          checkoutUrl: existingOrder.checkoutUrl,
+          order: publicOrder(existingOrder),
         };
       }
-      throw httpError(
-        409,
-        "A purchase already exists for this business number.",
-        "NUMBER_ORDER_EXISTS"
-      );
+      if (["paid", "provisioning", "pending_activation", "active"].includes(existingStatus)) {
+        return {
+          ok: true,
+          reused: true,
+          checkoutUrl: "",
+          order: publicOrder(existingOrder),
+        };
+      }
+      if (existingStatus !== "payment_failed") {
+        throw httpError(
+          409,
+          "A purchase already exists for this business number.",
+          "NUMBER_ORDER_EXISTS"
+        );
+      }
     }
 
-    const numberAmountMinor = Math.round(Number(item.initialChargeMinor || 0));
-    const callCreditAmountMinor = Math.round(Number(bundle.callCreditAmountMinor || 0));
+    const numberAmountMinor = Math.max(1, Math.round(Number(item.initialChargeMinor || 0)));
+    const callCreditAmountMinor = Math.max(
+      0,
+      Math.round(Number(bundle.callCreditAmountMinor || 0))
+    );
     const amountMinor = numberAmountMinor + callCreditAmountMinor;
-    if (!numberAmountMinor || numberAmountMinor <= 0 || !callCreditAmountMinor) {
+    if (!numberAmountMinor || !callCreditAmountMinor || amountMinor <= 0) {
       throw httpError(
         422,
-        "The Voice Agent bundle price is not configured.",
+        "The ReachFly bundle price is not configured.",
         "VOICE_BUNDLE_PRICE_NOT_CONFIGURED"
       );
     }
 
+    const providerRequiredMinor = Math.max(
+      0,
+      Math.round(Number(item.providerUpfrontMinor || 0)) +
+        Math.round(Number(item.providerMonthlyMinor || 0))
+    );
+    let carrierFunding = null;
+    if (!isVoiceCommerceTestMode()) {
+      try {
+        carrierFunding = await getTelnyxFundingSnapshot();
+      } catch {
+        throw httpError(
+          503,
+          "ReachFly number funding is temporarily unavailable. Please try again shortly.",
+          "REACHFLY_NUMBER_FUNDING_UNAVAILABLE"
+        );
+      }
+      if (
+        Number.isFinite(carrierFunding.availableMinor) &&
+        carrierFunding.availableMinor < providerRequiredMinor
+      ) {
+        throw httpError(
+          409,
+          "This number is temporarily unavailable for purchase because ReachFly cannot fund its activation right now. Please choose another number or try again later.",
+          "REACHFLY_NUMBER_FUNDING_UNAVAILABLE"
+        );
+      }
+    }
+
     const now = new Date().toISOString();
+    const reusableFailedOrder =
+      existingOrder && normalizeStatus(existingOrder.status) === "payment_failed"
+        ? existingOrder
+        : null;
+    const orderId = reusableFailedOrder?.id || crypto.randomUUID();
+    const monthlyChargeMinor = Math.max(0, Math.round(Number(item.monthlyChargeMinor || 0)));
     const order = {
-      id: crypto.randomUUID(),
+      ...(reusableFailedOrder || {}),
+      id: orderId,
       workspaceId: ctx.workspaceId,
       userId: clean(user?.id),
       quoteId,
       phoneNumber,
+      callingMode: normalizeCallingMode(input.callingMode || quote.callingMode),
       currency: clean(item.currency || "USD").toUpperCase(),
+      source: "reachfly_purchase",
       productType: "voice_bundle",
       bundleId: bundle.id,
       bundleLabel: bundle.label,
@@ -655,29 +821,60 @@ export function createVoiceCommerceService({
       numberAmountMinor,
       callCreditAmountMinor,
       amountMinor,
+      monthlyChargeMinor,
+
+      // Internal economics; never returned as provider pricing to customers.
       providerUpfrontMinor: Math.round(Number(item.providerUpfrontMinor || 0)),
       providerMonthlyMinor: Math.round(Number(item.providerMonthlyMinor || 0)),
-      setupFeeMinor: Math.round(Number(item.setupFeeMinor || 0)),
+      providerCostMinor: providerRequiredMinor,
+      markupPercent: Number(item.markupPercent || getNumberMarkupPercent()),
       markupMinor: Math.round(Number(item.markupMinor || 0)),
-      provider: "telnyx",
+      monthlyMarkupMinor: Math.round(Number(item.monthlyMarkupMinor || 0)),
+      setupFeeMinor: Math.round(Number(item.setupFeeMinor || 0)),
+      reachflyNumberGrossMarginMinor: Math.max(0, numberAmountMinor - providerRequiredMinor),
+      reachflyMonthlyGrossMarginMinor: Math.max(
+        0,
+        monthlyChargeMinor - Math.round(Number(item.providerMonthlyMinor || 0))
+      ),
+      carrierAvailableMinorAtCheckout:
+        carrierFunding && Number.isFinite(carrierFunding.availableMinor)
+          ? carrierFunding.availableMinor
+          : null,
+
+      provider: item.testMode ? "test_carrier" : "carrier",
+      testMode: Boolean(item.testMode || quote.testMode),
       paymentProvider: "safepay",
+      fundingMode: "customer_checkout_then_reachfly_funding",
+      customerPaymentRequired: true,
       providerTracker: "",
-      telnyxOrderId: "",
-      elevenLabsPhoneNumberId: "",
+      checkoutUrl: "",
+      telnyxOrderId: reusableFailedOrder?.telnyxOrderId || "",
+      elevenLabsPhoneNumberId: reusableFailedOrder?.elevenLabsPhoneNumberId || "",
       status: "creating",
-      createdAt: now,
+      error: "",
+      paymentFailureCode: "",
+      paymentFailureCategory: "",
+      paymentFailureAction: "",
+      paymentFailureRetryable: true,
+      paidAt: reusableFailedOrder?.paidAt || "",
+      createdAt: reusableFailedOrder?.createdAt || now,
       updatedAt: now,
+      retryCount: reusableFailedOrder
+        ? Math.max(0, Number(reusableFailedOrder.retryCount || 0)) + 1
+        : 0,
+      lastRetryAt: reusableFailedOrder ? now : "",
     };
 
     store.update((draft) => {
       ensureStateShape(draft);
-      draft.voiceNumberOrders.unshift(order);
+      const index = draft.voiceNumberOrders.findIndex((candidate) => candidate.id === orderId);
+      if (index >= 0) draft.voiceNumberOrders[index] = order;
+      else draft.voiceNumberOrders.unshift(order);
     });
 
     try {
       const returnPath = normalizeReturnPath(
-        input.returnPath ||
-          "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers"
+        input.returnPath || "/app/phone-numbers?view=buy"
       );
       const checkout = await createSafepayCheckout({
         amountMinor: order.amountMinor,
@@ -691,9 +888,7 @@ export function createVoiceCommerceService({
           numberPayment: "cancelled",
           order: order.id,
         }),
-        metadata: {
-          order_id: order.id,
-        },
+        metadata: { order_id: order.id },
       });
 
       let updated = null;
@@ -708,15 +903,25 @@ export function createVoiceCommerceService({
         target.checkoutCreatedAt = new Date().toISOString();
         target.status = "payment_pending";
         target.updatedAt = target.checkoutCreatedAt;
+        appendActivity(draft, {
+          workspaceId: target.workspaceId,
+          actorId: target.userId,
+          type: "voice_bundle_checkout_created",
+          title: `ReachFly bundle checkout created for ${target.phoneNumber}`,
+          detail: `One payment covers the selected number and ${target.aiCallCredits} AI call credits.`,
+          createdAt: target.checkoutCreatedAt,
+        });
         updated = { ...target };
       });
 
       return {
         ok: true,
+        singleCharge: true,
         checkoutUrl: checkout.checkoutUrl,
         order: publicOrder(updated || order),
       };
     } catch (error) {
+      const failure = normalizeCheckoutCreationFailure(error);
       store.update((draft) => {
         ensureStateShape(draft);
         const target = draft.voiceNumberOrders.find(
@@ -724,13 +929,19 @@ export function createVoiceCommerceService({
         );
         if (!target) return;
         target.status = "payment_failed";
-        target.error = clean(error?.message || String(error)).slice(0, 1200);
-        target.updatedAt = new Date().toISOString();
+        target.error = failure.message;
+        target.paymentFailureCode = failure.code;
+        target.paymentFailureCategory = failure.category;
+        target.paymentFailureRetryable = failure.retryable;
+        target.paymentFailureAction = failure.action;
+        target.paymentFailedAt = new Date().toISOString();
+        target.updatedAt = target.paymentFailedAt;
       });
       throw httpError(
         error?.statusCode || 502,
-        error?.message || "Could not create Voice Agent bundle checkout.",
-        "VOICE_BUNDLE_CHECKOUT_FAILED"
+        failure.message,
+        "VOICE_BUNDLE_CHECKOUT_FAILED",
+        failure
       );
     }
   }
@@ -949,7 +1160,10 @@ export function createVoiceCommerceService({
           purchasedBy: target.userId,
           purchasedAt: target.paidAt,
           activatedAt: target.activatedAt,
-          providerMonthlyMinor: 0,
+          providerMonthlyMinor: target.providerMonthlyMinor,
+          monthlyChargeMinor: target.monthlyChargeMinor,
+          billingStatus: Number(target.monthlyChargeMinor || 0) > 0 ? "active" : "not_required",
+          nextBillingAt: Number(target.monthlyChargeMinor || 0) > 0 ? addMonthsIso(target.activatedAt || now, 1) : "",
           currency: target.currency,
           createdAt: now,
           updatedAt: now,
@@ -969,6 +1183,13 @@ export function createVoiceCommerceService({
         number.orderId = target.id;
         number.testRoutingPhoneNumber = routingPhoneNumber;
         number.elevenLabsPhoneNumberId = phoneNumberId;
+        number.providerMonthlyMinor = target.providerMonthlyMinor;
+        number.monthlyChargeMinor = target.monthlyChargeMinor;
+        number.billingStatus = Number(target.monthlyChargeMinor || 0) > 0 ? "active" : "not_required";
+        number.nextBillingAt = Number(target.monthlyChargeMinor || 0) > 0
+          ? (number.nextBillingAt || addMonthsIso(target.activatedAt || now, 1))
+          : "";
+        number.currency = target.currency;
         number.updatedAt = now;
       }
 
@@ -1137,6 +1358,9 @@ export function createVoiceCommerceService({
             purchasedAt: target.paidAt,
             activatedAt: target.activatedAt,
             providerMonthlyMinor: target.providerMonthlyMinor,
+            monthlyChargeMinor: target.monthlyChargeMinor,
+            billingStatus: Number(target.monthlyChargeMinor || 0) > 0 ? "active" : "not_required",
+            nextBillingAt: Number(target.monthlyChargeMinor || 0) > 0 ? addMonthsIso(target.activatedAt || now, 1) : "",
             currency: target.currency,
             createdAt: now,
             updatedAt: now,
@@ -1155,6 +1379,13 @@ export function createVoiceCommerceService({
           number.telnyxOrderId = target.telnyxOrderId;
           number.telnyxConnectionId = resolveTelnyxConnectionId(false);
           number.elevenLabsPhoneNumberId = elevenLabsPhoneNumberId;
+          number.providerMonthlyMinor = target.providerMonthlyMinor;
+          number.monthlyChargeMinor = target.monthlyChargeMinor;
+          number.billingStatus = Number(target.monthlyChargeMinor || 0) > 0 ? "active" : "not_required";
+          number.nextBillingAt = Number(target.monthlyChargeMinor || 0) > 0
+            ? (number.nextBillingAt || addMonthsIso(target.activatedAt || now, 1))
+            : "";
+          number.currency = target.currency;
           number.updatedAt = now;
         }
 
@@ -2159,6 +2390,45 @@ async function telnyxRequest(path, { method = "GET", body } = {}) {
   return payload;
 }
 
+async function getTelnyxFundingSnapshot() {
+  const response = await telnyxRequest("/balance");
+  const data = response?.data || {};
+  const currency = clean(data.currency || "USD").toUpperCase();
+  const balance = Number(data.balance);
+  const availableCredit = Number(data.available_credit);
+  const creditLimit = Number(data.credit_limit);
+
+  // Telnyx exposes available_credit as the amount currently spendable on the
+  // account. Fall back to balance when older/provider responses omit it.
+  const available = Number.isFinite(availableCredit)
+    ? availableCredit
+    : Number.isFinite(balance)
+      ? balance
+      : NaN;
+
+  return {
+    currency,
+    balance: Number.isFinite(balance) ? balance : null,
+    creditLimit: Number.isFinite(creditLimit) ? creditLimit : null,
+    availableCredit: Number.isFinite(availableCredit) ? availableCredit : null,
+    availableMinor: Number.isFinite(available) ? Math.max(0, Math.round(available * 100)) : NaN,
+  };
+}
+
+function formatProviderMoney(amountMinor, currency = "USD") {
+  const amount = Number(amountMinor);
+  const code = clean(currency || "USD").toUpperCase();
+  if (!Number.isFinite(amount)) return code;
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: code,
+    }).format(amount / 100);
+  } catch {
+    return `${(amount / 100).toFixed(2)} ${code}`;
+  }
+}
+
 async function elevenLabsRequest(path, { method = "GET", body, apiKey } = {}) {
   const response = await fetch(`${ELEVENLABS_API_BASE}${path}`, {
     method,
@@ -2368,9 +2638,14 @@ async function getSafepayClient() {
 
 function getNumberCheckoutReadiness() {
   const missing = [];
+  const blockers = [];
 
   if (!clean(process.env.SAFEPAY_SECRET_KEY)) missing.push("SAFEPAY_SECRET_KEY");
   if (!clean(process.env.SAFEPAY_PUBLIC_KEY)) missing.push("SAFEPAY_PUBLIC_KEY");
+
+  if (isUnsafeSandboxLiveMode()) {
+    blockers.push("sandbox_live_mismatch");
+  }
 
   if (isVoiceCommerceTestMode()) {
     if (
@@ -2390,18 +2665,43 @@ function getNumberCheckoutReadiness() {
     ) {
       missing.push("VOICE_TEST_CALL_FROM_NUMBER");
     }
-  } else {
-    if (!getTelnyxCommerceApiKey()) missing.push("TELNYX_API_KEY");
-    if (!resolveTelnyxConnectionId(false)) missing.push("TELNYX_AI_AGENT_SIP_CONNECTION_ID");
-    if (!clean(process.env.ELEVENLABS_API_KEY)) missing.push("ELEVENLABS_API_KEY");
+  } else if (!isUnsafeSandboxLiveMode()) {
+    if (!getTelnyxCommerceApiKey()) missing.push("REACHFLY_NUMBER_FUNDING_KEY");
+    if (!resolveTelnyxConnectionId(false)) missing.push("REACHFLY_NUMBER_ROUTING_CONNECTION");
+    if (!clean(process.env.ELEVENLABS_API_KEY)) missing.push("REACHFLY_VOICE_RUNTIME_KEY");
   }
 
+  const ready = missing.length === 0 && blockers.length === 0;
   return {
-    ready: missing.length === 0,
+    ready,
     missing,
-    message: missing.length
-      ? `Business-number checkout is waiting for server configuration: ${missing.join(", ")}.`
-      : "Business-number checkout and provisioning are configured.",
+    blockers,
+    fundingMode: isVoiceCommerceTestMode()
+      ? "test"
+      : "customer_checkout_then_reachfly_funding",
+    customerCardRequired: true,
+    paymentProvider: "safepay",
+    voiceCommerceTestMode: isVoiceCommerceTestMode(),
+    message: blockers.includes("sandbox_live_mismatch")
+      ? "ReachFly payment testing is in sandbox while live number inventory is enabled. For QA, set VOICE_COMMERCE_TEST_MODE=true. For real purchases, switch Safepay to production before enabling live number inventory."
+      : missing.length
+        ? `Business-number checkout is waiting for server configuration: ${missing.join(", ")}.`
+        : isVoiceCommerceTestMode()
+          ? "ReachFly test checkout is ready. Use a Safepay sandbox test card; number activation is simulated."
+          : "ReachFly checkout is ready. The customer pays ReachFly once, then ReachFly provisions the selected number from its own carrier balance.",
+  };
+}
+
+function getBundleCheckoutReadiness() {
+  const numberReadiness = getNumberCheckoutReadiness();
+  return {
+    ...numberReadiness,
+    customerCardRequired: true,
+    paymentProvider: "safepay",
+    singleCharge: true,
+    message: numberReadiness.ready
+      ? "ReachFly bundle checkout is ready. One payment can include the selected number and AI call credits."
+      : numberReadiness.message,
   };
 }
 
@@ -2411,34 +2711,24 @@ function assertNumberCheckoutReady() {
     throw httpError(
       503,
       readiness.message,
-      "VOICE_NUMBER_CHECKOUT_NOT_CONFIGURED",
-      { missing: readiness.missing }
+      "VOICE_NUMBER_PURCHASE_NOT_CONFIGURED",
+      readiness
     );
   }
   return readiness;
 }
 
-function normalizeReturnPath(value) {
-  const raw = clean(value);
-  if (!raw || !raw.startsWith("/app/")) {
-    return "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers";
+function assertBundleCheckoutReady() {
+  const readiness = getBundleCheckoutReadiness();
+  if (!readiness.ready) {
+    throw httpError(
+      503,
+      readiness.message,
+      "VOICE_BUNDLE_CHECKOUT_NOT_CONFIGURED",
+      readiness
+    );
   }
-  try {
-    const parsed = new URL(raw, "https://reachfly.local");
-    return `${parsed.pathname}${parsed.search}`;
-  } catch {
-    return "/app/voice-agent?onboarding=1&tab=setup&view=buy-numbers";
-  }
-}
-
-function buildReturnUrl(returnPath, params = {}) {
-  const url = new URL(normalizeReturnPath(returnPath), getAppUrl());
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && String(value) !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-  return url.toString();
+  return readiness;
 }
 
 function resolveTelnyxConnectionId(required = true) {
@@ -2486,6 +2776,13 @@ function getAiConnectedCallPriceMinor() {
 
 function getAiConnectedCallCurrency() {
   return clean(process.env.AI_CALL_CONNECTED_CURRENCY || "USD").toUpperCase();
+}
+
+function getNumberMarkupPercent() {
+  const configured = Number(process.env.VOICE_NUMBER_MARKUP_PERCENT);
+  return Number.isFinite(configured) && configured >= 0
+    ? Math.min(1000, configured)
+    : DEFAULT_NUMBER_MARKUP_PERCENT;
 }
 
 function getVoiceBundleCatalog() {
@@ -2567,6 +2864,10 @@ function isVoiceCommerceTestMode() {
   return enabled && getSafepayEnvironment() === "sandbox";
 }
 
+function isUnsafeSandboxLiveMode() {
+  return getSafepayEnvironment() === "sandbox" && !isVoiceCommerceTestMode();
+}
+
 function buildTestNumberInventory(input = {}, limit = 8) {
   const areaCode =
     clean(input.areaCode || input.nationalDestinationCode)
@@ -2574,10 +2875,14 @@ function buildTestNumberInventory(input = {}, limit = 8) {
       .slice(0, 3) || "213";
   const locality = clean(input.locality) || "Los Angeles";
   const currency = clean(process.env.AI_CALL_CONNECTED_CURRENCY || "USD").toUpperCase();
-  const initialChargeMinor = Math.max(1, nonNegativeInteger(
-    process.env.VOICE_TEST_NUMBER_PRICE_MINOR,
+  const providerMonthlyMinor = Math.max(1, nonNegativeInteger(
+    process.env.VOICE_TEST_PROVIDER_NUMBER_COST_MINOR,
     100
   ));
+  const markupPercent = getNumberMarkupPercent();
+  const markupMinor = Math.round(providerMonthlyMinor * (markupPercent / 100));
+  const initialChargeMinor = Math.max(1, providerMonthlyMinor + markupMinor);
+  const monthlyChargeMinor = initialChargeMinor;
 
   return Array.from({ length: Math.max(1, Math.min(12, limit)) }, (_, index) => {
     const subscriber = String(101 + index).padStart(4, "0");
@@ -2595,11 +2900,22 @@ function buildTestNumberInventory(input = {}, limit = 8) {
       features: ["voice"],
       currency,
       providerUpfrontMinor: 0,
-      providerMonthlyMinor: 0,
-      setupFeeMinor: initialChargeMinor,
-      markupMinor: 0,
+      providerMonthlyMinor,
+      providerInitialMinor: providerMonthlyMinor,
+      setupFeeMinor: 0,
+      markupPercent,
+      markupMinor,
+      monthlyMarkupMinor: markupMinor,
       initialChargeMinor,
-      bundles: [],
+      monthlyChargeMinor,
+      bundles: getVoiceBundleCatalog()
+        .filter((bundle) => bundle.currency === currency)
+        .map((bundle) => ({
+          ...bundle,
+          numberInitialChargeMinor: initialChargeMinor,
+          numberMonthlyChargeMinor: monthlyChargeMinor,
+          totalInitialChargeMinor: initialChargeMinor + bundle.callCreditAmountMinor,
+        })),
     };
   });
 }
@@ -2622,10 +2938,43 @@ function requireEnv(name) {
   return value;
 }
 
+function publicNumberQuoteItem(item = {}) {
+  return {
+    phoneNumber: item.phoneNumber || "",
+    vanityFormat: item.vanityFormat || "",
+    quickship: Boolean(item.quickship),
+    reservable: Boolean(item.reservable),
+    bestEffort: Boolean(item.bestEffort),
+    regionInformation: Array.isArray(item.regionInformation)
+      ? item.regionInformation
+      : [],
+    features: Array.isArray(item.features) ? item.features : [],
+    currency: clean(item.currency || "USD").toUpperCase(),
+    initialChargeMinor: Number(item.initialChargeMinor || 0),
+    monthlyChargeMinor: Number(item.monthlyChargeMinor || 0),
+    firstMonthIncluded: true,
+    recurring: Number(item.monthlyChargeMinor || 0) > 0,
+    testMode: Boolean(item.testMode),
+    bundles: Array.isArray(item.bundles)
+      ? item.bundles.map((bundle) => ({
+          id: bundle.id || "",
+          label: bundle.label || "ReachFly bundle",
+          credits: Number(bundle.credits || 0),
+          callCreditAmountMinor: Number(bundle.callCreditAmountMinor || 0),
+          numberInitialChargeMinor: Number(bundle.numberInitialChargeMinor || 0),
+          numberMonthlyChargeMinor: Number(bundle.numberMonthlyChargeMinor || 0),
+          totalInitialChargeMinor: Number(bundle.totalInitialChargeMinor || 0),
+          currency: clean(bundle.currency || item.currency || "USD").toUpperCase(),
+          active: bundle.active !== false,
+          recommended: bundle.recommended === true,
+        }))
+      : [],
+  };
+}
+
 function publicOrder(item = {}) {
   return {
     id: item.id || "",
-    workspaceId: item.workspaceId || "",
     quoteId: item.quoteId || "",
     phoneNumber: item.phoneNumber || "",
     callingMode: normalizeCallingMode(item.callingMode),
@@ -2637,17 +2986,15 @@ function publicOrder(item = {}) {
     numberAmountMinor: Number(item.numberAmountMinor || item.amountMinor || 0),
     callCreditAmountMinor: Number(item.callCreditAmountMinor || 0),
     amountMinor: Number(item.amountMinor || 0),
+    monthlyChargeMinor: Number(item.monthlyChargeMinor || 0),
     currency: clean(item.currency || "USD").toUpperCase(),
     testMode: Boolean(item.testMode),
-    providerUpfrontMinor: Number(item.providerUpfrontMinor || 0),
-    providerMonthlyMinor: Number(item.providerMonthlyMinor || 0),
-    setupFeeMinor: Number(item.setupFeeMinor || 0),
-    markupMinor: Number(item.markupMinor || 0),
     status: normalizeStatus(item.status || "unknown"),
-    telnyxOrderId: item.telnyxOrderId || "",
-    telnyxPhoneStatus: item.telnyxPhoneStatus || "",
+    paymentProvider: item.paymentProvider || "",
+    fundingMode: item.fundingMode || item.paymentProvider || "",
+    customerPaymentRequired: item.customerPaymentRequired === true,
+    provisioningStatus: normalizeStatus(item.telnyxPhoneStatus || item.status || "unknown"),
     requirementsMet: item.requirementsMet ?? null,
-    elevenLabsPhoneNumberId: item.elevenLabsPhoneNumberId || "",
     createdAt: item.createdAt || "",
     paidAt: item.paidAt || "",
     activatedAt: item.activatedAt || "",
@@ -2666,7 +3013,7 @@ function publicOrderError(item = {}) {
   if (/unsupported\s+meta(?:data)?\s+key\s+workspace_id/i.test(rawError)) {
     return "Older checkout configuration failed before payment authorization. Retry payment; ReachFly no longer sends unsupported workspace metadata to the processor.";
   }
-  return rawError;
+  return publicCommerceMessage(rawError);
 }
 
 function publicPaymentFailure(item = {}) {
@@ -2690,7 +3037,7 @@ function publicPaymentFailure(item = {}) {
       category: clean(item.paymentFailureCategory),
       retryable: item.paymentFailureRetryable !== false,
       action: clean(item.paymentFailureAction),
-      message: rawError,
+      message: publicCommerceMessage(rawError),
     };
   }
 
@@ -2700,11 +3047,57 @@ function publicPaymentFailure(item = {}) {
       category: "payment_failed",
       retryable: true,
       action: "retry_checkout",
-      message: rawError,
+      message: publicCommerceMessage(rawError),
     };
   }
 
   return null;
+}
+
+function publicCommerceMessage(value) {
+  return clean(value)
+    .replace(/Telnyx/gi, "carrier")
+    .replace(/ElevenLabs/gi, "voice runtime")
+    .replace(/Cybersource/gi, "payment processor")
+    .replace(/\bSIP\b/gi, "routing");
+}
+
+function normalizeCheckoutCreationFailure(error) {
+  const rawMessage = publicCommerceMessage(error?.message || String(error || ""));
+  const status = Number(error?.statusCode || error?.status || 0);
+  const rawCode = clean(error?.code || error?.errorCode || "");
+
+  if (isUnsafeSandboxLiveMode()) {
+    return {
+      code: "sandbox_live_mismatch",
+      category: "checkout_configuration",
+      retryable: true,
+      action: "fix_environment",
+      message:
+        "ReachFly payment testing is in sandbox while live number inventory is enabled. Set VOICE_COMMERCE_TEST_MODE=true for sandbox testing, or switch Safepay to production for real number purchases.",
+    };
+  }
+
+  if (/unsupported\s+meta(?:data)?\s+key\s+workspace_id/i.test(rawMessage)) {
+    return {
+      code: "legacy_checkout_metadata",
+      category: "checkout_configuration",
+      retryable: true,
+      action: "retry_checkout",
+      message:
+        "This checkout used an older payment configuration. Retry the purchase; ReachFly no longer sends unsupported workspace metadata.",
+    };
+  }
+
+  return {
+    code: rawCode || (status ? String(status) : "checkout_error"),
+    category: status >= 500 ? "checkout_service_error" : "checkout_error",
+    retryable: true,
+    action: "retry_checkout",
+    message:
+      rawMessage ||
+      "ReachFly could not open secure checkout. Retry the purchase or use another payment method.",
+  };
 }
 
 function normalizeSafepayFailure(data = {}) {
@@ -2737,14 +3130,46 @@ function normalizeSafepayFailure(data = {}) {
   );
   const haystack = `${rawCode} ${rawCategory} ${rawMessage}`.toLowerCase();
 
-  if (rawCode === "203" || haystack.includes("general decline")) {
+  if (
+    getSafepayEnvironment() === "sandbox" &&
+    rawCode === "403" &&
+    (rawCategory.toLowerCase() === "payment_method_error" ||
+      haystack.includes("general decline"))
+  ) {
     return {
-      code: rawCode || "203",
+      code: rawCode,
+      category: rawCategory || "PAYMENT_METHOD_ERROR",
+      retryable: true,
+      action: "use_safepay_test_card",
+      message:
+        "Safepay sandbox rejected this payment method. ReachFly is in test mode, so use a documented Safepay sandbox test card (for example 4111 1111 1111 1111 with any future expiry and CVV 123). No real number was provisioned.",
+    };
+  }
+
+  if (rawCode === "203") {
+    return {
+      code: rawCode,
       category: rawCategory || "authorization_declined",
       retryable: true,
       action: "different_card_or_contact_bank",
       message:
-        "Your bank declined this card authorization. ReachFly did not provision the business number. Try another card, or ask the issuing bank to approve online/card-not-present payments before trying again.",
+        "The issuing bank declined this card authorization. ReachFly did not provision the business number. Try another card, or ask the bank to approve online/card-not-present payments before trying again.",
+    };
+  }
+
+  if (
+    rawCode === "403" ||
+    rawCategory.toLowerCase() === "payment_method_error" ||
+    haystack.includes("general decline")
+  ) {
+    return {
+      code: rawCode || "403",
+      category: rawCategory || "PAYMENT_METHOD_ERROR",
+      retryable: true,
+      action: "different_payment_method",
+      message:
+        rawMessage ||
+        "The payment processor rejected the authorization. ReachFly did not provision the business number. Try another payment method.",
     };
   }
 
@@ -2784,7 +3209,6 @@ function normalizeSafepayFailure(data = {}) {
 function publicNumber(item = {}) {
   return {
     id: item.id || "",
-    workspaceId: item.workspaceId || "",
     orderId: item.orderId || "",
     phoneNumber: item.phoneNumber || "",
     countryCode: item.countryCode || "",
@@ -2798,18 +3222,22 @@ function publicNumber(item = {}) {
     ownershipVerified: item.ownershipVerified === true,
     verificationStatus: normalizeStatus(item.verificationStatus || ""),
     verificationMethod: normalizeStatus(item.verificationMethod || ""),
-    verificationProvider: normalizeStatus(item.verificationProvider || ""),
     routingVerified: item.routingVerified === true,
-    elevenLabsPhoneNumberId: item.elevenLabsPhoneNumberId || "",
     testMode: Boolean(item.testMode),
     status: normalizeStatus(item.status || "unknown"),
-    providerMonthlyMinor: Number(item.providerMonthlyMinor || 0),
+    monthlyChargeMinor: Number(item.monthlyChargeMinor || 0),
+    billingStatus: normalizeStatus(
+      item.billingStatus ||
+        (Number(item.monthlyChargeMinor || 0) > 0 ? "active" : "not_required")
+    ),
+    nextBillingAt: item.nextBillingAt || "",
     currency: clean(item.currency || "USD").toUpperCase(),
     purchasedAt: item.purchasedAt || "",
     activatedAt: item.activatedAt || "",
     updatedAt: item.updatedAt || "",
   };
 }
+
 
 function inferCountryCodeFromQuote(draft, quoteId) {
   return clean(
@@ -2825,6 +3253,17 @@ function sanitizeSearch(input = {}) {
     administrativeArea: clean(input.administrativeArea || input.state).slice(0, 100),
     phoneNumberType: normalizeStatus(input.phoneNumberType || input.type || "local"),
   };
+}
+
+function addMonthsIso(value, months = 1) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return "";
+  const originalDay = date.getUTCDate();
+  date.setUTCDate(1);
+  date.setUTCMonth(date.getUTCMonth() + Math.max(1, Math.round(Number(months || 1))));
+  const lastDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+  date.setUTCDate(Math.min(originalDay, lastDay));
+  return date.toISOString();
 }
 
 function decimalMoneyToMinor(value) {
