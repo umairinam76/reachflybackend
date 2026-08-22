@@ -202,7 +202,8 @@ export function createLeadAuditService({ store, workspaceService } = {}) {
       profileHash,
       report: null,
       evidence: null,
-      provider: "anthropic",
+      provider: "reachfly-ai",
+      modelProvider: "anthropic",
       error: "",
     };
 
@@ -310,10 +311,10 @@ export function createLeadAuditService({ store, workspaceService } = {}) {
     try {
       const evidence = await inspectLeadWebsite(record);
       let report;
-      let provider = "anthropic";
+      let provider = "reachfly-ai";
 
       try {
-        report = await generateWithClaude(record, evidence);
+        report = await generateWithAuditAI(record, evidence);
       } catch (error) {
         provider = "deterministic-fallback";
         report = buildFallbackReport(record, evidence, error);
@@ -324,6 +325,7 @@ export function createLeadAuditService({ store, workspaceService } = {}) {
         report,
         evidence,
         provider,
+        modelProvider: provider === "reachfly-ai" ? "anthropic" : "deterministic",
         error: "",
         completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -472,7 +474,7 @@ async function inspectLeadWebsite(record) {
   };
 }
 
-async function generateWithClaude(record, evidence) {
+async function generateWithAuditAI(record, evidence) {
   const apiKey = clean(process.env.ANTHROPIC_API_KEY);
 
   if (!apiKey) {
@@ -480,7 +482,7 @@ async function generateWithClaude(record, evidence) {
   }
 
   const kind = record.kind;
-  const prompt = buildClaudePrompt(record, evidence);
+  const prompt = buildAuditPrompt(record, evidence);
   const maxUses = kind === "mini" ? 4 : kind === "competitor" ? 7 : 8;
   const maxTokens = kind === "mini" ? 3_000 : 6_000;
   const tools = [
@@ -500,7 +502,7 @@ async function generateWithClaude(record, evidence) {
         model: DEFAULT_MODEL,
         max_tokens: maxTokens,
         temperature: 0.1,
-        system: buildClaudeSystem(record),
+        system: buildAuditSystem(record),
         messages,
         tools,
       },
@@ -517,7 +519,7 @@ async function generateWithClaude(record, evidence) {
     .trim();
 
   if (!text) {
-    throw new Error("Claude returned no report content.");
+    throw new Error("ReachFly audit intelligence returned no report content.");
   }
 
   const parsed = parseJsonObject(text);
@@ -560,7 +562,7 @@ async function callAnthropic({ apiKey, body }) {
   }
 }
 
-function buildClaudeSystem(record) {
+function buildAuditSystem(record) {
   const brandName = record.brand.name;
   const brandWebsite = record.brand.website || "the parent workspace website";
 
@@ -577,7 +579,7 @@ function buildClaudeSystem(record) {
   ].join(" ");
 }
 
-function buildClaudePrompt(record, evidence) {
+function buildAuditPrompt(record, evidence) {
   const brand = record.brand;
   const base = {
     reportKind: record.kind,
@@ -830,7 +832,7 @@ function buildFallbackReport(record, evidence, error) {
   if (record.kind === "mini") {
     return {
       ...buildFallbackMini(record, evidence),
-      generationNote: `Claude fallback used: ${error.message}`,
+      generationNote: `AI enrichment unavailable; showing verified website evidence only. ${safeProviderError(error)}`,
     };
   }
 
@@ -840,7 +842,7 @@ function buildFallbackReport(record, evidence, error) {
       executiveSummary:
         "Live competitor research could not be completed. The report contains only verified observations from the target website.",
       marketQuery: [record.niche, record.location].filter(Boolean).join(" "),
-      targetVisibility: "Not verified - rerun when Claude web search is available.",
+      targetVisibility: "Not verified - rerun when AI research is available.",
       competitors: [],
       competitiveGaps: buildFallbackMini(record, evidence).issues.map((item) => ({
         title: item.tag,
@@ -848,7 +850,7 @@ function buildFallbackReport(record, evidence, error) {
         businessImpact: item.pain,
       })),
       salesTalkingPoints: [],
-      disclaimer: `Claude research unavailable: ${error.message}`,
+      disclaimer: `AI research unavailable; this result is limited to verified website evidence. ${safeProviderError(error)}`,
     };
   }
 
@@ -870,9 +872,9 @@ function buildFallbackReport(record, evidence, error) {
     technicalReview: [],
     seoAndLocalVisibility: [],
     conversionAndTrust: [],
-    competitorSummary: "Not verified - rerun when Claude web search is available.",
+    competitorSummary: "Not verified - rerun when AI research is available.",
     roadmap: [],
-    disclaimer: `Claude generation unavailable: ${error.message}`,
+    disclaimer: `AI enrichment unavailable; this result is limited to verified website evidence. ${safeProviderError(error)}`,
   };
 }
 
@@ -1067,10 +1069,45 @@ function publicReport(record, { includeEvidence = false } = {}) {
     brand: record.brand,
     auditProfile: record.auditProfile || null,
     report: record.report,
-    provider: record.provider,
-    error: record.error,
+    provider: "reachfly-ai",
+    auditSource: buildPublicAuditSource(record),
+    error: sanitizePublicAuditError(record.error),
     ...(includeEvidence ? { evidence: record.evidence } : {}),
   };
+}
+
+function buildPublicAuditSource(record = {}) {
+  const evidence = record.evidence || {};
+  const finalUrl = clean(evidence.finalUrl || record.website);
+  const sourceStatus = Number(evidence.status || 0);
+
+  return {
+    mode:
+      record.provider === "deterministic-fallback"
+        ? "verified-website"
+        : "verified-website+ai-research",
+    verified: Boolean(evidence.fetchedAt || evidence.finalUrl),
+    verifiedAt: clean(evidence.fetchedAt || record.completedAt),
+    website: finalUrl,
+    domain: clean(evidence.domain || hostname(finalUrl)),
+    httpStatus: Number.isFinite(sourceStatus) && sourceStatus > 0 ? sourceStatus : null,
+    researchEnriched: record.provider !== "deterministic-fallback",
+  };
+}
+
+function sanitizePublicAuditError(value) {
+  const text = clean(value);
+  if (!text) return "";
+
+  return text
+    .replace(/anthropic/gi, "AI provider")
+    .replace(/claude/gi, "AI provider")
+    .replace(/ANTHROPIC_API_KEY/g, "AI provider configuration");
+}
+
+function safeProviderError(error) {
+  const message = sanitizePublicAuditError(error?.message || error);
+  return message ? `Provider detail: ${message}` : "";
 }
 
 function reportCacheKey(workspaceId, website, kind, profileHash = "") {
@@ -1482,7 +1519,7 @@ function parseJsonObject(text) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
   const source = fenced || text;
   const start = source.indexOf("{");
-  if (start < 0) throw new Error("Claude did not return a JSON object.");
+  if (start < 0) throw new Error("AI audit response did not contain a JSON object.");
 
   let depth = 0;
   let inString = false;
@@ -1504,7 +1541,7 @@ function parseJsonObject(text) {
     }
   }
 
-  throw new Error("Claude returned incomplete JSON.");
+  throw new Error("AI audit response contained incomplete JSON.");
 }
 
 function renderAuditPdf(audit) {
