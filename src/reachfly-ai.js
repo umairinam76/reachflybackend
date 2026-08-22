@@ -82,6 +82,9 @@ export function createReachFlyAI({
       };
     }
 
+    const auditResult = buildAuditCommandResult(text, context);
+    if (auditResult) return auditResult;
+
     try {
       const claude = await claudeReply({ text, context });
       return await finalizeClaudeResult({
@@ -148,6 +151,12 @@ export function createReachFlyAI({
       const result = await command(text, options);
       onDelta(result.reply || "");
       return result;
+    }
+
+    const auditResult = buildAuditCommandResult(text, context);
+    if (auditResult) {
+      onDelta(auditResult.reply || "");
+      return auditResult;
     }
 
     try {
@@ -255,6 +264,23 @@ function buildWorkspaceContext({ store, workspaceService, user, screen }) {
   const scrapedLeads = (state.scrapedLeads || []).filter(
     (item) => item.workspaceId === workspaceId
   );
+  const audits = (state.leadAudits || [])
+    .filter((item) => item.workspaceId === workspaceId)
+    .sort(
+      (a, b) =>
+        Date.parse(b.updatedAt || b.completedAt || b.createdAt || 0) -
+        Date.parse(a.updatedAt || a.completedAt || a.createdAt || 0)
+    );
+  const latestAudits = latestAuditPerLead(audits);
+  const completedAudits = latestAudits.filter(
+    (item) => normalizeAuditStatus(item.status) === "complete"
+  );
+  const pendingAudits = latestAudits.filter((item) =>
+    ["queued", "generating"].includes(normalizeAuditStatus(item.status))
+  );
+  const auditScores = completedAudits
+    .map((item) => auditFitScore(item))
+    .filter((value) => Number.isFinite(value));
 
   return {
     ...wsContext,
@@ -266,6 +292,7 @@ function buildWorkspaceContext({ store, workspaceService, user, screen }) {
     connections,
     externalSources,
     voiceAgents,
+    audits: latestAudits,
     metrics: {
       campaigns: workspaceCampaigns.length,
       leads: workspaceCampaigns.reduce(
@@ -279,7 +306,227 @@ function buildWorkspaceContext({ store, workspaceService, user, screen }) {
       integrations: connections.filter((item) => item.status === "connected").length,
       externalSources: externalSources.length,
       voiceAgents: voiceAgents.length,
+      audits: latestAudits.length,
+      auditsComplete: completedAudits.length,
+      auditsPending: pendingAudits.length,
+      auditsFailed: latestAudits.filter(
+        (item) => normalizeAuditStatus(item.status) === "failed"
+      ).length,
+      highFitAudits: completedAudits.filter(
+        (item) => (auditFitScore(item) ?? -1) >= 70
+      ).length,
+      averageAuditFit: auditScores.length
+        ? Math.round(
+            auditScores.reduce((sum, value) => sum + value, 0) /
+              auditScores.length
+          )
+        : null,
     },
+  };
+}
+
+function buildAuditCommandResult(text, context) {
+  const value = String(text || "").trim();
+  const lower = value.toLowerCase();
+  const asksAboutAudit =
+    /\baudit(s|ed|ing)?\b|\bfit score\b|\bhigh[- ]?fit\b|\bcommercial fit\b|\bverified finding(s)?\b/i.test(
+      value
+    );
+
+  if (!asksAboutAudit) return null;
+
+  const audits = Array.isArray(context.audits) ? context.audits : [];
+  const complete = audits.filter(
+    (item) => normalizeAuditStatus(item.status) === "complete"
+  );
+  const pending = audits.filter((item) =>
+    ["queued", "generating"].includes(normalizeAuditStatus(item.status))
+  );
+  const failed = audits.filter(
+    (item) => normalizeAuditStatus(item.status) === "failed"
+  );
+  const scored = complete
+    .map((item) => ({ item, score: auditFitScore(item) }))
+    .filter(({ score }) => Number.isFinite(score))
+    .sort((a, b) => b.score - a.score);
+
+  if (/\b(run|start|create|generate|rerun|re-run)\b.*\baudit/i.test(lower)) {
+    return {
+      action: "open_ai_audits",
+      link: "/app/audits",
+      reply: [
+        "Open AI Audits to select the exact saved leads you want ReachFly to audit.",
+        "ReachFly will show queued, generating, complete, or failed status from the real audit worker, then attach the completed verified context to the lead journey.",
+      ].join(" "),
+    };
+  }
+
+  if (!audits.length) {
+    return {
+      action: "open_ai_audits",
+      link: "/app/audits",
+      reply:
+        "There are no lead audits in this workspace yet. Open AI Audits, select saved leads with public websites, and run the first audit. I will only report audit results that ReachFly has actually stored.",
+    };
+  }
+
+  if (/\b(running|pending|queued|processing|progress|status)\b/i.test(lower)) {
+    const activeLines = pending.slice(0, 8).map((item) => {
+      const status = normalizeAuditStatus(item.status);
+      return `• ${auditBusinessName(item)} — ${status === "generating" ? "generating" : "queued"}`;
+    });
+    const summary = `${complete.length} complete, ${pending.length} in progress, ${failed.length} failed.`;
+    return {
+      action: "audit_status",
+      link: "/app/audits",
+      audits: pending.slice(0, 8).map(publicAuditSummary),
+      reply: activeLines.length
+        ? `Real audit status: ${summary}\n${activeLines.join("\n")}`
+        : `Real audit status: ${summary} There are no audits currently queued or generating.`,
+    };
+  }
+
+  const wantsHighest = /\b(best|highest|top|high[- ]?fit|priority|prioriti[sz]e)\b/i.test(
+    lower
+  );
+  const wantsLatest = /\b(latest|recent|newest|last)\b/i.test(lower);
+  const source = wantsHighest
+    ? scored.map(({ item }) => item)
+    : wantsLatest
+      ? complete
+      : scored.length
+        ? scored.map(({ item }) => item)
+        : complete;
+  const selected = source.slice(0, 5);
+
+  if (!selected.length) {
+    return {
+      action: "audit_status",
+      link: "/app/audits",
+      reply: `ReachFly has ${audits.length} audit record${audits.length === 1 ? "" : "s"}, but none are complete yet. ${pending.length} are currently queued or generating and ${failed.length} failed.`,
+    };
+  }
+
+  const rows = selected.map((item, index) => {
+    const score = auditFitScore(item);
+    const alignment = cleanAuditText(
+      item?.report?.salesFit?.alignment || item?.report?.salesFit?.summary,
+      150
+    );
+    return `${index + 1}. ${auditBusinessName(item)}${
+      Number.isFinite(score) ? ` — ${score}/100 fit` : ""
+    }${alignment ? ` — ${alignment}` : ""}`;
+  });
+
+  const average = context.metrics?.averageAuditFit;
+  const headline = [
+    `${complete.length} completed audit${complete.length === 1 ? "" : "s"}`,
+    `${context.metrics?.highFitAudits || 0} high-fit`,
+    Number.isFinite(average) ? `${average}/100 average fit` : "",
+    pending.length ? `${pending.length} processing` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return {
+    action: wantsHighest ? "audit_priority" : "audit_summary",
+    link: "/app/audits",
+    audits: selected.map(publicAuditSummary),
+    reply: `${headline}\n${rows.join("\n")}\n\nThese are stored ReachFly audit results, not estimated scores or invented prospect interest.`,
+  };
+}
+
+function latestAuditPerLead(audits = []) {
+  const map = new Map();
+  for (const item of audits) {
+    const key = auditLeadKey(item);
+    if (!key || map.has(key)) continue;
+    map.set(key, item);
+  }
+  return [...map.values()];
+}
+
+function auditLeadKey(audit = {}) {
+  const placeId = String(audit?.lead?.placeId || "").trim().toLowerCase();
+  if (placeId) return `place:${placeId}`;
+
+  const website = normalizeAuditWebsite(audit.website || audit?.lead?.website);
+  if (website) return `website:${website}`;
+
+  const leadId = String(audit?.lead?.id || "").trim();
+  if (leadId) return `lead:${leadId}`;
+
+  const name = auditBusinessName(audit).toLowerCase();
+  const address = String(audit?.lead?.address || audit.location || "")
+    .trim()
+    .toLowerCase();
+  return name || address ? `business:${name}|${address}` : String(audit.id || "");
+}
+
+function auditFitScore(audit) {
+  const value =
+    audit?.report?.salesFit?.fitScore ?? audit?.report?.salesFit?.score ?? null;
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? Math.max(0, Math.min(100, Math.round(number)))
+    : null;
+}
+
+function auditBusinessName(audit = {}) {
+  return (
+    String(
+      audit?.lead?.business ||
+        audit?.lead?.name ||
+        audit?.niche ||
+        auditHostname(audit.website) ||
+        "Lead"
+    ).trim() || "Lead"
+  );
+}
+
+function normalizeAuditStatus(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/-/g, "_");
+}
+
+function normalizeAuditWebsite(value) {
+  try {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return url.hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function auditHostname(value) {
+  return normalizeAuditWebsite(value);
+}
+
+function cleanAuditText(value, max = 500) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+function publicAuditSummary(item) {
+  return {
+    id: item?.id || "",
+    business: auditBusinessName(item),
+    website: item?.website || item?.lead?.website || "",
+    status: normalizeAuditStatus(item?.status),
+    kind: item?.kind || "mini",
+    fitScore: auditFitScore(item),
+    alignment: cleanAuditText(
+      item?.report?.salesFit?.alignment || item?.report?.salesFit?.summary,
+      220
+    ),
+    updatedAt: item?.updatedAt || item?.completedAt || item?.createdAt || "",
   };
 }
 
@@ -295,6 +542,30 @@ function buildScreenSuggestions(context) {
 function suggestionCards(context) {
   const path = context.screen.pathname || "";
   const due = context.metrics?.dueToMe || 0;
+
+  if (/\/app\/(ai|audits)/.test(path)) {
+    const completed = context.metrics?.auditsComplete || 0;
+    const pending = context.metrics?.auditsPending || 0;
+    return [
+      {
+        title: "Review real audit results",
+        description: completed
+          ? `${completed} lead audit${completed === 1 ? " is" : "s are"} ready from this workspace.`
+          : "Run a lead audit from AI Audits to create verified prospect context.",
+      },
+      {
+        title: "Prioritise commercial fit",
+        description:
+          "Use fit score, verified findings, and pitch angles to choose which leads deserve the next sales action.",
+      },
+      {
+        title: pending ? "Let active audits finish" : "Send context into outreach",
+        description: pending
+          ? `${pending} audit${pending === 1 ? " is" : "s are"} currently queued or generating.`
+          : "Completed audit context can support the AI agent and outbound campaign journey without inventing buyer intent.",
+      },
+    ];
+  }
 
   if (/leads/.test(path)) {
     return [
@@ -662,6 +933,28 @@ function compactContext(context) {
       nextActionAt: lead.nextActionAt,
       tags: lead.tags,
     })),
+    audits: (context.audits || []).slice(0, 12).map((audit) => ({
+      id: audit.id,
+      business: auditBusinessName(audit),
+      website: audit.website,
+      kind: audit.kind,
+      status: normalizeAuditStatus(audit.status),
+      fitScore: auditFitScore(audit),
+      alignment: cleanAuditText(audit?.report?.salesFit?.alignment, 280),
+      summary: cleanAuditText(
+        audit?.report?.salesFit?.summary || audit?.report?.executiveSummary,
+        500
+      ),
+      suggestedOpener: cleanAuditText(
+        audit?.report?.salesFit?.suggestedOpener,
+        360
+      ),
+      updatedAt: audit.updatedAt || audit.completedAt || audit.createdAt || "",
+      error:
+        normalizeAuditStatus(audit.status) === "failed"
+          ? cleanAuditText(audit.error, 300)
+          : "",
+    })),
     integrations: (context.connections || []).slice(0, 12).map((item) => ({
       provider: item.provider,
       type: item.type,
@@ -907,47 +1200,41 @@ function anthropicSetupHint(error) {
   const message = safeError(error);
   const status = Number(error?.status || error?.statusCode || 0);
 
-  if (/ANTHROPIC_API_KEY/i.test(message)) {
-    return "Configure ANTHROPIC_API_KEY on the ReachFly API server, then restart reachfly-api with its updated environment.";
+  if (/ANTHROPIC_API_KEY|CLAUDE_API_KEY/i.test(message)) {
+    return "ReachFly AI intelligence is not configured on the API server. Workspace data and deterministic product actions remain available.";
   }
 
-  if (
-    status === 401 ||
-    /invalid.*api key|authentication|unauthorized/i.test(message)
-  ) {
-    return "Anthropic rejected the configured API key. Check the server-side ANTHROPIC_API_KEY and restart the API process.";
+  if (status === 401 || /invalid.*api key|authentication|unauthorized/i.test(message)) {
+    return "ReachFly AI intelligence could not authenticate with its configured server-side provider. Workspace data remains available.";
   }
 
-  if (
-    status === 403 ||
-    /permission|forbidden|access denied/i.test(message)
-  ) {
-    return "The Anthropic account does not currently have access to the selected Claude model. ReachFly will try the configured fallback models automatically.";
+  if (status === 403 || /permission|forbidden|access denied/i.test(message)) {
+    return "ReachFly AI intelligence is temporarily unavailable because the configured server-side provider denied access.";
   }
 
   if (status === 429 || /rate.?limit/i.test(message)) {
-    return "Claude is currently rate limited. Wait briefly and retry.";
+    return "ReachFly AI intelligence is temporarily busy. Real workspace data and deterministic actions remain available; retry the generated response shortly.";
   }
 
   if (/credit balance|billing|insufficient.*credit|purchase credits/i.test(message)) {
-    return "The Anthropic API account does not currently have enough API credit.";
+    return "ReachFly AI intelligence is temporarily unavailable because its server-side provider account needs attention.";
   }
 
   if (/model.*not found|model.*unavailable|unsupported model/i.test(message)) {
-    return "The selected Claude model is unavailable for this Anthropic account. ReachFly will automatically try another configured Claude model.";
+    return "ReachFly AI intelligence is switching between supported server-side models. Retry the generated response shortly.";
   }
 
   if (status === 529 || /overloaded/i.test(message)) {
-    return "Anthropic is temporarily overloaded. ReachFly will retry automatically.";
+    return "ReachFly AI intelligence is temporarily overloaded. Real workspace data and deterministic actions remain available.";
   }
 
   if (/fetch failed|ENOTFOUND|ECONNRESET|ECONNREFUSED|network/i.test(message)) {
-    return "The ReachFly API server could not reach Anthropic. Check outbound HTTPS/network access from the server.";
+    return "The ReachFly API server could not reach its AI intelligence provider. Real workspace data remains available.";
   }
 
   if (/timeout|timed out|aborted/i.test(message)) {
-    return "The Claude request timed out before Anthropic completed the response.";
+    return "The generated ReachFly AI response timed out. Real workspace data and deterministic actions remain available.";
   }
 
-  return `Claude request failed: ${message}`;
+  return "The generated ReachFly AI response is temporarily unavailable. Real workspace data and deterministic actions remain available.";
 }
