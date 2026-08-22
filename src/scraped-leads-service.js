@@ -159,7 +159,41 @@ export function createScrapedLeadsService({ store, workspaceService } = {}) {
     return unique.size;
   }
 
-  return { saveBatch, finishRun, list, countForWorkspace };
+  /**
+   * Return every identity key understood by leadFinder for leads that have
+   * already been saved in this workspace. Lead discovery uses this Set as
+   * `excludeKeys`, which prevents the same business from being returned again
+   * across manual searches, streaming searches, campaigns and voice workflows.
+   *
+   * Keep this workspace-scoped: another ReachFly workspace must never affect
+   * the lead discovery results for the current workspace.
+   */
+  function getIdentityKeys(user) {
+    const ctx = context(user);
+    const keys = new Set();
+
+    for (const record of store.read().scrapedLeads || []) {
+      if (record?.workspaceId !== ctx.workspaceId) continue;
+
+      for (const key of leadIdentityKeys(record)) {
+        if (key) keys.add(key);
+      }
+
+      // Preserve compatibility with records written by older ReachFly builds.
+      const storedKey = clean(record?.leadKey).toLowerCase();
+      if (storedKey) keys.add(storedKey);
+    }
+
+    return keys;
+  }
+
+  return {
+    saveBatch,
+    finishRun,
+    list,
+    countForWorkspace,
+    getIdentityKeys,
+  };
 }
 
 function publicLead(record) {
@@ -192,6 +226,51 @@ function leadIdentity(lead) {
   const address = clean(lead?.address).toLowerCase();
   if (name || address) return `business:${name}|${address}`;
   return "";
+}
+
+function leadIdentityKeys(lead) {
+  const keys = [];
+
+  const placeId = clean(lead?.placeId || lead?.place_id).toLowerCase();
+  const host = domainFromUrl(lead?.website || lead?.domain).toLowerCase();
+  const email = clean(lead?.email).toLowerCase();
+  const phone = String(
+    lead?.phone ||
+      lead?.internationalPhoneNumber ||
+      lead?.nationalPhoneNumber ||
+      ""
+  ).replace(/\D/g, "");
+  const name = normalizeIdentityText(lead?.name || lead?.business);
+  const address = normalizeIdentityText(
+    lead?.address ||
+      [lead?.street, lead?.city, lead?.state, lead?.postalCode]
+        .filter(Boolean)
+        .join(" ")
+  );
+
+  if (placeId) keys.push(`place:${placeId}`);
+
+  if (host) {
+    keys.push(`host:${host}`);
+    keys.push(`domain:${host}`);
+  }
+
+  if (email) keys.push(`email:${email}`);
+  if (phone.length >= 7) keys.push(`phone:${phone}`);
+
+  if (name && address) keys.push(`business:${name}|${address}`);
+  else if (name) keys.push(`name:${name}`);
+
+  return [...new Set(keys.map((key) => clean(key).toLowerCase()).filter(Boolean))];
+}
+
+function normalizeIdentityText(value) {
+  return clean(value)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function stableRecordId(workspaceId, runId, key) {
