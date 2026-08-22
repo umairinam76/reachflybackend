@@ -124,9 +124,21 @@ export function createVoiceCommerceService({
       .filter((item) => item.workspaceId === ctx.workspaceId)
       .sort(byNewest)
       .map(publicNumber);
+
+    // Keep the full immutable order history in storage, but do not make the UI
+    // render a stack of identical failed attempts for the same phone number.
+    // The latest unpaid failure is the only actionable payment record.
+    const seenFailedPaymentNumbers = new Set();
     const orders = (state.voiceNumberOrders || [])
       .filter((item) => item.workspaceId === ctx.workspaceId)
       .sort(byNewest)
+      .filter((item) => {
+        if (normalizeStatus(item.status) !== "payment_failed") return true;
+        const key = normalizePhone(item.phoneNumber) || clean(item.id);
+        if (seenFailedPaymentNumbers.has(key)) return false;
+        seenFailedPaymentNumbers.add(key);
+        return true;
+      })
       .slice(0, 30)
       .map(publicOrder);
     const activeNumber = numbers.find((item) => item.status === "active") || null;
@@ -393,8 +405,24 @@ export function createVoiceCommerceService({
     }
 
     const now = new Date().toISOString();
+
+    // Payment retries must reuse the most recent unpaid failed order for this
+    // workspace + phone number. Creating a fresh order on every declined card
+    // produced duplicate rows and made recovery confusing.
+    const reusableFailedOrder = (state.voiceNumberOrders || [])
+      .filter(
+        (candidate) =>
+          candidate.workspaceId === ctx.workspaceId &&
+          normalizePhone(candidate.phoneNumber) === phoneNumber &&
+          normalizeStatus(candidate.status) === "payment_failed" &&
+          !candidate.paidAt &&
+          !candidate.telnyxOrderId
+      )
+      .sort(byNewest)[0] || null;
+
     const order = {
-      id: crypto.randomUUID(),
+      ...(reusableFailedOrder || {}),
+      id: reusableFailedOrder?.id || crypto.randomUUID(),
       workspaceId: ctx.workspaceId,
       userId: clean(user?.id),
       quoteId,
@@ -411,10 +439,21 @@ export function createVoiceCommerceService({
       testMode: Boolean(item.testMode || quote.testMode),
       paymentProvider: "safepay",
       providerTracker: "",
+      checkoutUrl: "",
+      checkoutCreatedAt: "",
       telnyxOrderId: "",
       elevenLabsPhoneNumberId: "",
       status: "creating",
-      createdAt: now,
+      error: "",
+      paymentFailureCode: "",
+      paymentFailureCategory: "",
+      paymentFailureAction: "",
+      paymentFailureRetryable: true,
+      paymentFailedAt: "",
+      retryCount: Number(reusableFailedOrder?.retryCount || 0) +
+        (reusableFailedOrder ? 1 : 0),
+      lastRetryAt: reusableFailedOrder ? now : "",
+      createdAt: reusableFailedOrder?.createdAt || now,
       updatedAt: now,
     };
 
@@ -424,7 +463,14 @@ export function createVoiceCommerceService({
 
     store.update((draft) => {
       ensureStateShape(draft);
-      draft.voiceNumberOrders.unshift(order);
+      if (reusableFailedOrder) {
+        const target = draft.voiceNumberOrders.find(
+          (candidate) => candidate.id === reusableFailedOrder.id
+        );
+        if (target) Object.assign(target, order);
+      } else {
+        draft.voiceNumberOrders.unshift(order);
+      }
     });
 
     try {
@@ -445,7 +491,6 @@ export function createVoiceCommerceService({
           order: order.id,
         }),
         metadata: {
-          source: "reachfly_voice_number_purchase",
           order_id: order.id,
         },
       });
@@ -647,7 +692,6 @@ export function createVoiceCommerceService({
           order: order.id,
         }),
         metadata: {
-          source: "reachfly_voice_bundle_purchase",
           order_id: order.id,
         },
       });
@@ -728,15 +772,26 @@ export function createVoiceCommerceService({
     if (!order) return { matched: false };
 
     if (eventType === "payment.failed") {
+      const failure = normalizeSafepayFailure(data);
       store.update((draft) => {
         ensureStateShape(draft);
         const target = draft.voiceNumberOrders.find((item) => item.id === order.id);
         if (!target || target.status === "active") return;
         target.status = "payment_failed";
-        target.error = clean(data.message || data.category || "Safepay payment failed.").slice(0, 1200);
-        target.updatedAt = new Date().toISOString();
+        target.error = failure.message;
+        target.paymentFailureCode = failure.code;
+        target.paymentFailureCategory = failure.category;
+        target.paymentFailureRetryable = failure.retryable;
+        target.paymentFailureAction = failure.action;
+        target.paymentFailedAt = new Date().toISOString();
+        target.updatedAt = target.paymentFailedAt;
       });
-      return { matched: true, orderId: order.id, status: "payment_failed" };
+      return {
+        matched: true,
+        orderId: order.id,
+        status: "payment_failed",
+        paymentFailure: failure,
+      };
     }
 
     if (eventType === "payment.refunded") {
@@ -2224,17 +2279,15 @@ async function deleteElevenLabsPhoneNumber(phoneNumberId) {
 }
 
 function buildSafepayMetadata(metadata = {}, orderId = "") {
-  // Safepay's payment-session metadata accepts its documented commerce keys.
-  // Keep workspace/user/product details in ReachFly's own order record rather
-  // than sending unsupported provider metadata keys such as workspace_id.
-  const source = clean(metadata?.source || "reachfly").slice(0, 120);
+  // Do not send workspace_id/user_id/source/custom product keys to Safepay.
+  // Some processor configurations reject unknown metadata keys before card
+  // authorization (the legacy error was: unsupported meta key workspace_id).
+  // ReachFly already stores workspace/user/product context on the local order.
+  // We retain only the stable order identifier used to reconcile webhooks.
   const resolvedOrderId = clean(
     metadata?.order_id || metadata?.orderId || orderId
   ).slice(0, 200);
-  return {
-    source: source || "reachfly",
-    order_id: resolvedOrderId,
-  };
+  return resolvedOrderId ? { order_id: resolvedOrderId } : {};
 }
 
 async function createSafepayCheckout({
@@ -2599,7 +2652,132 @@ function publicOrder(item = {}) {
     paidAt: item.paidAt || "",
     activatedAt: item.activatedAt || "",
     updatedAt: item.updatedAt || "",
-    error: item.error || "",
+    error: publicOrderError(item),
+    paymentFailedAt: item.paymentFailedAt || "",
+    retryCount: Number(item.retryCount || 0),
+    lastRetryAt: item.lastRetryAt || "",
+    paymentFailure: publicPaymentFailure(item),
+  };
+}
+
+
+function publicOrderError(item = {}) {
+  const rawError = clean(item.error);
+  if (/unsupported\s+meta(?:data)?\s+key\s+workspace_id/i.test(rawError)) {
+    return "Older checkout configuration failed before payment authorization. Retry payment; ReachFly no longer sends unsupported workspace metadata to the processor.";
+  }
+  return rawError;
+}
+
+function publicPaymentFailure(item = {}) {
+  const rawError = clean(item.error);
+  const legacyMetadataFailure = /unsupported\s+meta(?:data)?\s+key\s+workspace_id/i.test(rawError);
+
+  if (legacyMetadataFailure) {
+    return {
+      code: "legacy_checkout_metadata",
+      category: "checkout_configuration",
+      retryable: true,
+      action: "retry_checkout",
+      message:
+        "This was an older ReachFly checkout configuration failure, not a card decline. Retry the payment; unsupported workspace metadata is no longer sent to the processor.",
+    };
+  }
+
+  if (item.paymentFailureCode || item.paymentFailureCategory || item.paymentFailureAction) {
+    return {
+      code: clean(item.paymentFailureCode),
+      category: clean(item.paymentFailureCategory),
+      retryable: item.paymentFailureRetryable !== false,
+      action: clean(item.paymentFailureAction),
+      message: rawError,
+    };
+  }
+
+  if (normalizeStatus(item.status) === "payment_failed" && rawError) {
+    return {
+      code: "",
+      category: "payment_failed",
+      retryable: true,
+      action: "retry_checkout",
+      message: rawError,
+    };
+  }
+
+  return null;
+}
+
+function normalizeSafepayFailure(data = {}) {
+  const rawCode = clean(
+    data.reason_code ||
+      data.reasonCode ||
+      data.reason ||
+      data.code ||
+      data.processor_code ||
+      data.processorCode ||
+      data?.action?.reason ||
+      data?.action?.reason_code ||
+      data?.processor?.reason ||
+      data?.processor?.reason_code
+  );
+  const rawCategory = clean(
+    data.category ||
+      data.error_category ||
+      data.errorCategory ||
+      data?.action?.category ||
+      data?.processor?.category
+  );
+  const rawMessage = clean(
+    data.message ||
+      data.description ||
+      data.error ||
+      data?.action?.message ||
+      data?.action?.description ||
+      data?.processor?.message
+  );
+  const haystack = `${rawCode} ${rawCategory} ${rawMessage}`.toLowerCase();
+
+  if (rawCode === "203" || haystack.includes("general decline")) {
+    return {
+      code: rawCode || "203",
+      category: rawCategory || "authorization_declined",
+      retryable: true,
+      action: "different_card_or_contact_bank",
+      message:
+        "Your bank declined this card authorization. ReachFly did not provision the business number. Try another card, or ask the issuing bank to approve online/card-not-present payments before trying again.",
+    };
+  }
+
+  if (rawCode === "208" || haystack.includes("inactive card") || haystack.includes("card-not-present")) {
+    return {
+      code: rawCode || "208",
+      category: rawCategory || "card_not_authorized",
+      retryable: true,
+      action: "different_card",
+      message:
+        "This card is inactive or is not enabled for online/card-not-present payments. ReachFly did not provision the business number. Use another card or enable online payments with the issuing bank.",
+    };
+  }
+
+  if (rawCode === "476" || haystack.includes("payer authentication") || haystack.includes("authentication failed")) {
+    return {
+      code: rawCode || "476",
+      category: rawCategory || "payer_authentication_failed",
+      retryable: true,
+      action: "retry_authentication_or_different_card",
+      message:
+        "The bank could not complete cardholder authentication. ReachFly did not provision the business number. Retry the payment and complete the bank verification step, or use another card.",
+    };
+  }
+
+  return {
+    code: rawCode,
+    category: rawCategory || "payment_declined",
+    retryable: true,
+    action: "retry_or_different_payment_method",
+    message:
+      rawMessage ||
+      "The payment processor declined this payment. ReachFly did not provision the business number. Retry the payment or use another payment method.",
   };
 }
 
