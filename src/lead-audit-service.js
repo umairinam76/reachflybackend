@@ -569,6 +569,8 @@ function buildClaudeSystem(record) {
     "You research only publicly accessible website content and public search results.",
     "Never invent a finding, performance score, ranking, owner, opening hours, address mismatch, competitor, technology, buying signal, intent signal, or prospect interest.",
     "When a workspace audit profile is supplied, use it only to evaluate commercial alignment and pitch relevance. Fit is not proof of buyer intent.",
+    "For Mini Audits, use the same evidence-first mindset as a full website audit: verify the business, identify factual public weaknesses and consequences, then compress only the most useful pre-call findings into a caller-ready report.",
+    "User-supplied pain points and direction are prioritization guidance, not evidence about the prospect.",
     "Do not run active security scans. Do not claim legal, accessibility, privacy, or security compliance.",
     "Return one valid JSON object only. Do not use markdown fences and do not add prose before or after JSON.",
     "When the supplied homepage evidence conflicts with a search result, identify the conflict and cite the public source in the source field.",
@@ -629,7 +631,7 @@ function buildClaudePrompt(record, evidence) {
       },
       null,
       2
-    )}\nRules: include 6-10 issues, prioritized with address/NAP conflicts, domain authority fragmentation, and search visibility before minor issues. Each issue finding must be exactly one sentence. Each issue pain must be exactly one sentence. salesFit must compare the verified business evidence to auditProfile.businessNiche, auditProfile.idealCustomer, auditProfile.offer, auditProfile.targetMarket, auditProfile.pitchGoal, auditProfile.customInstructions and the enabled auditProfile.criteria. fitScore is commercial alignment from 0-100, not buying intent. Do not say the prospect is interested, ready to buy, needs the offer, or has budget unless supplied CRM/public evidence explicitly proves it. suggestedOpener must be one short conversational opener that references at most one verified observation and then asks a question. pitchAngles must stay grounded in verified findings and the configured offer. Include no objection notes, founded/size field, unsupported recommendations, or extra sections.`;
+    )}\nRules: include 6-10 issues, prioritized with address/NAP conflicts, domain authority fragmentation, and search visibility before minor issues. Each issue finding must be exactly one sentence. Each issue pain must be exactly one sentence. salesFit must compare the verified business evidence to auditProfile.businessNiche, auditProfile.idealCustomer, auditProfile.offer, auditProfile.targetMarket, auditProfile.painPoints, auditProfile.pitchGoal, auditProfile.miniAuditDirection, auditProfile.customInstructions and the enabled auditProfile.criteria. Treat auditProfile.miniAuditDirection as the user's requested emphasis, but never let it override evidence. Treat auditProfile.painPoints as problems the workspace solves, not as facts about the prospect unless verified. fitScore is commercial alignment from 0-100, not buying intent. Do not say the prospect is interested, ready to buy, needs the offer, or has budget unless supplied CRM/public evidence explicitly proves it. suggestedOpener must be one short conversational opener that references at most one verified observation and then asks a question. pitchAngles must stay grounded in verified findings and the configured offer. Include no objection notes, founded/size field, unsupported recommendations, or extra sections.`;
   }
 
   if (record.kind === "competitor") {
@@ -1096,6 +1098,10 @@ function normalizeAuditProfile(value = {}) {
     idealCustomer: clean(value.idealCustomer).slice(0, 600),
     offer: clean(value.offer).slice(0, 800),
     targetMarket: clean(value.targetMarket).slice(0, 240),
+    painPoints: clean(value.painPoints).slice(0, 1200),
+    miniAuditDirection:
+      clean(value.miniAuditDirection).slice(0, 1600) ||
+      "Prioritize verified customer-acquisition, conversion, booking, trust, local visibility and follow-up gaps that connect naturally to the workspace offer. Keep the Mini Audit caller-ready and evidence-grounded.",
     pitchGoal: clean(value.pitchGoal).slice(0, 600),
     customInstructions: clean(value.customInstructions).slice(0, 1600),
     criteria: {
@@ -1145,11 +1151,24 @@ function buildFallbackSalesFit(record, evidence = {}, issues = []) {
     Boolean(businessNiche && leadNiche) &&
     (businessNiche.includes(leadNiche) || leadNiche.includes(businessNiche));
   const hasOffer = Boolean(profile.offer);
+  const painTokens = normalize(profile.painPoints)
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 5)
+    .slice(0, 40);
+  const verifiedIssueText = normalize(
+    issueList
+      .map((item) => `${clean(item?.finding || item?.evidence)} ${clean(item?.pain || item?.businessImpact)}`)
+      .join(" ")
+  );
+  const painPointAligned =
+    painTokens.length > 0 &&
+    painTokens.some((token) => verifiedIssueText.includes(token));
   const evidenceDepth = Math.min(10, issueList.length);
   const score = clamp(
     40 +
       (nicheAligned ? 20 : 0) +
       (hasOffer ? 10 : 0) +
+      (painPointAligned ? 10 : 0) +
       Math.min(20, evidenceDepth * 2),
     0,
     100

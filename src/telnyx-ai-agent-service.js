@@ -11,6 +11,20 @@ const DEFAULT_VOICE =
   process.env.ELEVENLABS_VOICE_ID ||
   "fNZkPhLHNXqE8oMjamg6";
 
+const REACHFLY_DEFAULT_AGENT_NAME =
+  clean(process.env.REACHFLY_DEFAULT_AGENT_NAME) ||
+  "Ava";
+
+const REACHFLY_AGENT_NAME_POOL = uniqueStrings(
+  String(
+    process.env.REACHFLY_AGENT_NAMES ||
+      "Ava,Maya,Noah,Leo,Zara,Sofia,Theo,Aria"
+  )
+    .split(",")
+    .map((value) => clean(value))
+    .filter(Boolean)
+);
+
 const ELEVENLABS_TTS_MODEL =
   clean(process.env.ELEVENLABS_TTS_MODEL_ID) ||
   "eleven_v3_conversational";
@@ -674,9 +688,9 @@ export function createTelnyxAIAgentService({
         const labels = safeObject(voice.labels);
         voices.push({
           id,
-          name: clean(voice.name) || id,
-          label: `${clean(voice.name) || "ElevenLabs voice"} · ${id}`,
-          provider: "elevenlabs",
+          name: clean(voice.name) || "ReachFly Voice",
+          label: clean(voice.name) || "ReachFly Voice",
+          provider: "reachfly-managed",
           category: clean(voice.category),
           language: clean(labels.language || labels.locale),
           locale: clean(labels.locale),
@@ -832,13 +846,15 @@ export function createTelnyxAIAgentService({
           id: providerAgentId,
           agentId: providerAgentId,
           localAgentId: workspaceAgent.id,
-          name:
-            clean(providerAgent?.name) ||
-            clean(workspaceAgent?.name) ||
-            "ReachFly managed Voice Agent",
+          name: reachFlyAgentDisplayName(
+            workspaceAgent,
+            providerAgentId
+          ),
           voiceId,
           voiceName,
-          voiceLabel: voiceId ? `${voiceName} · ${voiceId}` : voiceName,
+          voiceLabel: voiceName,
+          ecosystem: "reachfly",
+          providerLabel: "ReachFly managed voice",
           ttsModel: clean(tts.model_id || workspaceAgent.elevenLabsTtsModel),
           branchId: clean(providerAgent?.branch_id),
           versionId: clean(providerAgent?.version_id),
@@ -928,7 +944,7 @@ export function createTelnyxAIAgentService({
             return {
               id: agentId,
               agentId,
-              name: clean(providerAgent?.name || summary?.name) || agentId,
+              name: reachFlyAgentDisplayName({ id: agentId }, agentId),
               voiceId: clean(tts.voice_id),
               ttsModel: clean(tts.model_id),
               branchId: clean(providerAgent?.branch_id),
@@ -939,7 +955,7 @@ export function createTelnyxAIAgentService({
             return {
               id: agentId,
               agentId,
-              name: clean(summary?.name) || agentId,
+              name: reachFlyAgentDisplayName({ id: agentId }, agentId),
               voiceId: "",
               ttsModel: "",
               branchId: "",
@@ -971,9 +987,11 @@ export function createTelnyxAIAgentService({
 
     const agents = details.map((item) => ({
       ...item,
-      voiceName: item.voiceId ? voiceNames.get(item.voiceId) || item.voiceId : "No voice configured",
+      ecosystem: "reachfly",
+      providerLabel: "ReachFly managed voice",
+      voiceName: item.voiceId ? voiceNames.get(item.voiceId) || "ReachFly Voice" : "No voice configured",
       voiceLabel: item.voiceId
-        ? `${voiceNames.get(item.voiceId) || "ElevenLabs voice"} · ${item.voiceId}`
+        ? `${voiceNames.get(item.voiceId) || "ReachFly Voice"}`
         : "No voice configured",
     }));
 
@@ -9103,7 +9121,9 @@ function diagnostics(state, workspaceId) {
     ? Boolean(purchasedSelected && selectedFromNumber && phoneNumberId)
     : Boolean(selectedFromNumber && phoneNumberId);
   return {
-    provider: "elevenlabs-telnyx-sip",
+    provider: "reachfly-managed-voice",
+    defaultAgentName: REACHFLY_DEFAULT_AGENT_NAME,
+    agentNameOptions: REACHFLY_AGENT_NAME_POOL,
     configured: Boolean(
       process.env.ELEVENLABS_API_KEY &&
         elevenLabsAgentId &&
@@ -9202,7 +9222,64 @@ function publicAgent(agent) {
     updatedBy,
     ...safe
   } = agent;
-  return { ...safe };
+
+  return {
+    ...safe,
+    name: reachFlyAgentDisplayName(agent, agent.id || agent.elevenLabsAgentId),
+    ecosystem: "reachfly",
+    providerLabel: "ReachFly managed voice",
+  };
+}
+
+function reachFlyAgentDisplayName(agent = {}, seed = "") {
+  const explicit =
+    clean(agent.reachFlyName) ||
+    clean(agent.displayName) ||
+    clean(agent.name);
+
+  if (explicit && !looksLikeProviderGeneratedAgentName(explicit)) {
+    return explicit;
+  }
+
+  const pool =
+    REACHFLY_AGENT_NAME_POOL.length
+      ? REACHFLY_AGENT_NAME_POOL
+      : [REACHFLY_DEFAULT_AGENT_NAME];
+
+  const stableSeed =
+    clean(
+      agent.id ||
+        agent.elevenLabsAgentId ||
+        seed ||
+        agent.workspaceId ||
+        explicit
+    ) ||
+    "reachfly";
+
+  const digest = crypto
+    .createHash("sha256")
+    .update(stableSeed)
+    .digest();
+
+  return (
+    pool[digest[0] % pool.length] ||
+    REACHFLY_DEFAULT_AGENT_NAME
+  );
+}
+
+function looksLikeProviderGeneratedAgentName(value) {
+  const name = clean(value).toLowerCase();
+  if (!name) return true;
+
+  return (
+    name === "james" ||
+    name === "default agent" ||
+    name === "ai agent" ||
+    name.includes("elevenlabs") ||
+    name.includes("convai") ||
+    /^agent[_\s-]?[a-z0-9]{6,}$/i.test(name) ||
+    /^voice[_\s-]?agent[_\s-]?[a-z0-9]{6,}$/i.test(name)
+  );
 }
 
 function publicQueueItem(item, state) {

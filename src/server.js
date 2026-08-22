@@ -4764,10 +4764,100 @@ app.post(
         req.workspaceContext ||
         getWorkspaceContext(req.user);
 
+      const requestBody = req.body || {};
+      const voiceCampaignRequested =
+        String(requestBody.primaryChannel || "").toLowerCase() === "voice" ||
+        requestBody.voiceEnabled === true ||
+        requestBody.aiVoiceEnabled === true ||
+        /(?:voice|ai[\s_-]*calling|calling)/i.test(
+          String(requestBody.campaignType || "")
+        ) ||
+        requestBody.outreachPlan?.aiVoice === true;
+
+      if (voiceCampaignRequested) {
+        const voiceDashboard =
+          telnyxAiAgentService.getDashboard(req.user);
+        const diagnostics =
+          voiceDashboard?.diagnostics || {};
+        const agent =
+          voiceDashboard?.agent ||
+          voiceDashboard?.agents?.[0] ||
+          null;
+
+        const selectedNumber =
+          String(
+            diagnostics.selectedFromNumber ||
+              agent?.fromNumber ||
+              ""
+          ).trim();
+
+        const numberReady =
+          Boolean(
+            selectedNumber &&
+              (
+                diagnostics.elevenLabsPhoneNumberId ||
+                agent?.elevenLabsPhoneNumberId ||
+                diagnostics.numberPurchased ||
+                diagnostics.purchasedNumberRequired === false
+              )
+          );
+
+        const agentReady =
+          Boolean(
+            agent &&
+              agent.enabled !== false &&
+              (
+                agent.elevenLabsAgentId ||
+                diagnostics.elevenLabsAgentId
+              )
+          );
+
+        const callingMode =
+          String(
+            agent?.callingMode ||
+              diagnostics.callingMode ||
+              "outbound"
+          )
+            .trim()
+            .toLowerCase();
+
+        const outboundReady =
+          diagnostics.outboundEnabled !== false &&
+          ["outbound", "both"].includes(callingMode);
+
+        if (!numberReady || !agentReady || !outboundReady || diagnostics.configured !== true) {
+          const missing = [];
+          if (!numberReady) missing.push("business_number");
+          if (!agentReady) missing.push("voice_agent");
+          if (!outboundReady) missing.push("outbound_mode");
+          if (diagnostics.configured !== true) missing.push("voice_runtime");
+
+          const error = new Error(
+            !numberReady
+              ? "Set up a ReachFly business number before creating an AI Calling campaign."
+              : !agentReady
+                ? "Finish and activate the ReachFly Voice Agent before creating an AI Calling campaign."
+                : !outboundReady
+                  ? "Enable Outbound or Inbound + Outbound mode before creating an AI Calling campaign."
+                  : "Finish the ReachFly Voice setup before creating an AI Calling campaign."
+          );
+
+          error.statusCode = 409;
+          error.code = "VOICE_SETUP_REQUIRED";
+          error.fields = {
+            voiceSetupRequired: true,
+            missing,
+            setupLink:
+              "/app/agents?onboarding=1&mode=outbound&returnTo=%2Fapp%2Fcampaigns%2Fnew",
+          };
+          throw error;
+        }
+      }
+
       const campaign =
         await campaigns.createCampaign(
           {
-            ...req.body,
+            ...requestBody,
             userId: req.user.id,
 
             ownerId:
@@ -4809,6 +4899,8 @@ app.post(
         .json({
           error:
             error.message,
+          code:
+            error.code || "",
           fields:
             error.fields,
           details:
@@ -10662,6 +10754,8 @@ function sanitizeWorkspaceAuditProfile(value = {}) {
     offer: String(value?.offer || "").trim().slice(0, 800),
     targetMarket: String(value?.targetMarket || "").trim().slice(0, 240),
     pitchGoal: String(value?.pitchGoal || "").trim().slice(0, 600),
+    painPoints: String(value?.painPoints || "").trim().slice(0, 1200),
+    miniAuditDirection: String(value?.miniAuditDirection || "").trim().slice(0, 1600),
     customInstructions: String(value?.customInstructions || "").trim().slice(0, 1600),
     criteria: {
       nicheFit: criteria.nicheFit !== false,
